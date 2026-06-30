@@ -12,7 +12,7 @@
 | 0.4 | todo |  |  | CI |
 | 0.5 | todo |  |  | CD |
 | 0.6 | todo |  |  | Базис трёх Go-сервисов |
-| 0.7 | todo |  |  | AGENTS.md и дисциплина доков |
+| 0.7 | in_progress |  |  | AGENTS.md и дисциплина доков |
 | 1.1 | todo |  |  | Схема auth |
 | 1.2 | todo |  |  | Регистрация по токену |
 | 1.3 | todo |  |  | Логин / refresh / logout |
