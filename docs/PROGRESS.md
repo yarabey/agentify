@@ -17,7 +17,7 @@
 | 1.2 | done | merge 344e3a8 | 2026-06-30 | Регистрация по токену |
 | 1.3 | done | merge 31e11ae | 2026-06-30 | Логин / refresh / logout |
 | 1.4 | done | merge 8e9aa6d | 2026-06-30 | Middleware auth |
-| 1.5 | in_progress |  |  | Изоляция данных |
+| 1.5 | done | merge c3a0539 | 2026-06-30 | Изоляция данных |
 | 1.6 | done | merge 76566a6 | 2026-06-30 | Показ токена регистрации |
 | 1.7 | done | merge f2ca076 | 2026-06-30 | Bootstrap |
 | 2.1 | todo |  |  | Схема интеграций |
