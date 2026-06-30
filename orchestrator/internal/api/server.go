@@ -39,6 +39,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/auth"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
@@ -62,6 +63,9 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg db.CreateUserParams) (db.User, error)
 	// GetUserByUsername ищет аккаунт по username — путь логина (FR A3).
 	GetUserByUsername(ctx context.Context, username string) (db.User, error)
+	// GetUserByID ищет аккаунт по id — проверка is_admin для показа токена
+	// регистрации (FR A2, тикет 1.6).
+	GetUserByID(ctx context.Context, id pgtype.UUID) (db.User, error)
 	// CreateRefreshToken сохраняет хэш нового refresh-токена (FR A3).
 	CreateRefreshToken(ctx context.Context, arg db.CreateRefreshTokenParams) (db.RefreshToken, error)
 	// GetRefreshTokenByHash ищет refresh-токен по хэшу — путь /auth/refresh (FR A3).
