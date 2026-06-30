@@ -1,0 +1,7 @@
+# Caddyfile — ЗАГЛУШКА тикета 0.1.
+#
+# Реальная конфигурация (авто-TLS Let's Encrypt, reverse proxy на оркестратор,
+# раздача статики web) реализуется в тикетах 0.3/0.5.
+# См. docs/01_tech_stack_and_architecture.md §2 [РЕШЕНИЕ 5], §3 «Инфраструктура».
+
+# TODO(0.3): reverse_proxy на orchestrator, file_server для статики web.
