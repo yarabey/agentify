@@ -1,18 +1,20 @@
-// Package api — каркас HTTP-API оркестратора и реальные обработчики тикета 1.2.
+// Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов 1.2/1.3.
 //
-// Назначение (бизнес): это первый эндпоинт-тикет, поэтому здесь закладывается
-// каркас единого REST-API оркестратора (через который ходят web PWA и
-// Telegram-бот, см. orchestrator/README.md), а реально реализуется ТОЛЬКО
-// регистрация по токену — POST /auth/register (FR A1, Gherkin §1). Доступ в
-// систему закрытый: аккаунт создаётся лишь при предъявлении активного секретного
-// токена регистрации; без него — отказ (FR A1). Остальные операции контракта
-// (логин/refresh/logout — 1.3, middleware — 1.4, интеграции/задачи — позже)
-// пока отвечают 501 Not Implemented и будут реализованы в своих тикетах.
+// Назначение (бизнес): здесь живёт каркас единого REST-API оркестратора (через
+// который ходят web PWA и Telegram-бот, см. orchestrator/README.md), а реально
+// реализован весь auth-поток: регистрация по токену — POST /auth/register
+// (FR A1, Gherkin §1), логин/refresh/logout — POST /auth/login,
+// POST /auth/refresh, POST /auth/logout (FR A3). Доступ в систему закрытый:
+// аккаунт создаётся лишь при предъявлении активного секретного токена
+// регистрации; без него — отказ (FR A1). Остальные операции контракта
+// (middleware — 1.4, интеграции/задачи — позже) пока отвечают 501 Not
+// Implemented и будут реализованы в своих тикетах.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
-// только готовые операции — GetHealthz и PostAuthRegister. NewRouter монтирует
+// только готовые операции — GetHealthz, PostAuthRegister и
+// PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go). NewRouter монтирует
 // chi-роутер из сгенерированного HandlerFromMux (он же поднимает GET /healthz и
 // все маршруты API от корня — Caddy роутит /api/* со стрипом префикса, поэтому
 // пути монтируются от корня: /auth/register, /healthz). Слой данных — sqlc
@@ -42,37 +44,52 @@ import (
 // вернуть 409, не делая лишнего предварительного SELECT.
 const pgUniqueViolation = "23505"
 
-// Querier — узкий интерфейс слоя данных, нужный обработчикам тикета 1.2.
+// Querier — узкий интерфейс слоя данных, нужный обработчикам тикетов 1.2/1.3.
 //
-// Сужает *db.Queries до фактически используемых регистрацией методов: так Server
-// не зависит от всего сгенерированного API БД, а тесты могут при необходимости
-// подменить слой данных. Реализуется *db.Queries (sqlc) поверх pgxpool.
+// Сужает *db.Queries до фактически используемых auth-обработчиками методов: так
+// Server не зависит от всего сгенерированного API БД, а тесты могут при
+// необходимости подменить слой данных. Реализуется *db.Queries (sqlc) поверх
+// pgxpool.
 type Querier interface {
 	// GetActiveRegistrationToken возвращает действующий токен регистрации (FR A1).
 	GetActiveRegistrationToken(ctx context.Context) (db.RegistrationToken, error)
 	// CreateUser создаёт аккаунт с argon2id-хэшем пароля (FR A1, I1).
 	CreateUser(ctx context.Context, arg db.CreateUserParams) (db.User, error)
+	// GetUserByUsername ищет аккаунт по username — путь логина (FR A3).
+	GetUserByUsername(ctx context.Context, username string) (db.User, error)
+	// CreateRefreshToken сохраняет хэш нового refresh-токена (FR A3).
+	CreateRefreshToken(ctx context.Context, arg db.CreateRefreshTokenParams) (db.RefreshToken, error)
+	// GetRefreshTokenByHash ищет refresh-токен по хэшу — путь /auth/refresh (FR A3).
+	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (db.RefreshToken, error)
+	// RevokeRefreshTokenByHash отзывает refresh-токен по хэшу — ротация при
+	// /auth/refresh и явный отзыв при /auth/logout (FR A3).
+	RevokeRefreshTokenByHash(ctx context.Context, tokenHash string) error
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.
 //
 // Встраивает api.Unimplemented (501 для ещё не реализованных операций) и
-// переопределяет готовые. Хранит слой данных (queries) и логгер. Создаётся через
-// NewServer; HTTP-роутер собирается через NewRouter.
+// переопределяет готовые. Хранит слой данных (queries), логгер и ключ подписи
+// access-JWT. Создаётся через NewServer; HTTP-роутер собирается через NewRouter.
 type Server struct {
 	Unimplemented
 
-	queries Querier
-	logger  *slog.Logger
+	queries       Querier
+	logger        *slog.Logger
+	jwtSigningKey []byte
 }
 
-// NewServer собирает обработчик API оркестратора поверх слоя данных и логгера.
+// NewServer собирает обработчик API оркестратора поверх слоя данных, логгера и
+// ключа подписи access-JWT.
 //
 // queries — sqlc-запросы (обычно db.New(pool)); logger — логгер сервиса (nil
-// допустим, тогда серверные ошибки не логируются). Возвращает *Server, готовый к
-// монтированию через NewRouter.
-func NewServer(queries Querier, logger *slog.Logger) *Server {
-	return &Server{queries: queries, logger: logger}
+// допустим, тогда серверные ошибки не логируются); jwtSigningKey — секрет HMAC
+// для подписи/проверки access-токенов (JWT_SIGNING_KEY из окружения,
+// docs/MANUAL_STEPS.md) — НЕ генерируется и не подставляется по умолчанию здесь:
+// вызывающая сторона (orchestrator/main.go) отвечает за то, что ключ непуст в
+// проде. Возвращает *Server, готовый к монтированию через NewRouter.
+func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte) *Server {
+	return &Server{queries: queries, logger: logger, jwtSigningKey: jwtSigningKey}
 }
 
 // NewRouter монтирует chi-роутер оркестратора: общие middleware (recover,

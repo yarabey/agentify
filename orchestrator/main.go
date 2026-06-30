@@ -8,8 +8,9 @@
 // Как устроено (тех): main — тонкий: грузит конфиг под префиксом ORCH_ через
 // общий пакет platform, применяет миграции на старте, при наличии БД поднимает
 // pgxpool и монтирует сгенерированный из openapi API-роутер (тикет 1.2: реальный
-// POST /auth/register, прочие операции — 501), затем блокируется до SIGTERM/
-// SIGINT и гасится gracefully, закрывая пул.
+// POST /auth/register; тикет 1.3: POST /auth/login, /auth/refresh, /auth/logout;
+// прочие операции — 501), затем блокируется до SIGTERM/SIGINT и гасится
+// gracefully, закрывая пул.
 package main
 
 import (
@@ -44,6 +45,15 @@ type config struct {
 	// Пустое значение допустимо для запусков без БД (юнит-тесты каркаса): тогда
 	// шаг миграций пропускается.
 	DatabaseURL string `env:"DATABASE_URL"`
+
+	// JWTSigningKey — секрет HMAC для подписи/проверки access-JWT (тикет 1.3,
+	// FR A3). Переменная ORCH_JWT_SIGNING_KEY генерируется ОДНОКРАТНО вручную
+	// (`openssl rand -base64 48`, см. docs/MANUAL_STEPS.md) и кладётся в секреты
+	// окружения — здесь НЕТ дефолта и НЕ генерируется фолбэк: пустой ключ в
+	// проде означал бы предсказуемую подпись токенов доступа, поэтому при
+	// поднятом API (DatabaseURL непуст) пустой JWTSigningKey — фатальная ошибка
+	// старта (см. run), а не тихий запуск с небезопасным ключом.
+	JWTSigningKey string `env:"JWT_SIGNING_KEY"`
 }
 
 func main() {
@@ -79,12 +89,20 @@ func run() error {
 		svc.Logger().Warn("ORCH_DATABASE_URL пуст — пропускаю применение миграций на старте")
 	}
 
-	// Пул соединений и реальный API-сервер (тикет 1.2). Без БД API не поднимаем —
-	// регистрация и будущие эндпоинты обращаются к Postgres; остаётся только
-	// /healthz из каркаса platform. С БД монтируем сгенерированный из openapi
-	// chi-роутер (POST /auth/register + 501-заглушки прочих операций) и отдаём его
-	// сервису через SetHandler, сохраняя единый graceful shutdown.
+	// Пул соединений и реальный API-сервер (тикеты 1.2/1.3). Без БД API не
+	// поднимаем — auth-эндпоинты обращаются к Postgres; остаётся только /healthz
+	// из каркаса platform. С БД монтируем сгенерированный из openapi chi-роутер
+	// (POST /auth/register, /auth/login, /auth/refresh, /auth/logout +
+	// 501-заглушки прочих операций) и отдаём его сервису через SetHandler,
+	// сохраняя единый graceful shutdown.
 	if cfg.DatabaseURL != "" {
+		// Auth-эндпоинты подписывают access-JWT этим ключом (FR A3, тикет 1.3) —
+		// пустой ключ означал бы предсказуемую подпись токенов в проде, поэтому
+		// падаем на старте, а не поднимаем API с небезопасным дефолтом.
+		if cfg.JWTSigningKey == "" {
+			return fmt.Errorf("orchestrator: ORCH_JWT_SIGNING_KEY пуст — задайте секрет (см. docs/MANUAL_STEPS.md), пустой/предсказуемый ключ подписи JWT недопустим в проде")
+		}
+
 		pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 		if err != nil {
 			return fmt.Errorf("orchestrator: создание пула соединений к Postgres: %w", err)
@@ -93,7 +111,7 @@ func run() error {
 		// новые запросы уже не принимаются, активные доиграны.
 		defer pool.Close()
 
-		server := api.NewServer(db.New(pool), svc.Logger())
+		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey))
 		svc.SetHandler(api.NewRouter(server))
 	}
 

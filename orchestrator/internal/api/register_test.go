@@ -18,12 +18,27 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
 
-// fakeQuerier — подменный слой данных для unit-тестов обработчика.
+// fakeQuerier — подменный слой данных для unit-тестов обработчиков (тикеты
+// 1.2/1.3). Реализует весь Querier через настраиваемые поля-результаты; тесты
+// заполняют только то, что им нужно для сценария.
 type fakeQuerier struct {
 	activeToken    string
 	activeErr      error
 	createUserUser db.User
 	createUserErr  error
+
+	getUserByUsernameUser db.User
+	getUserByUsernameErr  error
+
+	createRefreshTokenErr error
+
+	getRefreshTokenByHashResult db.RefreshToken
+	getRefreshTokenByHashErr    error
+
+	revokeRefreshTokenByHashErr error
+	// revokedHashes собирает хэши, переданные в RevokeRefreshTokenByHash —
+	// позволяет тестам проверить, что отозван именно ожидаемый (старый) токен.
+	revokedHashes *[]string
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -40,11 +55,54 @@ func (f fakeQuerier) CreateUser(context.Context, db.CreateUserParams) (db.User, 
 	return f.createUserUser, nil
 }
 
+func (f fakeQuerier) GetUserByUsername(context.Context, string) (db.User, error) {
+	if f.getUserByUsernameErr != nil {
+		return db.User{}, f.getUserByUsernameErr
+	}
+	return f.getUserByUsernameUser, nil
+}
+
+func (f fakeQuerier) CreateRefreshToken(_ context.Context, arg db.CreateRefreshTokenParams) (db.RefreshToken, error) {
+	if f.createRefreshTokenErr != nil {
+		return db.RefreshToken{}, f.createRefreshTokenErr
+	}
+	return db.RefreshToken{
+		UserID:    arg.UserID,
+		TokenHash: arg.TokenHash,
+		ExpiresAt: arg.ExpiresAt,
+	}, nil
+}
+
+func (f fakeQuerier) GetRefreshTokenByHash(context.Context, string) (db.RefreshToken, error) {
+	if f.getRefreshTokenByHashErr != nil {
+		return db.RefreshToken{}, f.getRefreshTokenByHashErr
+	}
+	return f.getRefreshTokenByHashResult, nil
+}
+
+func (f fakeQuerier) RevokeRefreshTokenByHash(_ context.Context, tokenHash string) error {
+	if f.revokedHashes != nil {
+		*f.revokedHashes = append(*f.revokedHashes, tokenHash)
+	}
+	return f.revokeRefreshTokenByHashErr
+}
+
+// testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api
+// (тикеты 1.2/1.3). Не секрет — используется только в тестовом процессе.
+const testJWTSigningKey = "unit-test-jwt-signing-key"
+
+// newTestServer собирает *Server с тестовым ключом подписи JWT поверх
+// переданного fakeQuerier/Querier — общий конструктор для всех unit-тестов
+// пакета api (регистрация, логин, refresh, logout).
+func newTestServer(q Querier) *Server {
+	return NewServer(q, nil, []byte(testJWTSigningKey))
+}
+
 // doRegister прогоняет тело req через роутер с заданным fakeQuerier и возвращает
 // записанный ответ.
 func doRegister(t *testing.T, q Querier, body any) *httptest.ResponseRecorder {
 	t.Helper()
-	router := NewRouter(NewServer(q, nil))
+	router := NewRouter(newTestServer(q))
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal тела: %v", err)
@@ -74,7 +132,7 @@ func TestRegisterValidationRejectsEmptyFields(t *testing.T) {
 
 // TestRegisterRejectsMalformedJSON — невалидный JSON → 400.
 func TestRegisterRejectsMalformedJSON(t *testing.T) {
-	router := NewRouter(NewServer(fakeQuerier{activeToken: "secret"}, nil))
+	router := NewRouter(newTestServer(fakeQuerier{activeToken: "secret"}))
 	req := httptest.NewRequest(http.MethodPost, "/auth/register", bytes.NewReader([]byte("{not json")))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -105,7 +163,7 @@ func TestRegisterForbiddenWhenTokenMismatch(t *testing.T) {
 
 // TestHealthzServedByRouter — собранный API-роутер отвечает 200 на /healthz.
 func TestHealthzServedByRouter(t *testing.T) {
-	router := NewRouter(NewServer(fakeQuerier{}, nil))
+	router := NewRouter(newTestServer(fakeQuerier{}))
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -114,14 +172,16 @@ func TestHealthzServedByRouter(t *testing.T) {
 	}
 }
 
-// TestUnimplementedReturns501 — нереализованная операция (логин, тикет 1.3)
-// отвечает 501 через встроенную заглушку Unimplemented.
+// TestUnimplementedReturns501 — нереализованная операция (привязка Telegram,
+// будущий тикет) отвечает 501 через встроенную заглушку Unimplemented.
+// /auth/login, /auth/refresh, /auth/logout реализованы тикетом 1.3 — их
+// сценарии теперь покрыты login_test.go/refresh_test.go/logout_test.go.
 func TestUnimplementedReturns501(t *testing.T) {
-	router := NewRouter(NewServer(fakeQuerier{}, nil))
-	req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+	router := NewRouter(newTestServer(fakeQuerier{}))
+	req := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("статус /auth/login = %d, ожидался 501", rec.Code)
+		t.Fatalf("статус /channels/telegram/link-code = %d, ожидался 501", rec.Code)
 	}
 }
