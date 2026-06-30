@@ -29,6 +29,19 @@ package api
 // логируется на стороне сервера (s.logger) для диагностики, но не
 // возвращается клиенту.
 //
+// Защита от повторного UUID (тикет 2.4, FR B6, ADR 0002 "machine-ws duplicate
+// uuid policy"): на одну интеграцию в любой момент существует не больше
+// ОДНОГО активного WS-соединения. Если второй коннект успешно проходит ту же
+// аутентификацию (тот же integration_id) при уже активном первом — сервер
+// закрывает СТАРОЕ соединение кодом wsCloseSuperseded и принимает новое
+// ("close old, accept new" / last-connection-wins). Решение и обоснование —
+// см. ADR 0002: агент по дизайну (тикет 3.3) держит исходящий WS с
+// авто-реконнектом, и после сетевого сбоя естественный сценарий — переподключиться
+// до того, как сервер формально узнает о смерти старого TCP-соединения;
+// политика "отвергнуть новое" заблокировала бы легитимный реконнект на срок
+// до OFFLINE_THRESHOLD (§6). Реестр активных соединений — s.machineConns,
+// см. registerMachineConn/unregisterMachineConn.
+//
 // Как устроено (тех): контракт (api/openapi.yaml, /machine/ws) формально
 // перечисляет ответы "101"/"401" — это документальное упрощение, OpenAPI не
 // умеет нормально моделировать WS-handshake. Физически после успешного
@@ -79,6 +92,16 @@ import (
 // контракта — не зарезервирован спецификацией/библиотекой и однозначно
 // отличим от стандартных кодов закрытия (1000-1015).
 const wsCloseUnauthorized websocket.StatusCode = 4401
+
+// wsCloseSuperseded — close-код, которым registerMachineConn закрывает
+// СТАРОЕ WS-соединение интеграции, когда его вытесняет новое успешно
+// аутентифицированное соединение той же интеграции (тикет 2.4, FR B6,
+// ADR 0002, см. godoc файла). По аналогии с wsCloseUnauthorized — приватный
+// диапазон 4000-4999 (RFC 6455 §7.4.2); 4409 — мнемоника к HTTP 409 Conflict
+// (конфликтующее, вытесненное соединение), а не к 401: причина закрытия
+// принципиально другая (не провал аутентификации — обе стороны конфликта
+// предъявили одинаково валидный секрет).
+const wsCloseSuperseded websocket.StatusCode = 4409
 
 // machineHelloReadTimeout — сколько GetMachineWs ждёт первый кадр (hello)
 // после успешного WS-апгрейда, прежде чем считать аутентификацию
@@ -134,10 +157,19 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.CloseNow() }()
 
-	if !s.authenticateMachineHello(r, conn) {
+	integrationID, ok := s.authenticateMachineHello(r, conn)
+	if !ok {
 		_ = conn.Close(wsCloseUnauthorized, "unauthorized")
 		return
 	}
+
+	// Защита от повторного UUID (тикет 2.4, FR B6, ADR 0002): регистрируем
+	// это соединение как активное для integrationID, вытесняя предыдущее,
+	// если оно было. Снятие с регистрации — строго по compare-and-delete
+	// (см. unregisterMachineConn), чтобы не задеть запись более нового
+	// соединения, которое могло вытеснить ЭТО же между регистрацией и сюда.
+	s.registerMachineConn(integrationID, conn)
+	defer s.unregisterMachineConn(integrationID, conn)
 
 	// Успешный hello: соединение остаётся открытым. Полноценная обработка
 	// дальнейших кадров (machine.commands/events, ack) — тикет 3.3; здесь —
@@ -152,38 +184,39 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 // authenticateMachineHello читает первый WS-кадр и проверяет его как hello
 // (FR B3, B6): UUID находится по HMAC-отпечатку через
 // GetIntegrationByUUIDHMAC, затем (если у найденной интеграции непустой
-// ip_hint) сверяется IP TCP-пира. true — машина опознана, false — отказ по
-// любой причине (см. godoc файла про единый внешний сигнал).
-func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn) bool {
+// ip_hint) сверяется IP TCP-пира. При успехе возвращает (integration_id,
+// true); при отказе по любой причине — (uuid.Nil, false) (см. godoc файла
+// про единый внешний сигнал).
+func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn) (uuid.UUID, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), machineHelloReadTimeout)
 	defer cancel()
 
 	_, data, err := conn.Read(ctx)
 	if err != nil {
 		s.logMachineAuthRejected("чтение первого кадра", "error", err)
-		return false
+		return uuid.Nil, false
 	}
 
 	var env wsEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		s.logMachineAuthRejected("первый кадр не является валидным JSON-конвертом", "error", err)
-		return false
+		return uuid.Nil, false
 	}
 	if env.Type != helloMessageType {
 		s.logMachineAuthRejected("первый кадр не hello", "type", env.Type)
-		return false
+		return uuid.Nil, false
 	}
 
 	var payload helloPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		s.logMachineAuthRejected("payload hello не парсится", "error", err)
-		return false
+		return uuid.Nil, false
 	}
 
 	secret, err := uuid.Parse(payload.UUID)
 	if err != nil {
 		s.logMachineAuthRejected("uuid в hello не парсится", "error", err)
-		return false
+		return uuid.Nil, false
 	}
 
 	// Поиск интеграции по HMAC-отпечатку UUID-секрета — НЕ по расшифровке
@@ -196,18 +229,18 @@ func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.logMachineAuthRejected("uuid не найден по hmac")
-			return false
+			return uuid.Nil, false
 		}
 		s.logError("GetIntegrationByUUIDHMAC", err)
-		return false
+		return uuid.Nil, false
 	}
 
 	if !machineIPHintMatches(integration.IpHint, r) {
 		s.logMachineAuthRejected("ip_hint не совпал", "integration_id", integration.ID.String())
-		return false
+		return uuid.Nil, false
 	}
 
-	return true
+	return uuid.UUID(integration.ID.Bytes), true
 }
 
 // machineIPHintMatches проверяет необязательную доп. проверку IP (FR B3,
@@ -232,6 +265,52 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// registerMachineConn регистрирует conn как единственное активное
+// WS-соединение интеграции integrationID, вытесняя предыдущее, если оно было
+// (тикет 2.4, FR B6, ADR 0002, см. godoc файла "Защита от повторного UUID").
+//
+// Замена записи реестра происходит под s.machineConnsMu, но закрытие старого
+// соединения — НАМЕРЕННО вне критической секции: conn.Close выполняет полный
+// close-handshake (сетевой I/O), и держать на нём мьютекс заблокировало бы
+// регистрацию/снятие с регистрации других, никак не связанных интеграций.
+func (s *Server) registerMachineConn(integrationID uuid.UUID, conn *websocket.Conn) {
+	s.machineConnsMu.Lock()
+	old, existed := s.machineConns[integrationID]
+	s.machineConns[integrationID] = conn
+	s.machineConnsMu.Unlock()
+
+	if !existed {
+		return
+	}
+
+	if s.logger != nil {
+		// integration_id логируем для диагностики; сам UUID-секрет здесь не
+		// фигурирует (аутентификация уже состоялась по HMAC) и специально не
+		// извлекается (см. godoc файла).
+		s.logger.Warn("WS-соединение машины вытеснено новым подключением той же интеграции",
+			slog.String("integration_id", integrationID.String()))
+	}
+	_ = old.Close(wsCloseSuperseded, "superseded by newer connection")
+}
+
+// unregisterMachineConn снимает conn с регистрации интеграции integrationID
+// ПРИ ДИСКОННЕКТЕ (вызывается из defer GetMachineWs) — НО только если запись
+// реестра всё ещё указывает именно на conn (compare-and-delete).
+//
+// Без этой проверки возможна гонка session-takeover: новое соединение той же
+// интеграции успело зарегистрироваться (registerMachineConn) раньше, чем
+// старое соединение дошло до своего defer здесь — наивное безусловное
+// delete(s.machineConns, integrationID) стёрло бы из реестра уже актуальное
+// НОВОЕ соединение, оставив интеграцию без маршрутизируемой цели для команд
+// (тикет 3.4) при формально живом новом WS.
+func (s *Server) unregisterMachineConn(integrationID uuid.UUID, conn *websocket.Conn) {
+	s.machineConnsMu.Lock()
+	defer s.machineConnsMu.Unlock()
+	if s.machineConns[integrationID] == conn {
+		delete(s.machineConns, integrationID)
+	}
 }
 
 // logMachineAuthRejected пишет причину отказа WS-аутентификации машины в лог
