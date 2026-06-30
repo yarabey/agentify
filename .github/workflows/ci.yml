@@ -1,0 +1,253 @@
+# CI — тикет 0.4 (deps: 0.3). Источник правды по командам: AGENTS.md §7.
+#
+# Назначение (бизнес): исполняемый Definition of Done. Этот workflow блокирует
+# мёрж недокументированного/несобираемого/непротестированного кода. Обязательные
+# гейты (AGENTS.md §0 п.6 и §7): lint / test / bdd / docs-check. Дополнительно
+# держим build, generate-check (контракт-генерёнка синхронна) и web-typecheck.
+#
+# Как устроено (тех):
+#   * Один корневой Go-модуль (github.com/yarabey/agentify) — поэтому изменения в
+#     любом Go-коде гоняют все Go-джобы (lint/build/test/docs-check/bdd/generate),
+#     а изменения web/** гоняют web-джобу. Маршрутизацию делает dorny/paths-filter
+#     (джоб `changes`), результат — булевы выходы go/web/ci.
+#   * golangci-lint фиксируется на ИМЕННО v2.5.0 (как локально и в Makefile):
+#     ставим v2-модуль через `go install ...golangci-lint/v2@v2.5.0` и кладём в
+#     PATH, после чего `make lint`/`make docs-check` используют именно его (v2-схема
+#     .golangci.yml). Это исключает рассинхрон CI с локальным прогоном.
+#   * Интеграционные тесты на testcontainers (Postgres+Redpanda) ещё НЕ написаны —
+#     их добавят тикеты 1.1/3.2/11.3. Джоба `integration` инфраструктурно готова
+#     (Docker в ubuntu-latest доступен по умолчанию) и гоняет
+#     `go test -tags=integration ./...`; сейчас файлов с тегом `integration` нет,
+#     поэтому джоба зелёная (no-op), но каркас готов к появлению тестов. Подробнее —
+#     deploy/README.md, раздел «CI».
+#
+# Required-статусы для branch protection (настраивается вручную, MANUAL_STEPS —
+# в коде protection не задаётся): lint, build, test, generate-check, docs-check,
+# bdd, web, integration. См. README.md раздел «CI».
+#
+# Секреты в YAML значениями НЕ храним (AGENTS.md §8) — этому workflow секреты не
+# нужны; при необходимости они приходят через GitHub Secrets/Environments (тикет 0.5).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "claude/**"
+      - "ticket/**"
+      - "fix/**"
+
+# Отменяем устаревшие запуски на той же ветке/PR, чтобы не жечь раннеры.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  NODE_VERSION: "22"
+  # Версия golangci-lint фиксирована (совпадает с Makefile GOLANGCI_LINT_VERSION
+  # и системным /usr/local/bin/golangci-lint локально).
+  GOLANGCI_LINT_VERSION: "v2.5.0"
+
+jobs:
+  # --- Маршрутизация по путям (path-фильтры) ---------------------------------
+  # Один Go-модуль ⇒ любые изменения в Go-исходниках/контракте/тулинге считаем
+  # «go-изменением»; изменения web/** — «web-изменением». Изменения только в
+  # документации (*.md без кода) не должны держать обязательные Go-гейты, поэтому
+  # выход `ci` отдельно сигналит, что менялось что-то требующее сборки/тестов.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.golangci.yml'
+              - 'api/**'
+              - 'sqlc.yaml'
+              - 'orchestrator/migrations/**'
+              - 'deploy/scripts/**'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+              - 'api/openapi.yaml'
+              - '.github/workflows/ci.yml'
+
+  # --- Линт (обязательный гейт, AGENTS.md §7) --------------------------------
+  lint:
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Ставим ИМЕННО v2.5.0 (v2-модуль) — тем же способом, что `make tools`.
+      - name: Install golangci-lint v2.5.0
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+      - name: golangci-lint version (assert v2.5.0)
+        run: |
+          golangci-lint version
+          golangci-lint version 2>&1 | grep -q "2.5.0" || { echo "ожидался golangci-lint 2.5.0"; exit 1; }
+      - name: make lint
+        run: make lint
+
+  # --- Сборка ----------------------------------------------------------------
+  build:
+    name: build
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build ./...
+        run: go build ./...
+
+  # --- Unit-тесты (обязательный гейт, AGENTS.md §7) --------------------------
+  test:
+    name: test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: make test
+        run: make test
+
+  # --- Контракт-генерёнка синхронна ------------------------------------------
+  # `make generate` детерминированно перегенерит Go-типы/chi-сервер (oapi-codegen),
+  # TS-схему web (openapi-typescript) и модели БД (sqlc); затем git diff --exit-code.
+  generate-check:
+    name: generate-check
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Тулинг кодогенерации фиксированных версий: Go-инструменты + npm-пакеты web.
+      - name: Install codegen toolchain (oapi-codegen, sqlc, openapi-typescript)
+        run: make tools
+      - name: make generate-check
+        run: make generate-check
+
+  # --- Документация (обязательный гейт, AGENTS.md §7) ------------------------
+  # docs-check вызывает системный golangci-lint через переменную GOLANGCI_LINT —
+  # обеспечиваем v2.5.0 на PATH и передаём её путь, чтобы использовалась v2-схема.
+  docs-check:
+    name: docs-check
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install golangci-lint v2.5.0
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+      # docs-check.sh по умолчанию ищет /usr/local/bin/golangci-lint; передаём путь
+      # к установленному v2.5.0 из GOBIN явно через SYSTEM_GOLANGCI_LINT.
+      - name: make docs-check
+        run: make docs-check SYSTEM_GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+
+  # --- BDD (обязательный гейт, AGENTS.md §7) ---------------------------------
+  # Сейчас `make bdd` — заглушка (godog-харнесс придёт в тикете 11.2). Джоба
+  # зелёная; та же команда заработает без правок workflow, когда появятся .feature.
+  bdd:
+    name: bdd
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: make bdd
+        run: make bdd
+
+  # --- Интеграционные тесты на testcontainers (Postgres+Redpanda) ------------
+  # Каркас для тикетов 1.1/3.2/11.3. Docker доступен в ubuntu-latest по умолчанию,
+  # поэтому testcontainers-go сможет поднимать реальные Postgres+Redpanda.
+  # Сейчас интеграционных тестов нет: они будут помечены `//go:build integration`,
+  # а здесь гоняется `go test -tags=integration ./...` — на пустом множестве это
+  # no-op (exit 0). Каркас готов: добавление тестов с тегом сразу включит джобу.
+  integration:
+    name: integration
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Docker available (testcontainers)
+        run: docker version
+      - name: go test -tags=integration ./...
+        run: go test -tags=integration ./...
+
+  # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
+  # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим
+  # TS-типы из openapi.yaml и проверяем типы (tsc --noEmit).
+  web:
+    name: web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: npm ci
+      - name: gen:api (TS-схема из контракта)
+        run: npm run gen:api
+      # Полноценного tsconfig пока нет (Vite-приложение — тикет 9.1), поэтому
+      # типизируем сгенерированную из контракта схему напрямую с явными опциями.
+      # Это реальный гейт: битая TS-схема из openapi.yaml уронит джобу.
+      - name: tsc typecheck (generated API schema)
+        run: npx tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler src/api/schema.ts

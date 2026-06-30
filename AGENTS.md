@@ -102,6 +102,11 @@ make docs-check   # проверка: нет публичных символов
 make run-local    # поднять всё в docker compose локально
 ```
 CI блокирует мёрж, если падает любой из `lint / test / bdd / docs-check`.
+Реализация — [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (тикет 0.4):
+те же `make`-цели плюс `build`, `generate-check`, `integration` (testcontainers) и
+`web`-typecheck; path-фильтры по сервисам. Какие чек-раны включить в branch
+protection — см. раздел «CI» в [`README.md`](README.md). golangci-lint в CI
+фиксирован на `v2.5.0` (v2-схема `.golangci.yml`).
 
 ---
 
