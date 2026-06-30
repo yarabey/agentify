@@ -13,7 +13,7 @@
 | 0.5 | todo |  |  | CD |
 | 0.6 | done | #2 merge 0.6 | 2026-06-30 | Базис трёх Go-сервисов |
 | 0.7 | done | merge 0.7 | 2026-06-30 | AGENTS.md и дисциплина доков |
-| 1.1 | in_progress |  |  | Схема auth |
+| 1.1 | done | #2 merge 1.1 | 2026-06-30 | Схема auth |
 | 1.2 | todo |  |  | Регистрация по токену |
 | 1.3 | todo |  |  | Логин / refresh / logout |
 | 1.4 | todo |  |  | Middleware auth |
