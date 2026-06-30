@@ -19,7 +19,7 @@
 | 1.4 | done | merge 8e9aa6d | 2026-06-30 | Middleware auth |
 | 1.5 | todo |  |  | Изоляция данных |
 | 1.6 | todo |  |  | Показ токена регистрации |
-| 1.7 | in_progress |  |  | Bootstrap |
+| 1.7 | done | merge f2ca076 | 2026-06-30 | Bootstrap |
 | 2.1 | todo |  |  | Схема интеграций |
 | 2.2 | todo |  |  | CRUD + выдача UUID |
 | 2.3 | todo |  |  | Аутентификация машины по UUID |
