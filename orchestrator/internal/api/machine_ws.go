@@ -82,6 +82,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 )
 
@@ -110,36 +111,6 @@ const wsCloseSuperseded websocket.StatusCode = 4409
 // соединения, не давая медленному/зависшему клиенту держать handshake
 // бесконечно.
 const machineHelloReadTimeout = 10 * time.Second
-
-// wsEnvelope — JSON-конверт сообщения протокола машина↔оркестратор
-// (docs/protocol.md §2). Здесь используется только для разбора самого
-// первого кадра (hello) на WS-handshake; остальные поля, кроме Type и
-// Payload, тикетом 2.3 не используются (полноценная обработка конверта —
-// тикет 3.3), но включены для полноты разбора и будущего переиспользования.
-type wsEnvelope struct {
-	MessageID       string          `json:"message_id"`
-	TaskID          *string         `json:"task_id"`
-	IntegrationID   string          `json:"integration_id"`
-	Type            string          `json:"type"`
-	Seq             int64           `json:"seq"`
-	Ts              string          `json:"ts"`
-	ProtocolVersion string          `json:"protocol_version"`
-	Payload         json.RawMessage `json:"payload"`
-}
-
-// helloMessageType — значение поля Type конверта, которым агент
-// аутентифицируется сразу после WS-коннекта (docs/protocol.md §4).
-const helloMessageType = "hello"
-
-// helloPayload — payload сообщения type=="hello" (docs/protocol.md §4):
-// {uuid, agent_version, providers[]}. agent_version/Providers тикетом 2.3 не
-// проверяются (сверка версии протокола/агента — FR C5, тикет 4.7), но
-// разбираются, чтобы провалидировать сам факт корректного hello-кадра.
-type helloPayload struct {
-	UUID         string   `json:"uuid"`
-	AgentVersion string   `json:"agent_version"`
-	Providers    []string `json:"providers"`
-}
 
 // GetMachineWs реализует GET /machine/ws — WS-handshake с аутентификацией
 // машины по UUID (FR B3, B6, тикет 2.3, см. godoc файла).
@@ -197,17 +168,17 @@ func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn)
 		return uuid.Nil, false
 	}
 
-	var env wsEnvelope
+	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		s.logMachineAuthRejected("первый кадр не является валидным JSON-конвертом", "error", err)
 		return uuid.Nil, false
 	}
-	if env.Type != helloMessageType {
+	if env.Type != bus.MessageTypeHello {
 		s.logMachineAuthRejected("первый кадр не hello", "type", env.Type)
 		return uuid.Nil, false
 	}
 
-	var payload helloPayload
+	var payload bus.HelloPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		s.logMachineAuthRejected("payload hello не парсится", "error", err)
 		return uuid.Nil, false
