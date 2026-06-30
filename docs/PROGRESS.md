@@ -15,7 +15,7 @@
 | 0.7 | done | merge 0.7 | 2026-06-30 | AGENTS.md и дисциплина доков |
 | 1.1 | done | #2 merge 1.1 | 2026-06-30 | Схема auth |
 | 1.2 | done | merge 344e3a8 | 2026-06-30 | Регистрация по токену |
-| 1.3 | todo |  |  | Логин / refresh / logout |
+| 1.3 | in_progress |  |  | Логин / refresh / logout |
 | 1.4 | todo |  |  | Middleware auth |
 | 1.5 | todo |  |  | Изоляция данных |
 | 1.6 | todo |  |  | Показ токена регистрации |
