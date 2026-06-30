@@ -1,25 +1,30 @@
-// Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов 1.2/1.3.
+// Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов
+// 1.2/1.3/1.4.
 //
 // Назначение (бизнес): здесь живёт каркас единого REST-API оркестратора (через
 // который ходят web PWA и Telegram-бот, см. orchestrator/README.md), а реально
 // реализован весь auth-поток: регистрация по токену — POST /auth/register
 // (FR A1, Gherkin §1), логин/refresh/logout — POST /auth/login,
-// POST /auth/refresh, POST /auth/logout (FR A3). Доступ в систему закрытый:
-// аккаунт создаётся лишь при предъявлении активного секретного токена
-// регистрации; без него — отказ (FR A1). Остальные операции контракта
-// (middleware — 1.4, интеграции/задачи — позже) пока отвечают 501 Not
-// Implemented и будут реализованы в своих тикетах.
+// POST /auth/refresh, POST /auth/logout (FR A3), и auth-middleware,
+// определяющий пользователя по access-токену на защищённых маршрутах
+// (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go). Доступ
+// в систему закрытый: аккаунт создаётся лишь при предъявлении активного
+// секретного токена регистрации; без него — отказ (FR A1). Остальные операции
+// контракта (интеграции/задачи — позже) пока отвечают 501 Not Implemented и
+// будут реализованы в своих тикетах, но уже сейчас проходят через
+// auth-middleware наравне с готовыми защищёнными операциями.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
 // только готовые операции — GetHealthz, PostAuthRegister и
 // PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go). NewRouter монтирует
-// chi-роутер из сгенерированного HandlerFromMux (он же поднимает GET /healthz и
+// chi-роутер из сгенерированного HandlerWithOptions (он же поднимает GET /healthz и
 // все маршруты API от корня — Caddy роутит /api/* со стрипом префикса, поэтому
-// пути монтируются от корня: /auth/register, /healthz). Слой данных — sqlc
-// *db.Queries поверх pgxpool; бизнес-логика проверки токена и хэширования пароля
-// живёт в обработчике, SQL — в db.
+// пути монтируются от корня: /auth/register, /healthz), подключая
+// auth-middleware выборочно к защищённым маршрутам (см. NewRouter и
+// middleware.go). Слой данных — sqlc *db.Queries поверх pgxpool; бизнес-логика
+// проверки токена и хэширования пароля живёт в обработчике, SQL — в db.
 package api
 
 import (
@@ -93,17 +98,31 @@ func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte) *Serv
 }
 
 // NewRouter монтирует chi-роутер оркестратора: общие middleware (recover,
-// request-id) и все маршруты из сгенерированного контракта поверх переданного
-// Server.
+// request-id), auth-middleware (тикет 1.4) и все маршруты из сгенерированного
+// контракта поверх переданного Server.
 //
 // Маршруты монтируются от корня (Caddy стрипает префикс /api/*), включая
 // GET /healthz и POST /auth/register. Возвращаемый chi.Router передаётся в
 // platform.Service.SetHandler, сохраняя единый graceful shutdown.
+//
+// auth-middleware (s.authMiddleware, см. middleware.go) подключается через
+// ChiServerOptions.Middlewares — официальный per-operation хук
+// oapi-codegen-chi: сгенерированный ServerInterfaceWrapper прогоняет его для
+// каждой операции, но контекст запроса к этому моменту уже содержит маркер
+// BearerAuthScopes ТОЛЬКО для операций, защищённых контрактом (без
+// `security: []` в openapi.yaml) — так middleware применяется выборочно к
+// защищённым маршрутам, не трогая публичные (/healthz, /auth/register,
+// /auth/login, /auth/refresh, /machine/ws), без ручного списка путей и без
+// правок сгенерированного кода (подробности — godoc middleware.go).
 func NewRouter(s *Server) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
-	return HandlerFromMux(s, r).(chi.Router)
+	handler := HandlerWithOptions(s, ChiServerOptions{
+		BaseRouter:  r,
+		Middlewares: []MiddlewareFunc{s.authMiddleware},
+	})
+	return handler.(chi.Router)
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.
