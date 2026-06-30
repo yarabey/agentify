@@ -5,7 +5,7 @@
 # `run-local` — заглушки, реализуемые в тикетах 0.2 / 11.2 / 0.7 / 0.3.
 
 # --- Зафиксированные версии инструментов (тикет 0.1) ---
-GOLANGCI_LINT_VERSION ?= v1.64.8
+GOLANGCI_LINT_VERSION ?= v2.5.0
 SQLC_VERSION          ?= v1.27.0
 GOOSE_VERSION         ?= v3.24.1
 OAPI_CODEGEN_VERSION  ?= v2.4.1
@@ -24,7 +24,7 @@ help: ## Показать список целей.
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 tools: ## Установить инструментарий (sqlc, goose, oapi-codegen, golangci-lint, goreleaser) фиксированных версий.
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 	go install github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
 	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)

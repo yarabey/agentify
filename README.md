@@ -64,17 +64,19 @@ make test    # unit-тесты
 ## Линтеры документации
 
 Согласно [`AGENTS.md` §3](AGENTS.md), документация — часть Definition of Done.
-В [`.golangci.yml`](.golangci.yml) включены:
+[`.golangci.yml`](.golangci.yml) написан по **схеме golangci-lint v2** (ключ
+`version: "2"`), под системный бинарь `v2.5.0`. Включены:
 
 - **revive** — требует godoc на экспортируемых символах (`exported`) и
   комментарии пакетов (`package-comments`);
 - **godot** — комментарии должны заканчиваться точкой.
 
 > Отклонение тикета 0.1: отдельный линтер `godoclint`, упомянутый в AGENTS.md §3
-> и тексте тикета, в `golangci-lint v1.64.8` **отсутствует** в реестре линтеров.
-> Покрытие godoc обеспечивается связкой `revive` (`exported` + `package-comments`)
-> и `godot`. Полную проверку документации возьмёт на себя `make docs-check`
-> (тикет 0.7); при появлении `godoclint` он будет добавлен в конфиг.
+> и тексте тикета, в `golangci-lint` **отсутствует** в реестре линтеров
+> (проверено в `v1.64.8` и `v2.5.0`). Покрытие godoc обеспечивается связкой
+> `revive` (`exported` + `package-comments`) и `godot`. Полную проверку
+> документации возьмёт на себя `make docs-check` (тикет 0.7); при появлении
+> `godoclint` он будет добавлен в конфиг.
 
 Дополнительно: [`.editorconfig`](.editorconfig) (единый стиль файлов) и
 [`.pre-commit-config.yaml`](.pre-commit-config.yaml) (gofmt/vet/golangci-lint

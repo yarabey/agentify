@@ -1,20 +1,25 @@
-# Конфигурация golangci-lint для монорепо agentify.
+# Конфигурация golangci-lint (схема v2) для монорепо agentify.
 #
 # Назначение: включить линтеры документации (AGENTS.md §3) — revive (требует
-# godoc на экспортируемых символах) и godot (комментарии заканчиваются точкой),
-# плюс базовый набор для качества Go-кода.
+# godoc на экспортируемых символах + комментарии пакетов) и godot (комментарии
+# заканчиваются точкой), плюс базовый набор для качества Go-кода.
 #
 # Отклонение: отдельный линтер `godoclint`, упомянутый в AGENTS.md §3 и тикете
-# 0.1, в golangci-lint v1.64.8 ОТСУТСТВУЕТ в реестре линтеров. Покрытие godoc
-# обеспечивается revive (правила exported/package-comments) и godot. Когда
-# godoclint станет доступен (или появится make docs-check в тикете 0.7), он
-# будет добавлен сюда.
+# 0.1, в golangci-lint отсутствует в реестре линтеров (проверено в v1.64.8 и
+# v2.5.0). Покрытие godoc обеспечивается revive (правила exported /
+# package-comments) и godot. Когда godoclint станет доступен (или появится
+# make docs-check в тикете 0.7), он будет добавлен сюда.
+#
+# Схема — v2 (golangci-lint >= 2.x); ключ version обязателен.
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  # В v2 вместо disable-all используется default: none.
+  default: none
   enable:
     # --- линтеры документации (требование AGENTS.md §3) ---
     - revive # godoc на экспортируемых символах, комментарии пакетов
@@ -27,33 +32,33 @@ linters:
     - unused
     - misspell
 
-linters-settings:
-  godot:
-    # Проверять godoc-комментарии ко всем декларациям, а не только верхнего уровня.
-    scope: declarations
-    capital: false
-  revive:
-    # Включаем правила, требующие документацию (AGENTS.md §3).
-    rules:
-      - name: exported
-        severity: error
-        disabled: false
-        arguments:
-          - checkPrivateReceivers
-          - sayRepetitiveInsteadOfStutters
-      - name: package-comments
-        severity: error
-        disabled: false
-      - name: blank-imports
-      - name: context-as-argument
-      - name: error-return
-      - name: error-naming
-      - name: if-return
-      - name: indent-error-flow
-      - name: var-declaration
+  settings:
+    godot:
+      # Проверять godoc-комментарии ко всем декларациям, а не только верхнего уровня.
+      scope: declarations
+      capital: false
+    revive:
+      # Включаем правила, требующие документацию (AGENTS.md §3).
+      rules:
+        - name: exported
+          severity: error
+          disabled: false
+          arguments:
+            - checkPrivateReceivers
+            - sayRepetitiveInsteadOfStutters
+        - name: package-comments
+          severity: error
+          disabled: false
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: indent-error-flow
+        - name: var-declaration
 
-issues:
-  # Не маскировать дефолтным excludes наши требования к godoc.
-  exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
+  exclusions:
+    # Не маскировать дефолтными исключениями наши требования к godoc.
+    # (В v2 пресет "comments" гасил бы часть revive/godot — не включаем его.)
+    presets: []
+    rules: []
