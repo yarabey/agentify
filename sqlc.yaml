@@ -1,0 +1,24 @@
+# Конфигурация sqlc (v1.27.0): типобезопасный доступ к БД оркестратора.
+#
+# Назначение (бизнес): по AGENTS.md §3 и docs/01_tech_stack_and_architecture.md §3
+# запросы к БД пишутся как SQL и компилируются в типобезопасные Go-функции (sqlc),
+# без ORM-магии. Источник схемы — миграции goose в orchestrator/migrations.
+#
+# Как устроено (тех): engine=postgresql, драйвер pgx/v5. На момент тикета 0.2
+# orchestrator/queries ещё пуст (запросы добавит тикет 1.1). sqlc на пустом
+# каталоге запросов отрабатывает БЕЗ ошибки и генерит из схемы models.go
+# (таблицы → Go-структуры) + db.go. emit_* подобраны под идиоматичный pgx-код.
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "orchestrator/migrations"
+    queries: "orchestrator/queries"
+    gen:
+      go:
+        package: "db"
+        out: "orchestrator/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        emit_interface: false
+        emit_empty_slices: true

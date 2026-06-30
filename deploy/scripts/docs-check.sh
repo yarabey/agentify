@@ -127,12 +127,27 @@ else
 	fi
 fi
 
-# --- (c+) Полный codegen-diff: заглушка до тикета 0.2 -------------------------
-# TODO(0.2): после реализации `make generate` (oapi-codegen) добавить здесь
-# реальный diff: сгенерировать клиентов/серверные интерфейсы из openapi.yaml во
-# временный каталог и сравнить с закоммиченным кодом; расхождение => exit!=0.
-# Сейчас это осознанный no-op — кодогенерации в дереве пока нет.
-log "(c+) полный codegen-diff включится после тикета 0.2 (см. TODO(0.2) в скрипте) — пропуск"
+# --- (c+) Полный codegen-diff (тикет 0.2) -------------------------------------
+# Реализовано в тикете 0.2: `make generate` детерминированно генерит Go-типы и
+# chi-сервер (oapi-codegen), TS-схему web (openapi-typescript) и модели БД (sqlc)
+# из api/openapi.yaml + миграций; `make generate-check` затем сравнивает результат
+# с закоммиченным деревом. Расхождение => генерёнка устарела => exit!=0.
+#
+# Тулчейн кодогенерации (oapi-codegen, sqlc, node) есть не во всех окружениях, где
+# гоняется docs-check (напр. голый pre-commit). Поэтому проверку запускаем, ТОЛЬКО
+# если инструменты доступны; иначе осознанно пропускаем — полноценный codegen-diff
+# обеспечивает CI (тикет 0.4) через отдельную цель `make generate-check`.
+log "(c+) полный codegen-diff: make generate && git diff --exit-code (если тулчейн доступен)"
+GOBIN_DIR="$(go env GOPATH 2>/dev/null)/bin"
+if [ -x "${GOBIN_DIR}/oapi-codegen" ] && [ -x "${GOBIN_DIR}/sqlc" ] && command -v npm >/dev/null 2>&1; then
+	if make -s generate-check OAPI_CODEGEN="${GOBIN_DIR}/oapi-codegen" SQLC="${GOBIN_DIR}/sqlc" >/dev/null 2>&1; then
+		ok "(c+) сгенерированный код синхронен с api/openapi.yaml"
+	else
+		fail "(c+) генерёнка разошлась с контрактом — запусти 'make generate' и закоммить результат"
+	fi
+else
+	log "(c+) тулчейн кодогенерации недоступен (oapi-codegen/sqlc/npm) — пропуск; полный diff обеспечит CI (make generate-check)"
+fi
 
 # --- Итог ---------------------------------------------------------------------
 if [ "${rc}" -eq 0 ]; then

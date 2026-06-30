@@ -19,9 +19,14 @@ export PATH := $(GOBIN):$(PATH)
 # использовать именно его, не полагаясь на GOPATH/bin. Переопределяемо извне.
 SYSTEM_GOLANGCI_LINT ?= /usr/local/bin/golangci-lint
 
+# Инструменты кодогенерации (тикет 0.2). Берём из GOBIN (ставит `make tools`),
+# но позволяем переопределить, если бинарь лежит в другом месте.
+OAPI_CODEGEN ?= $(GOBIN)/oapi-codegen
+SQLC         ?= $(GOBIN)/sqlc
+
 .DEFAULT_GOAL := help
 
-.PHONY: help tools generate lint test bdd docs-check run-local
+.PHONY: help tools generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local
 
 help: ## Показать список целей.
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -33,10 +38,26 @@ tools: ## Установить инструментарий (sqlc, goose, oapi-c
 	go install github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
 	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
 	go install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
-	@echo "tools installed into $(GOBIN)"
+	npm --prefix web ci
+	@echo "tools installed into $(GOBIN) и web/node_modules (openapi-typescript)"
 
-generate: ## [ЗАГЛУШКА — тикет 0.2] Кодогенерация из openapi.yaml и sqlc.
-	@echo "generate: implemented in ticket 0.2"
+generate: generate-go generate-ts generate-sql ## Кодогенерация из openapi.yaml (oapi-codegen, openapi-typescript) и схемы БД (sqlc).
+	@echo "generate: done (go types+server, ts schema, sqlc models)"
+
+generate-go: ## Сгенерировать Go-типы и chi-серверный интерфейс из api/openapi.yaml (oapi-codegen).
+	$(OAPI_CODEGEN) --config api/oapi-codegen.types.yaml api/openapi.yaml
+	$(OAPI_CODEGEN) --config api/oapi-codegen.server.yaml api/openapi.yaml
+
+generate-ts: ## Сгенерировать TS-типы web из api/openapi.yaml (openapi-typescript).
+	npm --prefix web run gen:api
+
+generate-sql: ## Сгенерировать Go-модели БД из миграций (sqlc); запросы добавит тикет 1.1.
+	$(SQLC) generate
+
+generate-check: generate ## Проверить, что закоммиченная генерёнка совпадает с контрактом (CI, тикет 0.4).
+	@git diff --exit-code -- orchestrator/internal/api orchestrator/internal/db web/src/api/schema.ts \
+		|| { echo "generate-check: сгенерированный код разошёлся с контрактом — запусти 'make generate' и закоммить"; exit 1; }
+	@echo "generate-check: генерёнка синхронна с контрактом"
 
 lint: ## Запустить golangci-lint (вкл. линтеры документации revive/godot).
 	golangci-lint run ./...
