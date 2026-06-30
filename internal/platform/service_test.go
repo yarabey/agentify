@@ -3,11 +3,30 @@ package platform
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// freeAddr возвращает свободный эфемерный loopback-адрес для теста. Открывает
+// слушатель на 127.0.0.1:0, фиксирует присвоенный ядром адрес и сразу закрывает
+// слушатель, отдавая адрес наружу. TOCTOU-окно между закрытием и повторным
+// связыванием в Service.Run мало и приемлемо для теста; это герметизирует тест
+// от конфликтов по портам и от чужих процессов на фиксированном порту.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("не удалось подобрать свободный порт: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("не удалось закрыть временный слушатель: %v", err)
+	}
+	return addr
+}
 
 // freeConfig возвращает базовый конфиг с эфемерным портом (:0), чтобы тесты не
 // конфликтовали за фиксированный адрес и могли идти параллельно/повторно.
@@ -80,38 +99,54 @@ func TestRunGracefulShutdownOnSIGTERM(t *testing.T) {
 // /healthz реально отвечает по сети на сконфигурированном адресе.
 func TestRunServesHealthzWhileRunning(t *testing.T) {
 	cfg := freeConfig()
-	// Фиксированный loopback-порт для обращения по сети; при занятости тест
-	// просто упадёт с понятной ошибкой, что приемлемо для smoke-проверки.
-	cfg.HealthAddr = "127.0.0.1:18099"
+	// Свободный эфемерный loopback-адрес: тест герметичен, не зависит от чужих
+	// процессов и не конфликтует с другими тестами по фиксированному порту.
+	cfg.HealthAddr = freeAddr(t)
 
 	svc, err := NewService("bot", cfg)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
 
+	// Явная последовательность остановки вместо ловушки defer (LIFO):
+	// сначала ждём готовности и проверяем 200, затем cancel(), и только потом
+	// читаем результат Run. Это и проверяет путь graceful shutdown (Run обязан
+	// вернуть nil после отмены контекста).
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- svc.Run(ctx) }()
-	defer func() { <-done }()
 
 	url := fmt.Sprintf("http://%s/healthz", cfg.HealthAddr)
 	var resp *http.Response
 	// Дать серверу подняться: несколько попыток с коротким ожиданием.
 	for i := 0; i < 20; i++ {
-		resp, err = http.Get(url) //nolint:gosec // адрес — наш фиксированный loopback в тесте
+		resp, err = http.Get(url) //nolint:gosec // адрес — наш эфемерный loopback в тесте
 		if err == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if err != nil {
+		cancel()
+		<-done
 		t.Fatalf("GET %s не удался: %v", url, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("статус /healthz = %d, ожидалось 200", resp.StatusCode)
+	statusCode := resp.StatusCode
+	_ = resp.Body.Close()
+	if statusCode != http.StatusOK {
+		t.Errorf("статус /healthz = %d, ожидалось 200", statusCode)
+	}
+
+	// Инициируем остановку и убеждаемся, что Run корректно завершает shutdown.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run вернул ошибку при graceful shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не вернулся в таймаут после отмены контекста")
 	}
 }
 
