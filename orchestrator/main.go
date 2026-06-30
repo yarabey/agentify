@@ -10,7 +10,11 @@
 // pgxpool и монтирует сгенерированный из openapi API-роутер (тикет 1.2: реальный
 // POST /auth/register; тикет 1.3: POST /auth/login, /auth/refresh, /auth/logout;
 // прочие операции — 501), затем блокируется до SIGTERM/SIGINT и гасится
-// gracefully, закрывая пул.
+// gracefully, закрывая пул. Бинарь поддерживает одну подкоманду —
+// `orchestrator bootstrap` (тикет 1.7, см. cmd_bootstrap.go): без аргументов
+// запускается обычный сервис (как раньше), с аргументом "bootstrap" —
+// идемпотентно создаёт первого администратора и стартовый токен регистрации и
+// завершается, не поднимая HTTP.
 package main
 
 import (
@@ -57,6 +61,18 @@ type config struct {
 }
 
 func main() {
+	// Подкоманда `orchestrator bootstrap` (тикет 1.7) перехватывается ДО
+	// обычного запуска сервиса: без аргументов (len(os.Args) == 1) поведение
+	// не меняется — стартует сервис, как и раньше. Простого разбора os.Args[1]
+	// достаточно для единственной подкоманды MVP — без новой CLI-библиотеки.
+	if len(os.Args) > 1 && os.Args[1] == "bootstrap" {
+		if err := runBootstrap(); err != nil {
+			fmt.Fprintln(os.Stderr, "orchestrator bootstrap: фатальная ошибка:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "orchestrator: фатальная ошибка:", err)
 		os.Exit(1)
