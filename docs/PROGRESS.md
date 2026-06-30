@@ -27,7 +27,7 @@
 | 2.5 | todo |  |  | Редактирование не рвёт задачи |
 | 2.6 | todo |  |  | Удаление с активными задачами |
 | 3.1 | done | #2 merge 3.1 | 2026-06-30 | ADR топиков Redpanda (+hotfix флака platform-теста) |
-| 3.2 | in_progress |  |  | Producer/Consumer (franz-go) |
+| 3.2 | done | #2 merge 3.2 | 2026-06-30 | Producer/Consumer (franz-go) |
 | 3.3 | todo |  |  | WS-транспорт агент↔оркестратор |
 | 3.4 | todo |  |  | Мост оркестратора |
 | 3.5 | todo |  |  | Локальный outbox агента (bbolt) |
