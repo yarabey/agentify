@@ -1,0 +1,152 @@
+# CD — тикет 0.5 (deps: 0.4). Источник правды по решению — 01_tech_stack_and_architecture.md
+# §2 [РЕШЕНИЕ 5]: «CI собирает образы, пушит в GHCR, по SSH делает
+# docker compose pull && up на Ubuntu-VPS».
+#
+# Назначение (бизнес): это единственный путь, которым код попадает на прод.
+# Запуск — ручной и осознанный (FR/ADR не предполагают авто-деплоя на каждый
+# мёрж в MVP): кто-то явно нажимает «Run workflow», и дополнительно требуется
+# подтверждение required reviewer-а на окружении `prod` (настраивается
+# человеком в GitHub UI, см. docs/MANUAL_STEPS.md §3) — двойная защита от
+# случайного релиза непроверенного состояния main.
+#
+# Как устроено (тех):
+#   * Триггер — ТОЛЬКО workflow_dispatch, без input-параметров: деплоится
+#     текущее состояние ветки, на которой запущен workflow (`github.sha`).
+#     Обычный режим использования — «Run workflow» на ветке main.
+#   * concurrency без cancel-in-progress: деплой не должен обрываться
+#     на середине (в отличие от CI, где устаревшие прогоны безопасно отменять).
+#   * Job build-and-push: матрица по 4 нашим сервисам (orchestrator, bot, web,
+#     caddy), у каждого свой Dockerfile (см. соответствующие Dockerfile/
+#     deploy/caddy.Dockerfile). Логинимся в GHCR штатным GITHUB_TOKEN
+#     (permissions.packages: write на этот job) — отдельный PAT не нужен,
+#     человек один раз включает package write permissions для Actions
+#     (MANUAL_STEPS.md §3). Образ тегируется и SHA коммита, и `latest`.
+#     Кэш слоёв — GitHub Actions cache (type=gha), отдельный scope на сервис,
+#     чтобы кэши сервисов не вытесняли друг друга.
+#   * Job deploy: needs build-and-push, окружение `prod` — именно тут GitHub
+#     применяет required reviewer, настроенный человеком (MANUAL_STEPS.md §3).
+#     По SSH (appleboy/ssh-action, секреты SSH_DEPLOY_KEY/SSH_HOST/SSH_USER —
+#     точные имена из MANUAL_STEPS.md §3) на VPS:
+#       1) обновляем рабочую копию репозитория в ~/agentify до точного коммита
+#          деплоя (`git fetch` + `git checkout <sha>`) — это и есть синхронизация
+#          docker-compose.yml/docker-compose.prod.yml/Caddyfile.prod на VPS:
+#          они уже лежат в репозитории, отдельный scp не нужен. Выбран этот
+#          способ (а не scp перед командой), потому что он проще (один SSH-шаг,
+#          без второго экшена для передачи файлов) и надёжнее (на VPS
+#          оказывается ровно то дерево конфигов, что соответствует задеплоенным
+#          образам — тот же коммит, без риска рассинхрона при частичном scp).
+#          Подробности и предусловие (репозиторий должен быть один раз
+#          вручную склонирован на VPS в ~/agentify) — deploy/README.md.
+#       2) логинимся в GHCR на VPS тем же GITHUB_TOKEN джобы (живёт только
+#          в рамках этого запуска, на VPS не персистится — `docker logout`
+#          в конце; токен передаётся в скрипт через переменную окружения,
+#          в лог не печатается);
+#       3) `docker compose -f docker-compose.yml -f docker-compose.prod.yml
+#          pull && ... up -d` с IMAGE_TAG=<sha> — поднимаем именно тот образ,
+#          который только что собрал build-and-push.
+#
+# Секреты в YAML значениями не храним (AGENTS.md §8) — только ссылки на
+# secrets.*; точные имена секретов взяты из docs/MANUAL_STEPS.md §3 (не
+# редактируется агентами, см. AGENTS.md/ORCHESTRATION.md).
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+# Деплой не отменяем на середине (в отличие от ci.yml) — обрыв на полпути
+# может оставить VPS с частично обновлённым набором образов.
+concurrency:
+  group: deploy-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # --- Сборка и публикация образов в GHCR -------------------------------------
+  build-and-push:
+    name: build-and-push (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - service: orchestrator
+            dockerfile: orchestrator/Dockerfile
+          - service: bot
+            dockerfile: bot/Dockerfile
+          - service: web
+            dockerfile: web/Dockerfile
+          - service: caddy
+            dockerfile: deploy/caddy.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Контекст сборки — корень монорепо для всех 4 сервисов (как и в
+      # docker-compose.yml: каждому Dockerfile нужны общие go.mod/internal/*
+      # либо корень для web/caddy).
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/yarabey/agentify-${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/yarabey/agentify-${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # --- Деплой на VPS по SSH ----------------------------------------------------
+  deploy:
+    name: deploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Применяет required reviewer окружения prod, настроенный человеком
+    # (MANUAL_STEPS.md §3) — без подтверждения этот job не стартует.
+    environment: prod
+    steps:
+      - name: Pull repo on VPS, login to GHCR, roll out images
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_DEPLOY_KEY }}
+          envs: IMAGE_TAG,GHCR_ACTOR,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            # Предусловие (одноразово, руками): репозиторий уже склонирован
+            # на VPS в ~/agentify deploy-пользователем. См. deploy/README.md.
+            cd ~/agentify
+
+            # Синхронизируем docker-compose.yml/docker-compose.prod.yml/
+            # Caddyfile.prod на VPS до состояния, с которого собраны образы.
+            # Тянем все ветки (без явного refspec) — workflow_dispatch можно
+            # запустить не только с main, поэтому фиксируемся на точном SHA,
+            # а не на имени ветки.
+            git fetch --quiet origin
+            git checkout --quiet "${IMAGE_TAG}"
+
+            # Токен живёт только в рамках этого шага: логинимся, катим,
+            # разлогиниваемся. Не печатаем токен в лог.
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_ACTOR}" --password-stdin
+
+            export IMAGE_TAG
+            docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml pull
+            docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+
+            docker logout ghcr.io
