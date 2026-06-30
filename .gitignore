@@ -1,0 +1,24 @@
+# Бинарные артефакты сборки
+/bin/
+/out/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# Секреты и локальная конфигурация (см. AGENTS.md §8)
+.env
+.env.*
+!.env.example
+
+# Зависимости web
+/web/node_modules/
+/web/dist/
+
+# Редакторы/ОС
+.DS_Store
+.idea/
+.vscode/
