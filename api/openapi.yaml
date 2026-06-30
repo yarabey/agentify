@@ -1,0 +1,526 @@
+openapi: 3.1.0
+info:
+  title: Orchestrator API (единый API всех каналов)
+  version: 0.1.0-mvp
+  description: |
+    Единый API оркестратора. Через него работают все каналы (web PWA, Telegram-бот).
+    Машинный канал (агент ↔ оркестратор) идёт по WebSocket с аутентификацией по UUID
+    и здесь описан только как точка подключения — формат сообщений см. docs/protocol.md.
+    Трассировка требований: коды FR (A1, B2, E2…) и Gherkin-функции даны в описаниях.
+
+servers:
+  - url: https://api.example.com
+    description: prod (заменить на свой домен)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+    description: Регистрация, логин, токены (FR A1–A3, Gherkin §1)
+  - name: admin
+    description: Администрирование (FR A2)
+  - name: integrations
+    description: Интеграции и машины (FR B1–B6, Gherkin §2)
+  - name: tasks
+    description: Жизненный цикл задачи (FR E, F, H; Gherkin §4–§10)
+  - name: channels
+    description: Привязка каналов, напр. Telegram (FR D3)
+  - name: machine
+    description: Точка подключения агента (WebSocket, auth по UUID)
+
+paths:
+  /healthz:
+    get:
+      summary: Health-check
+      security: []
+      responses:
+        "200": { description: OK }
+
+  # ---------- AUTH (FR A1–A3, Gherkin §1) ----------
+  /auth/register:
+    post:
+      tags: [auth]
+      security: []
+      summary: Регистрация по токену регистрации
+      description: |
+        Создаёт аккаунт только при валидном токене регистрации (FR A1).
+        Без/невалидный токен → 403 (Gherkin §1 «Регистрация без токена запрещена»).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201": { description: Аккаунт создан }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Имя пользователя занято }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      security: []
+      summary: Логин
+      description: Выдаёт access (JWT, короткоживущий) и refresh (непрозрачный). FR A3.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Токены выданы
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      security: []
+      summary: Обновление токенов
+      description: Меняет валидный refresh на новую пару (ротация refresh). FR A3.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: Новая пара токенов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Выход (отзыв refresh)
+      description: Отзывает refresh-токен. FR A3.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "204": { description: Выполнено }
+
+  # ---------- ADMIN (FR A2) ----------
+  /admin/registration-token:
+    get:
+      tags: [admin]
+      summary: Показать действующий токен регистрации
+      description: Доступно только администратору (FR A2, Gherkin §1 «Администратор видит токен»).
+      responses:
+        "200":
+          description: Действующий токен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ---------- INTEGRATIONS (FR B1–B6, Gherkin §2) ----------
+  /integrations:
+    get:
+      tags: [integrations]
+      summary: Список интеграций пользователя
+      description: Только свои интеграции (FR A4, I3). Содержит статус онлайн/оффлайн (FR B4).
+      responses:
+        "200":
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Integration" }
+    post:
+      tags: [integrations]
+      summary: Создать интеграцию (выдаёт UUID)
+      description: |
+        Обязательное имя, опциональный IP-хинт (FR B1). В ответе — секретный UUID,
+        доступный пользователю для настройки машины (FR B2, Gherkin §2 «Создание выдаёт UUID»).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IntegrationCreate" }
+      responses:
+        "201":
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntegrationWithSecret" }
+
+  /integrations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [integrations]
+      summary: Получить интеграцию
+      responses:
+        "200":
+          description: Интеграция
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntegrationWithSecret" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [integrations]
+      summary: Редактировать имя/IP
+      description: Не прерывает активные задачи (FR B5, Gherkin §2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IntegrationUpdate" }
+      responses:
+        "200": { description: Обновлено }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [integrations]
+      summary: Удалить интеграцию
+      description: |
+        При наличии активных задач требует подтверждения (?confirm=true) и корректно
+        завершает/отменяет их (FR B5, Gherkin §2 «Удаление требует подтверждения»).
+      parameters:
+        - name: confirm
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "204": { description: Удалено }
+        "409":
+          description: Есть активные задачи, нужно подтверждение (confirm=true)
+
+  # ---------- TASKS (FR E,F,H; Gherkin §4–§10) ----------
+  /tasks:
+    get:
+      tags: [tasks]
+      summary: История задач
+      description: Состав записи — FR H1, Gherkin §10. Хранение бессрочно (FR I2).
+      parameters:
+        - name: integration_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/TaskStatus" }
+      responses:
+        "200":
+          description: Список задач
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Task" }
+    post:
+      tags: [tasks]
+      summary: Поставить задачу
+      description: |
+        Ставит задачу в очередь к машине (FR E1). Дедуп по заголовку Idempotency-Key
+        (FR E7, Gherkin §4 «Защита от двойной отправки»). Если машина оффлайн — задача
+        ждёт в очереди (FR E4, Gherkin §9).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskCreate" }
+      responses:
+        "201":
+          description: Задача создана (status=queued)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "200":
+          description: Идемпотентный повтор — возвращена уже созданная задача
+
+  /tasks/{id}:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [tasks]
+      summary: Карточка задачи
+      responses:
+        "200":
+          description: Задача
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{id}/events:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    get:
+      tags: [tasks]
+      summary: Журнал событий задачи
+      description: Вопросы агента, ответы пользователя, согласования, смены статуса (FR H1, аудит F4).
+      responses:
+        "200":
+          description: Упорядоченный журнал
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TaskEvent" }
+
+  /tasks/{id}/answer:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [tasks]
+      summary: Ответить на вопрос агента
+      description: |
+        Ответ привязывается к конкретному question_id (FR F2, Gherkin §5
+        «Несколько вопросов сопоставляются корректно»). После ответа задача → running.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question_id, text]
+              properties:
+                question_id: { type: string, format: uuid }
+                text: { type: string }
+      responses:
+        "202": { description: Ответ принят }
+
+  /tasks/{id}/approve:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [tasks]
+      summary: Согласовать/отклонить команду
+      description: |
+        Решение по запросу согласования команды вне allowlist (FR F3, Gherkin §5
+        «Команда вне allowlist», «Отклонение команды»).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, decision]
+              properties:
+                request_id: { type: string, format: uuid }
+                decision: { type: string, enum: [approve, reject] }
+      responses:
+        "202": { description: Решение принято }
+
+  /tasks/{id}/cancel:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [tasks]
+      summary: Отменить задачу
+      description: |
+        Команда отмены гарантированно доходит до машины, агент останавливается (FR E6,
+        Gherkin §8). Приоритет — сохранность данных: критическая операция доводится
+        до безопасного состояния, мгновенная остановка не гарантируется.
+      responses:
+        "202": { description: Отмена инициирована }
+
+  /tasks/{id}/confirm:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [tasks]
+      summary: Подтвердить завершение
+      description: |
+        Переводит задачу из awaiting_confirm в completed. ТОЛЬКО это действие закрывает
+        задачу (FR E2, Gherkin §7 «Пользователь подтверждает завершение»).
+      responses:
+        "200": { description: Задача завершена }
+
+  /tasks/{id}/reject:
+    parameters: [ { $ref: "#/components/parameters/IdPath" } ]
+    post:
+      tags: [tasks]
+      summary: Отклонить результат (на доработку)
+      description: Из awaiting_confirm возвращает задачу в running (FR E2, Gherkin §7).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: { type: string }
+      responses:
+        "200": { description: Возвращена в работу }
+
+  # ---------- CHANNELS (FR D3) ----------
+  /channels/telegram/link-code:
+    post:
+      tags: [channels]
+      summary: Сгенерировать код привязки Telegram
+      description: |
+        Web генерирует одноразовый код; пользователь отправляет /start <code> боту,
+        который обменивает его на привязку (FR D3).
+      responses:
+        "201":
+          description: Код создан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: string }
+                  expires_at: { type: string, format: date-time }
+
+  # ---------- MACHINE (WebSocket, auth по UUID) ----------
+  /machine/ws:
+    get:
+      tags: [machine]
+      security: []
+      summary: Точка подключения агента (WebSocket Upgrade)
+      description: |
+        Агент устанавливает исходящее WS-соединение и аутентифицируется по UUID интеграции
+        (FR B3). Все команды/события идут асинхронно через шину (FR §7). Формат сообщений —
+        docs/protocol.md. Это не обычный REST-эндпоинт.
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Ключ дедупликации постановки задачи (FR E7).
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Не аутентифицирован
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Запрещено
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    RegisterRequest:
+      type: object
+      required: [registration_token, username, password]
+      properties:
+        registration_token: { type: string }
+        username: { type: string }
+        password: { type: string, format: password }
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: TTL access-токена, сек }
+
+    IntegrationCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        ip_hint: { type: string, nullable: true, description: Опциональная доп. проверка IP (FR B3) }
+
+    IntegrationUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        ip_hint: { type: string, nullable: true }
+
+    Integration:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        ip_hint: { type: string, nullable: true }
+        status: { type: string, enum: [online, offline], description: FR B4 }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    IntegrationWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/Integration"
+        - type: object
+          properties:
+            uuid:
+              type: string
+              format: uuid
+              description: Секрет для аутентификации машины (FR B2). Показывается владельцу.
+
+    TaskStatus:
+      type: string
+      description: Статусы FSM, см. docs/Жизненный цикл задачи.md
+      enum: [created, queued, running, waiting_user, awaiting_confirm, completed, failed, cancelled, stale]
+
+    TaskCreate:
+      type: object
+      required: [integration_id, text]
+      properties:
+        integration_id: { type: string, format: uuid }
+        text: { type: string }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        integration_id: { type: string, format: uuid }
+        text: { type: string }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    TaskEvent:
+      type: object
+      description: Элемент журнала задачи (FR H1, аудит F4)
+      properties:
+        id: { type: string, format: uuid }
+        seq: { type: integer, description: Порядковый номер в рамках задачи }
+        type:
+          type: string
+          enum: [status_change, agent_question, user_answer, command_approval_request, user_decision, agent_progress, agent_completed, error]
+        payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
