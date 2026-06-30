@@ -50,6 +50,10 @@ const (
 	pgDB    = "reg_test"
 
 	activeToken = "super-secret-registration-token"
+
+	// testJWTSigningKey — ключ подписи access-JWT для интеграционных тестов
+	// пакета api (тикет 1.3). Не секрет — используется только в тестовом процессе.
+	testJWTSigningKey = "integration-test-jwt-signing-key"
 )
 
 // startPostgres поднимает одиночный Postgres в контейнере, применяет миграции и
@@ -169,7 +173,7 @@ func TestIntegration_Register_Success(t *testing.T) {
 	defer done()
 	seedActiveToken(ctx, t, pool)
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
 
 	const password = "s3cr3t-pass"
 	rec := postRegister(t, router, api.RegisterRequest{
@@ -205,7 +209,7 @@ func TestIntegration_Register_ForbiddenWithoutToken(t *testing.T) {
 	defer done()
 	seedActiveToken(ctx, t, pool)
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
 
 	// Неверный токен → 403 (семантический отказ закрытого доступа).
 	wrong := postRegister(t, router, api.RegisterRequest{
@@ -233,7 +237,7 @@ func TestIntegration_Register_DuplicateUsername(t *testing.T) {
 	defer done()
 	seedActiveToken(ctx, t, pool)
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
 
 	body := api.RegisterRequest{Username: "carol", Password: "pw", RegistrationToken: activeToken}
 
