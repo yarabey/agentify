@@ -26,7 +26,7 @@
 | 2.4 | todo |  |  | Защита от повторного UUID |
 | 2.5 | todo |  |  | Редактирование не рвёт задачи |
 | 2.6 | todo |  |  | Удаление с активными задачами |
-| 3.1 | in_progress |  |  | ADR топиков Redpanda |
+| 3.1 | done | #2 merge 3.1 | 2026-06-30 | ADR топиков Redpanda (+hotfix флака platform-теста) |
 | 3.2 | todo |  |  | Producer/Consumer (franz-go) |
 | 3.3 | todo |  |  | WS-транспорт агент↔оркестратор |
 | 3.4 | todo |  |  | Мост оркестратора |
