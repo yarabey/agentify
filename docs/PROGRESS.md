@@ -29,7 +29,7 @@
 | 3.1 | done | #2 merge 3.1 | 2026-06-30 | ADR топиков Redpanda (+hotfix флака platform-теста) |
 | 3.2 | done | #2 merge 3.2 | 2026-06-30 | Producer/Consumer (franz-go) |
 | 3.3 | done | merge de60a7a | 2026-06-30 | WS-транспорт агент↔оркестратор |
-| 3.4 | in_progress |  |  | Мост оркестратора |
+| 3.4 | done | 244cc5e | 2026-06-30 | Мост оркестратора |
 | 3.5 | todo |  |  | Локальный outbox агента (bbolt) |
 | 3.6 | todo |  |  | Heartbeat и статус машины |
 | 4.1 | todo |  |  | Релиз бинаря агента |
