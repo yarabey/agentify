@@ -26,7 +26,11 @@ SQLC         ?= $(GOBIN)/sqlc
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local
+.PHONY: help tools generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke
+
+# Compose-файл локального стека (тикет 0.3).
+COMPOSE_FILE ?= deploy/docker-compose.yml
+DOCKER_COMPOSE ?= docker compose -f $(COMPOSE_FILE)
 
 help: ## Показать список целей.
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -71,5 +75,11 @@ bdd: ## [ЗАГЛУШКА — тикет 11.2] Прогон Gherkin-сценар
 docs-check: ## Проверка документации: godoc на экспортируемых символах, маркеры задач с номером, согласованность openapi.yaml (тикет 0.7).
 	GOLANGCI_LINT=$(SYSTEM_GOLANGCI_LINT) deploy/scripts/docs-check.sh
 
-run-local: ## [ЗАГЛУШКА — тикет 0.3] Поднять стек в docker compose локально.
-	@echo "run-local: implemented in ticket 0.3"
+run-local: ## Поднять весь стек локально (Postgres+Redpanda+orchestrator+bot+caddy+web), собрав образы.
+	$(DOCKER_COMPOSE) up -d --build
+
+run-local-down: ## Погасить локальный стек и удалить тома (postgres/redpanda data).
+	$(DOCKER_COMPOSE) down -v
+
+smoke: ## Smoke-проверка локального стека: /healthz всех сервисов отвечает 200.
+	deploy/scripts/smoke.sh
