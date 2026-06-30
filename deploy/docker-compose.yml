@@ -75,6 +75,8 @@ services:
       ORCH_HEALTH_ADDR: ":8080"
       # DSN Postgres для миграций-на-старте (и будущих бизнес-запросов, EPIC 1+).
       ORCH_DATABASE_URL: postgres://${POSTGRES_USER:-agentify}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentify}?sslmode=disable
+      # Seed-брокер Redpanda для моста machine.commands → WS (тикет 3.4, ADR 0001).
+      ORCH_REDPANDA_SEEDS: redpanda:9092
     depends_on:
       postgres:
         condition: service_healthy

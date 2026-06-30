@@ -53,13 +53,16 @@ package api
 // providers[]} (docs/protocol.md §4). Провал любой из этих проверок —
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
-// "unauthorized". При успехе соединение остаётся открытым; обработка
-// payload-ов команд/событий, ack/offset-семантика и т.п. — вне объёма этого
-// тикета (тикет 3.3 "WS-транспорт"), здесь после успешного hello — только
-// минимальный read-loop, блокирующийся на чтении кадров до дисконнекта
-// клиента, ничего с ними не делая (нужен, чтобы коннект не выглядел повисшим
-// и control-фреймы coder/websocket обрабатывались штатно — см. godoc
-// websocket.Conn "You must always read from the connection").
+// "unauthorized". При успехе соединение остаётся открытым; read-loop тикета
+// 3.4 разбирает каждый дальнейший кадр (см. handleMachineFrame/parseAckFrame)
+// и активно обрабатывает только type==ack — пересылает его
+// зарегистрированному s.ackSink (мосту оркестратора machine.commands → WS,
+// commit-after-ACK, protocol.md §5, см. godoc AckSink в server.go). Любой
+// другой тип кадра (task_accepted/agent_question/command_approval_request/...
+// — тикеты 3.5/5.x) и любой нераспознанный/битый кадр МОЛЧА игнорируются —
+// ни паники, ни закрытия соединения (нужно и чтобы коннект не выглядел
+// повисшим, и чтобы control-фреймы coder/websocket обрабатывались штатно —
+// см. godoc websocket.Conn "You must always read from the connection").
 //
 // IP клиента берётся из net.SplitHostPort(r.RemoteAddr) — прямого TCP-пира,
 // БЕЗ доверия заголовку X-Forwarded-For: в MVP нет инфраструктуры доверенных
@@ -142,14 +145,66 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	s.registerMachineConn(integrationID, conn)
 	defer s.unregisterMachineConn(integrationID, conn)
 
-	// Успешный hello: соединение остаётся открытым. Полноценная обработка
-	// дальнейших кадров (machine.commands/events, ack) — тикет 3.3; здесь —
-	// минимальный read-loop до дисконнекта клиента (см. godoc файла).
+	// Успешный hello: соединение остаётся открытым. Read-loop тикета 3.4:
+	// разбираем каждый дальнейший кадр и пересылаем ack мосту оркестратора
+	// (s.ackSink, см. handleMachineFrame); любой иной тип кадра (а также
+	// нераспознанный/битый JSON) МОЛЧА игнорируется — обработка прочих типов
+	// (task_accepted/agent_question/command_approval_request/... — тикеты
+	// 3.5/5.x) вне объёма этого тикета, но получение такого кадра не должно
+	// ронять или закрывать соединение (см. godoc файла).
 	for {
-		if _, _, err := conn.Read(r.Context()); err != nil {
+		_, data, err := conn.Read(r.Context())
+		if err != nil {
 			return
 		}
+		s.handleMachineFrame(data)
 	}
+}
+
+// handleMachineFrame разбирает один кадр, полученный ПОСЛЕ успешного hello
+// (тикет 3.4, protocol.md §5). Сейчас активно обрабатывается только
+// type==ack (commit-after-ack для machine.commands — см. godoc AckSink в
+// server.go); ЛЮБОЙ другой тип, а также нераспознанный/битый кадр —
+// безопасно игнорируется, без побочных эффектов (ни паники, ни закрытия
+// соединения): это явное требование тикета 3.4 — обработка прочих типов
+// кадров (task_accepted/agent_question/... — тикеты 3.5/5.x) не должна
+// блокироваться/ломаться из-за их временного отсутствия здесь.
+func (s *Server) handleMachineFrame(data []byte) {
+	ackMessageID, ok := parseAckFrame(data)
+	if !ok {
+		return
+	}
+	sink := s.getAckSink()
+	if sink == nil {
+		// Мост не зарегистрирован (Redpanda отключён/тест без тикета 3.4) —
+		// штатно игнорируем, см. godoc SetAckSink.
+		return
+	}
+	sink.HandleAck(ackMessageID)
+}
+
+// parseAckFrame пытается разобрать сырой WS-кадр как конверт type==ack
+// (protocol.md §4/§5, bus.AckPayload). Возвращает (ack_message_id, true) при
+// успехе; ("", false) для ЛЮБОГО иного случая — кадр не JSON, конверт другого
+// типа, payload без ack_message_id и т.п. Причина не различается специально:
+// вызывающий (handleMachineFrame) одинаково игнорирует кадр в любом из этих
+// случаев.
+func parseAckFrame(data []byte) (string, bool) {
+	var env bus.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return "", false
+	}
+	if env.Type != bus.MessageTypeAck {
+		return "", false
+	}
+	var payload bus.AckPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return "", false
+	}
+	if payload.AckMessageID == "" {
+		return "", false
+	}
+	return payload.AckMessageID, true
 }
 
 // authenticateMachineHello читает первый WS-кадр и проверяет его как hello
