@@ -25,7 +25,11 @@
 // только готовые операции — GetHealthz, PostAuthRegister,
 // PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go),
 // GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId (см.
-// integrations.go) и GetMachineWs (см. machine_ws.go). NewRouter монтирует
+// integrations.go) и GetMachineWs (см. machine_ws.go), которая после
+// успешного hello разбирает входящие кадры машины и пересылает ack-кадры
+// зарегистрированному AckSink — мосту оркестратора (machine.commands →
+// WS, commit-after-ACK, тикет 3.4, protocol.md §5, см. SetAckSink/MachineConn
+// и godoc machine_ws.go). NewRouter монтирует
 // chi-роутер из сгенерированного HandlerWithOptions (он же поднимает
 // GET /healthz и все маршруты API от корня — Caddy роутит /api/* со стрипом
 // префикса, поэтому пути монтируются от корня: /auth/register, /healthz),
@@ -139,6 +143,34 @@ type Server struct {
 	// своего defer».
 	machineConns   map[uuid.UUID]*websocket.Conn
 	machineConnsMu sync.Mutex
+
+	// ackSink — получатель ack-кадров машины (тикет 3.4, см. AckSink). nil по
+	// умолчанию — ack-кадры просто игнорируются (штатно, если Redpanda-мост не
+	// настроен, например в тестах/каркасных прогонах без ORCH_REDPANDA_SEEDS,
+	// см. orchestrator/main.go). Регистрируется один раз при старте через
+	// SetAckSink, читается под ackSinkMu, т.к. может устанавливаться уже после
+	// NewServer, но до начала обслуживания WS-трафика.
+	ackSink   AckSink
+	ackSinkMu sync.RWMutex
+}
+
+// AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
+// нуждается в том, чтобы GetMachineWs (machine_ws.go) сообщал мосту
+// оркестратора о получении ack{ack_message_id}, не зная ничего о его
+// внутреннем устройстве (Redpanda, ожидание/коммит конкретной записи) — этот
+// узкий интерфейс и есть граница между транспортным слоем (api) и мостом
+// (orchestrator/internal/bridge.Bridge реализует его структурно, без
+// импорта пакета api пакетом bridge и наоборот — зависимость только в одну
+// сторону, от orchestrator/main.go, которая и связывает Server с Bridge через
+// SetAckSink).
+type AckSink interface {
+	// HandleAck обрабатывает ack с данным ack_message_id (message_id
+	// подтверждаемой команды, bus.AckPayload). Реализация ОБЯЗАНА быть
+	// безопасной к повторному и к неизвестному message_id (дубль ack,
+	// просроченный ack уже отретраенной команды и т.п., at-least-once,
+	// protocol.md §5) — никогда не паниковать, просто проигнорировать
+	// несовпавший вызов.
+	HandleAck(ackMessageID string)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -202,6 +234,40 @@ func NewRouter(s *Server) chi.Router {
 		Middlewares: []MiddlewareFunc{s.authMiddleware},
 	})
 	return handler.(chi.Router)
+}
+
+// MachineConn возвращает активное WS-соединение интеграции integrationID,
+// если оно сейчас есть (ok==true), — переиспользование реестра s.machineConns
+// (тикет 2.4) мостом оркестратора (тикет 3.4) как источника «активное WS для
+// integration_id», предусмотренное ADR 0002. ok==false означает «машина
+// сейчас оффлайн» (нет активного WS) — вызывающий (мост) не должен
+// коммитить соответствующую запись Redpanda и обязан отложить доставку до
+// переподключения машины (protocol.md §5).
+func (s *Server) MachineConn(integrationID uuid.UUID) (*websocket.Conn, bool) {
+	s.machineConnsMu.Lock()
+	defer s.machineConnsMu.Unlock()
+	conn, ok := s.machineConns[integrationID]
+	return conn, ok
+}
+
+// SetAckSink регистрирует получателя ack-кадров машины (тикет 3.4, см. godoc
+// AckSink). Вызывается ОДИН раз при старте (orchestrator/main.go), после
+// конструирования моста и до начала обслуживания HTTP/WS-трафика; nil —
+// допустимое значение (в т.ч. явный сброс) — тогда GetMachineWs молча
+// игнорирует ack-кадры (см. machine_ws.go), что штатно при отключённом
+// Redpanda-мосте (ORCH_REDPANDA_SEEDS пуст) и в тестах, не относящихся к
+// тикету 3.4.
+func (s *Server) SetAckSink(sink AckSink) {
+	s.ackSinkMu.Lock()
+	defer s.ackSinkMu.Unlock()
+	s.ackSink = sink
+}
+
+// getAckSink читает текущий AckSink под ackSinkMu (см. godoc полей Server).
+func (s *Server) getAckSink() AckSink {
+	s.ackSinkMu.RLock()
+	defer s.ackSinkMu.RUnlock()
+	return s.ackSink
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

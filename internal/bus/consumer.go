@@ -168,6 +168,20 @@ func (c *Consumer) CommitRecords(ctx context.Context, recs ...*kgo.Record) error
 	return nil
 }
 
+// PollFetches — второй хук для моста 3.4 (наравне с CommitRecords): тонкая
+// обёртка над client.PollFetches, нужная мосту, чтобы строить СВОЙ цикл
+// «прочитал запись → доставил в WS машины → дождался ack → закоммитил именно
+// эту запись» (protocol.md §5), а не batch-цикл Run (Run коммитит ЦЕЛУЮ
+// пачку партии сразу после успешного Handler — для команд machine.commands
+// это было бы преждевременным коммитом ДО получения ack агента, что нарушило
+// бы at-least-once гарантию §5). client — неэкспортированное поле, поэтому
+// мосту из другого пакета (orchestrator/internal/bridge) нужен именно такой
+// публичный проброс; собственное состояние (dedup и т.п.) Consumer тут не
+// трогает — это осознанно «сырой» доступ к fetch-циклу для моста.
+func (c *Consumer) PollFetches(ctx context.Context) kgo.Fetches {
+	return c.client.PollFetches(ctx)
+}
+
 // Close покидает consumer group (коммитит то, что было помечено) и закрывает
 // клиента. Вызывать при остановке сервиса.
 func (c *Consumer) Close() {

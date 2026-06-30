@@ -3,14 +3,22 @@
 // Назначение (бизнес): оркестратор — ядро системы (FR E*, A*, F*): REST+WS,
 // FSM задач, auth, история, мост к Redpanda. В тикете 0.6 здесь реализован лишь
 // общий операционный каркас (конфиг из env, slog, /healthz, graceful shutdown);
-// бизнес-логика добавляется в EPIC 1/3/5+.
+// бизнес-логика добавляется в EPIC 1/3/5+. Тикет 3.4 добавляет сам мост
+// Redpanda → WS (machine.commands → конкретная машина, commit-after-ACK,
+// protocol.md §5, см. orchestrator/internal/bridge) — он запускается
+// конкурентно с HTTP-сервером, если задан ORCH_REDPANDA_SEEDS.
 //
 // Как устроено (тех): main — тонкий: грузит конфиг под префиксом ORCH_ через
 // общий пакет platform, применяет миграции на старте, при наличии БД поднимает
 // pgxpool и монтирует сгенерированный из openapi API-роутер (тикет 1.2: реальный
 // POST /auth/register; тикет 1.3: POST /auth/login, /auth/refresh, /auth/logout;
-// прочие операции — 501), затем блокируется до SIGTERM/SIGINT и гасится
-// gracefully, закрывая пул. Бинарь поддерживает одну подкоманду —
+// прочие операции — 501). Если заданы ORCH_DATABASE_URL И ORCH_REDPANDA_SEEDS,
+// поднимается ещё и Redpanda-консьюмер моста (bridge.Bridge) — он и
+// HTTP-сервер запускаются конкурентно на общем сигнал-чувствительном ctx через
+// errgroup (тот же паттерн, что agent/main.go для WS-клиента), и оба гасятся
+// при SIGTERM/SIGINT. Пустой ORCH_REDPANDA_SEEDS — мост просто не запускается
+// (нефатально, warn-лог) — нужно, чтобы существующие прогоны/тесты без
+// Redpanda не ломались. Бинарь поддерживает одну подкоманду —
 // `orchestrator bootstrap` (тикет 1.7, см. cmd_bootstrap.go): без аргументов
 // запускается обычный сервис (как раньше), с аргументом "bootstrap" —
 // идемпотентно создаёт первого администратора и стартовый токен регистрации и
@@ -20,17 +28,29 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/platform"
 	"github.com/yarabey/agentify/orchestrator/internal/api"
+	"github.com/yarabey/agentify/orchestrator/internal/bridge"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
 	"github.com/yarabey/agentify/orchestrator/migrations"
 )
+
+// bridgeConsumerGroup — имя consumer group моста (тикет 3.4, ADR 0001:
+// «мост команд — своя группа (orchestrator-bridge)»). Отдельная от любых
+// других consumer group (например, будущих обработчиков machine.events),
+// чтобы коммиты моста не задевали офсеты других подписчиков той же темы.
+const bridgeConsumerGroup = "orchestrator-bridge"
 
 // serviceName — каноническое имя сервиса в логах и в теле /healthz.
 const serviceName = "orchestrator"
@@ -76,6 +96,14 @@ type config struct {
 	// поднятом API пустое/некорректное значение — фатальная ошибка старта
 	// (см. run), а не тихий запуск с небезопасным ключом.
 	AppEncryptionKey string `env:"APP_ENCRYPTION_KEY"`
+
+	// RedpandaSeeds — адреса брокеров Redpanda (host:port), через запятую.
+	// Переменная ORCH_REDPANDA_SEEDS. Пустое значение (дефолт) означает «мост
+	// Redpanda → WS отключён» (тикет 3.4) — оркестратор работает как раньше,
+	// только REST+WS-handshake, без доставки команд из machine.commands; тот
+	// же принцип «пустая опциональная фича — не ошибка старта», что у
+	// DatabaseURL/OrchestratorWSURL в остальных конфигах сервисов.
+	RedpandaSeeds []string `env:"REDPANDA_SEEDS" envSeparator:","`
 }
 
 func main() {
@@ -109,7 +137,14 @@ func run() error {
 		return err
 	}
 
-	ctx := context.Background()
+	// Общий сигнал-чувствительный ctx — как в agent/main.go: создаётся ЗДЕСЬ,
+	// ДО запуска svc.Run, и передаётся всем горутинам (HTTP-сервер, мост
+	// Redpanda) через errgroup. Service.Run сам оборачивает переданный ctx в
+	// собственный signal.NotifyContext (internal/platform/service.go), но
+	// горутина моста такой обёртки не имеет — ей нужен этот общий ctx, чтобы
+	// тоже узнать об отмене по сигналу.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	// Миграции-на-старте (тикет 0.3): прежде чем сервис начнёт отвечать готовым
 	// на /healthz, приводим схему БД к актуальной версии встроенными
@@ -122,6 +157,11 @@ func run() error {
 	} else {
 		svc.Logger().Warn("ORCH_DATABASE_URL пуст — пропускаю применение миграций на старте")
 	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return svc.Run(gctx)
+	})
 
 	// Пул соединений и реальный API-сервер (тикеты 1.2/1.3). Без БД API не
 	// поднимаем — auth-эндпоинты обращаются к Postgres; остаётся только /healthz
@@ -162,7 +202,49 @@ func run() error {
 
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
 		svc.SetHandler(api.NewRouter(server))
+
+		// Мост Redpanda → WS (тикет 3.4, protocol.md §5): опционален, как и
+		// WS-транспорт агента в agent/main.go. Нужен и сервер (источник
+		// ConnRegistry — server.MachineConn, ADR 0002), и Redpanda-seeds;
+		// пустой ORCH_REDPANDA_SEEDS — тихо пропускаем фичу (оркестратор
+		// продолжает обслуживать REST+WS-handshake без доставки команд).
+		if len(cfg.RedpandaSeeds) == 0 {
+			svc.Logger().Warn("мост Redpanda → WS отключён: ORCH_REDPANDA_SEEDS не задан")
+		} else {
+			consumer, err := bus.NewConsumer(bus.ConsumerConfig{
+				Seeds:  cfg.RedpandaSeeds,
+				Group:  bridgeConsumerGroup,
+				Topics: []string{bus.TopicMachineCommands},
+			})
+			if err != nil {
+				return fmt.Errorf("orchestrator: ORCH_REDPANDA_SEEDS задан, но создание Redpanda-консьюмера моста не удалось: %w", err)
+			}
+			// Закрываем консьюмера при остановке: после graceful shutdown
+			// HTTP/моста новые poll/commit уже не нужны.
+			defer consumer.Close()
+
+			brg, err := bridge.New(consumer, server, bridge.WithLogger(svc.Logger()))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка моста Redpanda → WS: %w", err)
+			}
+			server.SetAckSink(brg)
+
+			g.Go(func() error {
+				return brg.Run(gctx)
+			})
+		}
+	} else if len(cfg.RedpandaSeeds) != 0 {
+		// Без БД нет server.MachineConn (ConnRegistry моста) — поднять мост
+		// нечем. Не фатально (тот же принцип «опциональная фича»), но явно
+		// предупреждаем, чтобы не выглядело так, будто мост тихо работает.
+		svc.Logger().Warn("ORCH_REDPANDA_SEEDS задан, но ORCH_DATABASE_URL пуст — мост Redpanda → WS не запускается (нужен API-сервер как реестр WS-соединений)")
 	}
 
-	return svc.Run(ctx)
+	// errgroup.Wait возвращает первую реальную ошибку любой из горутин;
+	// context.Canceled при штатном shutdown (сигнал/отмена ctx) — не ошибка
+	// (тот же принцип, что agent/main.go).
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }

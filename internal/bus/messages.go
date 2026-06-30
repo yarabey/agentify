@@ -57,6 +57,20 @@ const (
 	MessageTypePing = "ping"
 )
 
+// AckPayload — payload сообщения type == MessageTypeAck (protocol.md §4, §5):
+// подтверждение агентом обработки команды из machine.commands, отправленное
+// в ответ на конкретный конверт-команду. AckMessageID — это MessageID ИМЕННО
+// того конверта-команды, который агент подтверждает (а не MessageID самого
+// ack-конверта) — по нему мост оркестратора (тикет 3.4) сопоставляет ack с
+// доставленной, но ещё не закоммиченной записью Redpanda и коммитит её
+// offset (commit-after-ACK, §5). Дублирующийся или ссылающийся на неизвестный
+// message_id ack — штатная ситуация at-least-once (переотправка/гонка) и
+// должен безопасно игнорироваться стороной, которая его разбирает.
+type AckPayload struct {
+	// AckMessageID — message_id подтверждаемого конверта-команды.
+	AckMessageID string `json:"ack_message_id"`
+}
+
 // HelloPayload — payload сообщения type == MessageTypeHello (protocol.md §4):
 // первый кадр агента после WS-коннекта, по которому оркестратор опознаёт
 // машину (FR B3, тикет 2.3/3.3). Это тот же набор полей, что разбирает
