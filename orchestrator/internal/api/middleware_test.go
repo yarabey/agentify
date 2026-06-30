@@ -8,9 +8,12 @@
 // дублирует генерируемую логику и не ссылается на BearerAuthScopes напрямую.
 // probeServer подменяет ОДНУ защищённую операцию (GET /admin/registration-token)
 // тестовым обработчиком (probeHandler), чтобы можно было заглянуть в
-// контекст после прохождения middleware (UserIDFromContext) — сама операция
-// в проде пока отвечает 501 через Unimplemented (см. server.go), это не
-// меняется.
+// контекст после прохождения middleware (UserIDFromContext) — выбор именно
+// этой операции для probe исторический (тикет 1.4, когда она ещё отвечала
+// 501 через Unimplemented); с тикета 1.6 она реализована по-настоящему
+// (admin.go), но как маршрут для проверки самого middleware подходит
+// одинаково хорошо в обоих случаях — probeServer.GetAdminRegistrationToken
+// всё равно подменяет вызов целиком.
 //
 // Покрываем приёмочные сценарии тикета 1.4:
 //   - валидный токен → пропускает и кладёт user_id в контекст;
@@ -19,8 +22,10 @@
 //   - отсутствующий заголовок Authorization → 401;
 //   - неправильная схема (не "Bearer") → 401;
 //   - выборочность: публичный маршрут (GET /healthz) — без проверки вовсе;
-//     защищённый, но ещё не реализованный (/admin/registration-token) — всё
-//     равно требует токен, отвечая 401 без него и 501 (а не 401) с валидным.
+//     защищённый маршрут (через probe) — всё равно требует токен, отвечая
+//     401 без него и пропуская (статус-маркер probe) с валидным; отдельная
+//     проверка «защищённый, но ещё не реализованный → 401/501» теперь живёт
+//     на маршруте GET /integrations (см. TestRouter_ProtectedRouteRequiresToken).
 package api
 
 import (
@@ -192,17 +197,25 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 // защищённый контрактом маршрут (нет `security: []` в openapi.yaml) отдаёт
 // 401 без токена и доходит до обработчика (тут — заглушка Unimplemented,
 // 501) с валидным.
+//
+// Маршрут под тестом — GET /integrations (ещё не реализован, см.
+// server.go): /admin/registration-token, который раньше использовался здесь
+// для той же проверки, с тикета 1.6 реализован (admin.go) и отвечает
+// 403/200, а не 501 — его поведение «защищённый маршрут требует токен»
+// теперь покрыто отдельно admin_test.go, а этот тест проверяет общий
+// механизм middleware+Unimplemented на ЛЮБОМ ещё не готовом защищённом
+// маршруте.
 func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 
-	noToken := httptest.NewRequest(http.MethodGet, "/admin/registration-token", nil)
+	noToken := httptest.NewRequest(http.MethodGet, "/integrations", nil)
 	noTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(noTokenRec, noToken)
 	if noTokenRec.Code != http.StatusUnauthorized {
 		t.Fatalf("без токена: статус = %d (%s), ожидался 401", noTokenRec.Code, noTokenRec.Body.String())
 	}
 
-	withToken := httptest.NewRequest(http.MethodGet, "/admin/registration-token", nil)
+	withToken := httptest.NewRequest(http.MethodGet, "/integrations", nil)
 	withToken.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	withTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(withTokenRec, withToken)

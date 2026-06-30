@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/google/uuid"
 
@@ -32,6 +33,9 @@ type fakeQuerier struct {
 
 	getUserByUsernameUser db.User
 	getUserByUsernameErr  error
+
+	getUserByIDUser db.User
+	getUserByIDErr  error
 
 	createRefreshTokenErr error
 
@@ -63,6 +67,13 @@ func (f fakeQuerier) GetUserByUsername(context.Context, string) (db.User, error)
 		return db.User{}, f.getUserByUsernameErr
 	}
 	return f.getUserByUsernameUser, nil
+}
+
+func (f fakeQuerier) GetUserByID(context.Context, pgtype.UUID) (db.User, error) {
+	if f.getUserByIDErr != nil {
+		return db.User{}, f.getUserByIDErr
+	}
+	return f.getUserByIDUser, nil
 }
 
 func (f fakeQuerier) CreateRefreshToken(_ context.Context, arg db.CreateRefreshTokenParams) (db.RefreshToken, error) {
