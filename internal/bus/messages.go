@@ -1,0 +1,79 @@
+package bus
+
+// Типы сообщений конверта (protocol.md §4, "Типы сообщений") — машинное
+// представление таблицы из §4, чтобы продьюсеры/потребители на обеих сторонах
+// (orchestrator, agent) не дублировали "magic strings" значения поля Type
+// (Envelope.Type). Источник правды по смыслу каждого типа и его payload —
+// сам protocol.md §4; здесь — только имена констант и форма payload, которая
+// сериализуется/парсится механически (hello — единственный payload, нужный
+// уже на транспортном уровне тикета 3.3; остальные типы перечислены для
+// полноты протокола и используются последующими тикетами 3.4/3.5/5.x).
+
+// Типы сообщений агент → оркестратор (топик TopicMachineEvents, protocol.md
+// §4, таблица "Агент → оркестратор").
+const (
+	// MessageTypeHello — первый кадр после WS-коннекта; аутентификация по UUID
+	// (FR B3). Payload — HelloPayload.
+	MessageTypeHello = "hello"
+	// MessageTypeHeartbeat — живость машины; обновляет last_seen_at (FR B4).
+	// Payload — {} (пустой объект).
+	MessageTypeHeartbeat = "heartbeat"
+	// MessageTypeAck — подтверждение обработки команды (protocol.md §5).
+	// Payload — {ack_message_id}.
+	MessageTypeAck = "ack"
+	// MessageTypeTaskAccepted — задача принята в работу → FSM running.
+	// Payload — {}.
+	MessageTypeTaskAccepted = "task_accepted"
+	// MessageTypeAgentQuestion — вопрос пользователю → FSM waiting_user (FR F1).
+	// Payload — {question_id, text}.
+	MessageTypeAgentQuestion = "agent_question"
+	// MessageTypeCommandApprovalRequest — команда вне allowlist → waiting_user
+	// (FR F3). Payload — {request_id, command, reason}.
+	MessageTypeCommandApprovalRequest = "command_approval_request"
+	// MessageTypeAgentProgress — прогресс (история/аудит). Payload — {text}.
+	MessageTypeAgentProgress = "agent_progress"
+	// MessageTypeAgentCompleted — агент отчитался → FSM awaiting_confirm (НЕ
+	// закрывает задачу, FR E2). Payload — {summary}.
+	MessageTypeAgentCompleted = "agent_completed"
+	// MessageTypeError — ошибка → FSM failed. Payload — {code, message}.
+	MessageTypeError = "error"
+)
+
+// Типы сообщений оркестратор → агент (топик TopicMachineCommands, protocol.md
+// §4, таблица "Оркестратор → агент").
+const (
+	// MessageTypeTaskAssigned — поставить задачу (FR E1). Payload — {text}.
+	MessageTypeTaskAssigned = "task_assigned"
+	// MessageTypeUserAnswer — ответ пользователя; агент продолжает (FR F2).
+	// Payload — {question_id, text}.
+	MessageTypeUserAnswer = "user_answer"
+	// MessageTypeCommandDecision — решение по согласованию (FR F3). Payload —
+	// {request_id, decision: approve|reject}.
+	MessageTypeCommandDecision = "command_decision"
+	// MessageTypeCancel — отмена; безопасная остановка, приоритет сохранности
+	// данных (FR E6). Payload — {}.
+	MessageTypeCancel = "cancel"
+	// MessageTypePing — проверка живости соединения. Payload — {}.
+	MessageTypePing = "ping"
+)
+
+// HelloPayload — payload сообщения type == MessageTypeHello (protocol.md §4):
+// первый кадр агента после WS-коннекта, по которому оркестратор опознаёт
+// машину (FR B3, тикет 2.3/3.3). Это тот же набор полей, что разбирает
+// orchestrator/internal/api.GetMachineWs на стороне сервера, и который должен
+// собрать agent/internal/wsclient на стороне клиента — общий пакет bus
+// гарантирует, что обе стороны говорят об одной и той же форме payload без
+// дублирования структуры.
+type HelloPayload struct {
+	// UUID — секрет интеграции (plaintext), выданный владельцу при создании
+	// интеграции (POST /integrations, тикет 2.2) и переданный агенту при
+	// настройке (FR B2). Сервер ищет интеграцию по HMAC-отпечатку этого
+	// значения (FR B6), сам секрет нигде, кроме hello, не передаётся.
+	UUID string `json:"uuid"`
+	// AgentVersion — версия бинаря агента (FR C5, контроль совместимости —
+	// тикет 4.7). Тикетом 3.3 не валидируется, только переносится.
+	AgentVersion string `json:"agent_version"`
+	// Providers — список провайдеров, доступных этому агенту (claude,
+	// claude-code, ...; EPIC 4.5). Тикетом 3.3 не валидируется.
+	Providers []string `json:"providers"`
+}
