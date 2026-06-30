@@ -1,0 +1,9 @@
+# docker-compose.yml — ЗАГЛУШКА тикета 0.1.
+#
+# Реальный compose (Postgres + Redpanda + orchestrator + bot + Caddy + web,
+# применение goose-миграций на старте) реализуется в тикете 0.3.
+# Здесь зафиксирован лишь каркас файла, чтобы структура монорепо была полной.
+#
+# См. docs/01_tech_stack_and_architecture.md §5.
+services: {}
+# TODO(0.3): описать сервисы postgres, redpanda, orchestrator, bot, caddy, web.
