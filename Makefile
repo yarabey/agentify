@@ -15,6 +15,10 @@ GORELEASER_VERSION    ?= v2.5.1
 GOBIN := $(shell go env GOPATH)/bin
 export PATH := $(GOBIN):$(PATH)
 
+# Системный golangci-lint фиксированной версии (тикет 0.7): docs-check должен
+# использовать именно его, не полагаясь на GOPATH/bin. Переопределяемо извне.
+SYSTEM_GOLANGCI_LINT ?= /usr/local/bin/golangci-lint
+
 .DEFAULT_GOAL := help
 
 .PHONY: help tools generate lint test bdd docs-check run-local
@@ -43,8 +47,8 @@ test: ## Запустить unit-тесты Go.
 bdd: ## [ЗАГЛУШКА — тикет 11.2] Прогон Gherkin-сценариев (godog).
 	@echo "bdd: implemented in ticket 11.2"
 
-docs-check: ## [ЗАГЛУШКА — тикет 0.7] Проверка документации (godoc/openapi/TODO).
-	@echo "docs-check: implemented in ticket 0.7"
+docs-check: ## Проверка документации: godoc на экспортируемых символах, маркеры задач с номером, согласованность openapi.yaml (тикет 0.7).
+	GOLANGCI_LINT=$(SYSTEM_GOLANGCI_LINT) deploy/scripts/docs-check.sh
 
 run-local: ## [ЗАГЛУШКА — тикет 0.3] Поднять стек в docker compose локально.
 	@echo "run-local: implemented in ticket 0.3"
