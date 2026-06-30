@@ -60,6 +60,15 @@ API**, в который ходят и web PWA, и Telegram-бот (принци
 Специфичные для оркестратора поля (Redpanda, JWT-ключи) добавляются под тем же
 префиксом `ORCH_` в соответствующих тикетах.
 
+Только для подкоманды `orchestrator bootstrap` (тикет 1.7, см. ниже) — без
+дефолтов, обязательны для самого bootstrap'а:
+
+| Переменная | Назначение |
+|---|---|
+| `ORCH_BOOTSTRAP_ADMIN_USERNAME` | Username первого администратора. |
+| `ORCH_BOOTSTRAP_ADMIN_PASSWORD` | Пароль первого администратора (хэшируется argon2id, в БД не попадает plaintext). |
+| `ORCH_INITIAL_REGISTRATION_TOKEN` | Значение стартового токена регистрации (FR A2). Имя секрета зафиксировано в [`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) (`openssl rand -hex 16`), читается под общим префиксом `ORCH_`. |
+
 ## Запуск локально
 
 ```bash
@@ -79,3 +88,36 @@ curl -s -X POST localhost:8080/auth/register \
 вручную в таблице `registration_tokens`.
 
 Остановка — `Ctrl+C` (SIGINT) или `kill -TERM <pid>`: сервис гасится gracefully.
+
+## Bootstrap первого администратора (тикет 1.7)
+
+Доступ в систему закрытый (FR A1): обычная регистрация (`POST /auth/register`)
+сама требует активного токена регистрации, поэтому самый первый аккаунт и сам
+этот токен заводит отдельная подкоманда того же бинаря — `orchestrator
+bootstrap` (без нового CLI-фреймворка, простой разбор `os.Args[1]`; без
+аргументов бинарь по-прежнему стартует как обычный сервис).
+
+```bash
+ORCH_DATABASE_URL='postgres://app:app@localhost:5432/app?sslmode=disable' \
+ORCH_BOOTSTRAP_ADMIN_USERNAME='admin' \
+ORCH_BOOTSTRAP_ADMIN_PASSWORD='<сгенерированный пароль>' \
+ORCH_INITIAL_REGISTRATION_TOKEN='<значение из docs/MANUAL_STEPS.md, openssl rand -hex 16>' \
+  go run ./orchestrator bootstrap
+```
+
+Команда сама приводит схему БД к актуальной версии (как и обычный запуск
+сервиса), затем идемпотентно:
+
+- создаёт первого администратора (`is_admin=true`, пароль — argon2id-хэш, FR I1)
+  с username/паролем из `ORCH_BOOTSTRAP_ADMIN_USERNAME`/`ORCH_BOOTSTRAP_ADMIN_PASSWORD`,
+  либо, если пользователь с этим username уже существует (например, заведён
+  обычной регистрацией), доводит его до администратора, не создавая дубликат;
+- создаёт активный токен регистрации со значением `ORCH_INITIAL_REGISTRATION_TOKEN`
+  (FR A2), либо — если активный токен уже есть (неважно с каким значением,
+  ротация токена вне MVP) — пропускает создание.
+
+Повторные запуски с теми же переменными окружения (типичный сценарий —
+bootstrap-шаг при каждом деплое) **идемпотентны**: они не падают с ошибкой
+уникальности и не создают второго администратора или второго активного
+токена — каждый шаг no-op, если уже выполнен. Подробности — godoc
+[`orchestrator/internal/bootstrap`](internal/bootstrap).

@@ -16,10 +16,12 @@ openssl rand -base64 48   # JWT_SIGNING_KEY
 openssl rand -base64 32   # APP_ENCRYPTION_KEY
 openssl rand -base64 24   # POSTGRES_PASSWORD
 openssl rand -hex 16      # INITIAL_REGISTRATION_TOKEN
+openssl rand -base64 18   # BOOTSTRAP_ADMIN_PASSWORD (пароль первого администратора)
 ```
+`BOOTSTRAP_ADMIN_USERNAME` — не секрет, просто логин первого администратора (например, `admin`), придумать самому.
 
 ## 3. Положить в GitHub → Settings → Secrets (Actions, окружение `prod`)
-`SSH_DEPLOY_KEY`, `SSH_HOST`, `SSH_USER`, `JWT_SIGNING_KEY`, `APP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `INITIAL_REGISTRATION_TOKEN`.
+`SSH_DEPLOY_KEY`, `SSH_HOST`, `SSH_USER`, `JWT_SIGNING_KEY`, `APP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `INITIAL_REGISTRATION_TOKEN`, `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`.
 - [ ] Создать окружение **`prod`** с **required reviewer = ты** (защита деплоя).
 - [ ] Включить **GHCR** (Actions: `packages: write`) и **Releases** (`contents: write`).
 - [ ] Branch protection на `main`: PR + зелёный CI + ≥1 ревью.
