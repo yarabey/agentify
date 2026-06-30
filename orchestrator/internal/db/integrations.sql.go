@@ -94,6 +94,39 @@ func (q *Queries) GetIntegrationByIDAndUser(ctx context.Context, arg GetIntegrat
 	return i, err
 }
 
+const getIntegrationByUUIDHMAC = `-- name: GetIntegrationByUUIDHMAC :one
+SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at FROM integrations
+WHERE uuid_hmac = $1
+`
+
+// Назначение (бизнес): аутентификация машины на WS-handshake /machine/ws
+// (тикет 2.3, FR B3, B6) — агент в первом кадре (`hello`) предъявляет
+// plaintext UUID-секрет; сервисный слой считает его HMAC-отпечаток (тем же
+// ключом, что и при создании, internal/crypto) и ищет интеграцию по нему.
+// НАМЕРЕННО без фильтра по user_id (в отличие от GetIntegrationByIDAndUser):
+// на этом шаге владелец ещё не известен — сам поиск по uuid_hmac и есть
+// способ его установить (тот же паттерн, что у GetUserByUsername при логине,
+// см. orchestrator/internal/api/auth.go). Не находит — pgx.ErrNoRows;
+// сервисный слой схлопывает это с несовпадением ip_hint в единый отказ
+// WS-аутентификации (close 4401), без утечки причины.
+func (q *Queries) GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (Integration, error) {
+	row := q.db.QueryRow(ctx, getIntegrationByUUIDHMAC, uuidHmac)
+	var i Integration
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Name,
+		&i.IpHint,
+		&i.UuidHmac,
+		&i.UuidEnc,
+		&i.Status,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const listIntegrationsByUser = `-- name: ListIntegrationsByUser :many
 SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at FROM integrations
 WHERE user_id = $1
