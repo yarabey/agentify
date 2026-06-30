@@ -15,9 +15,14 @@
 //     с реальной БД (argon2id-хэш, сохранённый ticket-1.2-кодом CreateUser).
 //
 // Сценарий «истёкший access-токен → 401» — на уровне internal/auth
-// (jwt_test.go, TestParseAccessTokenRejectsExpired): полноценная HTTP-аутентификация
-// access-токеном (middleware) — предмет тикета 1.4, здесь её ещё нет (ни один
-// эндпоинт её не требует — login/refresh/logout сами выдают токены).
+// (jwt_test.go, TestParseAccessTokenRejectsExpired) и orchestrator/internal/api
+// (middleware_test.go, тикет 1.4). /auth/logout не освобождён от bearerAuth в
+// openapi.yaml (нет `security: []`, в отличие от /auth/register|login|refresh)
+// — с тикета 1.4 он тоже проходит через auth-middleware, поэтому ниже
+// postJSONAuth прикладывает к /auth/logout валидный Authorization-заголовок
+// (сам токен здесь — переиспользуемый по сценарию access-токен из login,
+// логика обработчика logout от него не зависит, она работает с refresh_token
+// в теле).
 package api_test
 
 import (
@@ -34,7 +39,9 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
 
-// postJSON шлёт POST path с JSON-телом body через httptest поверх router.
+// postJSON шлёт POST path с JSON-телом body через httptest поверх router, без
+// заголовка Authorization — для маршрутов с `security: []` в openapi.yaml
+// (/auth/login, /auth/refresh).
 func postJSON(t *testing.T, router http.Handler, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	raw, err := json.Marshal(body)
@@ -43,6 +50,23 @@ func postJSON(t *testing.T, router http.Handler, path string, body any) *httptes
 	}
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// postJSONAuth — как postJSON, но дополнительно прикладывает
+// "Authorization: Bearer <accessToken>" — для маршрутов, защищённых
+// auth-middleware (тикет 1.4), напр. /auth/logout.
+func postJSONAuth(t *testing.T, router http.Handler, path, accessToken string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal тела: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
@@ -224,7 +248,10 @@ func TestIntegration_Logout_RevokesTokenForRefresh(t *testing.T) {
 		t.Fatalf("unmarshal TokenPair (login): %v", err)
 	}
 
-	logoutRec := postJSON(t, router, "/auth/logout", api.PostAuthLogoutJSONBody{RefreshToken: pair.RefreshToken})
+	// /auth/logout защищён auth-middleware (тикет 1.4, нет `security: []` в
+	// openapi.yaml) — прикладываем валидный access-токен; сам access-токен из
+	// pair (полученный логином) для этого вполне подходит.
+	logoutRec := postJSONAuth(t, router, "/auth/logout", pair.AccessToken, api.PostAuthLogoutJSONBody{RefreshToken: pair.RefreshToken})
 	if logoutRec.Code != http.StatusNoContent {
 		t.Fatalf("logout: статус = %d (%s), ожидался 204", logoutRec.Code, logoutRec.Body.String())
 	}
@@ -234,8 +261,10 @@ func TestIntegration_Logout_RevokesTokenForRefresh(t *testing.T) {
 		t.Fatalf("refresh после logout: статус = %d (%s), ожидался 401", refreshRec.Code, refreshRec.Body.String())
 	}
 
-	// Повторный logout тем же (уже отозванным) токеном — идемпотентно, тоже 204.
-	secondLogoutRec := postJSON(t, router, "/auth/logout", api.PostAuthLogoutJSONBody{RefreshToken: pair.RefreshToken})
+	// Повторный logout тем же (уже отозванным) refresh, но снова с валидным
+	// access-токеном (auth-middleware проверяет access, а не refresh) —
+	// идемпотентно, тоже 204.
+	secondLogoutRec := postJSONAuth(t, router, "/auth/logout", pair.AccessToken, api.PostAuthLogoutJSONBody{RefreshToken: pair.RefreshToken})
 	if secondLogoutRec.Code != http.StatusNoContent {
 		t.Fatalf("повторный logout: статус = %d (%s), ожидался 204", secondLogoutRec.Code, secondLogoutRec.Body.String())
 	}

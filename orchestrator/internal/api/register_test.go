@@ -12,8 +12,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/google/uuid"
 
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
@@ -176,12 +179,33 @@ func TestHealthzServedByRouter(t *testing.T) {
 // будущий тикет) отвечает 501 через встроенную заглушку Unimplemented.
 // /auth/login, /auth/refresh, /auth/logout реализованы тикетом 1.3 — их
 // сценарии теперь покрыты login_test.go/refresh_test.go/logout_test.go.
+//
+// /channels/telegram/link-code защищён auth-middleware (тикет 1.4, нет
+// `security: []` в openapi.yaml) — даже нереализованные операции проходят
+// через него, поэтому запрос несёт валидный Bearer-токен: тест проверяет
+// именно заглушку Unimplemented (501), а не auth-middleware (его 401-поведение
+// для этого же маршрута — TestUnimplementedRequiresBearerToken ниже).
 func TestUnimplementedReturns501(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 	req := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("статус /channels/telegram/link-code = %d, ожидался 501", rec.Code)
+	}
+}
+
+// TestUnimplementedRequiresBearerToken — та же нереализованная операция без
+// Authorization-заголовка отдаёт 401 от auth-middleware, не доходя до
+// заглушки Unimplemented (FR A3, D2, тикет 1.4): «защищённый, но ещё не
+// реализованный» — всё равно защищённый.
+func TestUnimplementedRequiresBearerToken(t *testing.T) {
+	router := NewRouter(newTestServer(fakeQuerier{}))
+	req := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус /channels/telegram/link-code без токена = %d, ожидался 401", rec.Code)
 	}
 }
