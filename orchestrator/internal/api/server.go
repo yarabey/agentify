@@ -1,5 +1,5 @@
 // Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов
-// 1.2/1.3/1.4/2.2/2.3.
+// 1.2/1.3/1.4/2.2/2.3/2.4.
 //
 // Назначение (бизнес): здесь живёт каркас единого REST-API оркестратора (через
 // который ходят web PWA и Telegram-бот, см. orchestrator/README.md), а реально
@@ -10,8 +10,9 @@
 // (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go), CRUD
 // интеграций с выдачей UUID-секрета — GET/POST /integrations,
 // GET/PATCH /integrations/{id} (FR B1, B2, B5, Gherkin §2, см. integrations.go),
-// а также аутентификация машины по UUID на WS-handshake — GET /machine/ws
-// (FR B3, B6, Gherkin §2, см. machine_ws.go). Доступ в систему закрытый:
+// а также аутентификация машины по UUID на WS-handshake — GET /machine/ws,
+// вкл. вытеснение повторного соединения той же интеграции (FR B3, B6,
+// Gherkin §2, ADR 0002, см. machine_ws.go). Доступ в систему закрытый:
 // аккаунт создаётся лишь при предъявлении активного секретного токена
 // регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи,
 // удаление интеграции) пока отвечают 501 Not Implemented и будут реализованы
@@ -41,9 +42,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -122,6 +126,19 @@ type Server struct {
 	// крипто-гигиена (см. godoc internal/crypto.DeriveKey).
 	integrationUUIDAEADKey []byte
 	integrationUUIDHMACKey []byte
+
+	// machineConns — реестр активных WS-соединений машины по integration_id
+	// (тикет 2.4, FR B6, ADR 0002 "защита от повторного UUID"). Один процесс
+	// оркестратора в MVP (docs/01_tech_stack_and_architecture.md [РЕШЕНИЕ 5]) —
+	// in-memory достаточно, распределённой координации (Redis и т.п.) не
+	// требуется. Под machineConnsMu: используется и для вытеснения старого
+	// соединения новым с тем же integration_id (registerMachineConn), и для
+	// compare-and-delete снятия с регистрации при дисконнекте
+	// (unregisterMachineConn) — см. godoc обеих функций в machine_ws.go про
+	// гонку «новое соединение зарегистрировалось раньше, чем старое дошло до
+	// своего defer».
+	machineConns   map[uuid.UUID]*websocket.Conn
+	machineConnsMu sync.Mutex
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -155,6 +172,7 @@ func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encry
 		jwtSigningKey:          jwtSigningKey,
 		integrationUUIDAEADKey: crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
 		integrationUUIDHMACKey: crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
+		machineConns:           make(map[uuid.UUID]*websocket.Conn),
 	}
 }
 
