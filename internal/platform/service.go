@@ -63,6 +63,25 @@ func (s *Service) Router() chi.Router {
 	return s.router
 }
 
+// SetHandler заменяет HTTP-роутер сервиса на переданный handler перед вызовом
+// Run, сохраняя весь жизненный цикл (тот же адрес, таймауты и graceful
+// shutdown).
+//
+// Назначение: тикет 1.2 поднимает в оркестраторе сгенерированный из openapi
+// chi-роутер (он уже включает собственный GET /healthz и реальные эндпоинты
+// API). Чтобы не дублировать /healthz из двух источников и не навешивать
+// маршруты на встроенный health-роутер, сервис принимает готовый handler
+// целиком. Передавать handler нужно ДО Run; nil игнорируется (остаётся
+// health-роутер по умолчанию). handler — любой chi.Router (или иной
+// http.Handler, обёрнутый в chi); тип сужен до chi.Router, т.к. весь стек
+// сервиса работает на chi.
+func (s *Service) SetHandler(handler chi.Router) {
+	if handler == nil {
+		return
+	}
+	s.router = handler
+}
+
 // Run запускает HTTP-сервер сервиса и блокируется до остановки.
 //
 // Сервер слушает Config.HealthAddr и обслуживает /healthz. Run возвращает
