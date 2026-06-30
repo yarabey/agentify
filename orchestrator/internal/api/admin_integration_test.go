@@ -73,7 +73,7 @@ func TestIntegration_AdminRegistrationToken_AdminSeesToken(t *testing.T) {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 	rec := getAdminRegistrationToken(t, router, "Bearer "+accessToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
@@ -119,7 +119,7 @@ func TestIntegration_AdminRegistrationToken_NonAdminForbidden(t *testing.T) {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 	rec := getAdminRegistrationToken(t, router, "Bearer "+accessToken)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("статус = %d (%s), ожидался 403", rec.Code, rec.Body.String())
@@ -143,7 +143,7 @@ func TestIntegration_AdminRegistrationToken_RequiresBearerToken(t *testing.T) {
 		t.Fatalf("CreateRegistrationToken: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 	rec := getAdminRegistrationToken(t, router, "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())

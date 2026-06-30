@@ -25,7 +25,7 @@
 //     защищённый маршрут (через probe) — всё равно требует токен, отвечая
 //     401 без него и пропуская (статус-маркер probe) с валидным; отдельная
 //     проверка «защищённый, но ещё не реализованный → 401/501» теперь живёт
-//     на маршруте GET /integrations (см. TestRouter_ProtectedRouteRequiresToken).
+//     на маршруте DELETE /integrations/{id} (см. TestRouter_ProtectedRouteRequiresToken).
 package api
 
 import (
@@ -198,24 +198,23 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 // 401 без токена и доходит до обработчика (тут — заглушка Unimplemented,
 // 501) с валидным.
 //
-// Маршрут под тестом — GET /integrations (ещё не реализован, см.
-// server.go): /admin/registration-token, который раньше использовался здесь
-// для той же проверки, с тикета 1.6 реализован (admin.go) и отвечает
-// 403/200, а не 501 — его поведение «защищённый маршрут требует токен»
-// теперь покрыто отдельно admin_test.go, а этот тест проверяет общий
-// механизм middleware+Unimplemented на ЛЮБОМ ещё не готовом защищённом
-// маршруте.
+// Маршрут под тестом — DELETE /integrations/{id} (тикет 2.6, сознательно вне
+// скоупа тикета 2.2 — см. integrations.go, DeleteIntegrationsId НЕ
+// переопределён). GET /integrations использовался здесь раньше для той же
+// проверки, но с тикета 2.2 реализован (integrations.go) и отвечает 200, а
+// не 501 — этот тест проверяет общий механизм middleware+Unimplemented на
+// ЛЮБОМ ещё не готовом защищённом маршруте, а не конкретно на /integrations.
 func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 
-	noToken := httptest.NewRequest(http.MethodGet, "/integrations", nil)
+	noToken := httptest.NewRequest(http.MethodDelete, "/integrations/"+uuid.New().String(), nil)
 	noTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(noTokenRec, noToken)
 	if noTokenRec.Code != http.StatusUnauthorized {
 		t.Fatalf("без токена: статус = %d (%s), ожидался 401", noTokenRec.Code, noTokenRec.Body.String())
 	}
 
-	withToken := httptest.NewRequest(http.MethodGet, "/integrations", nil)
+	withToken := httptest.NewRequest(http.MethodDelete, "/integrations/"+uuid.New().String(), nil)
 	withToken.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	withTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(withTokenRec, withToken)
