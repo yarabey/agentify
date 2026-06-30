@@ -1,5 +1,5 @@
 // Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов
-// 1.2/1.3/1.4/2.2.
+// 1.2/1.3/1.4/2.2/2.3.
 //
 // Назначение (бизнес): здесь живёт каркас единого REST-API оркестратора (через
 // который ходят web PWA и Telegram-бот, см. orchestrator/README.md), а реально
@@ -7,30 +7,31 @@
 // (FR A1, Gherkin §1), логин/refresh/logout — POST /auth/login,
 // POST /auth/refresh, POST /auth/logout (FR A3), и auth-middleware,
 // определяющий пользователя по access-токену на защищённых маршрутах
-// (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go), а также
-// CRUD интеграций с выдачей UUID-секрета — GET/POST /integrations,
-// GET/PATCH /integrations/{id} (FR B1, B2, B5, Gherkin §2, см. integrations.go).
-// Доступ в систему закрытый: аккаунт создаётся лишь при предъявлении активного
-// секретного токена регистрации; без него — отказ (FR A1). Остальные операции
-// контракта (задачи, удаление интеграции, аутентификация машины — позже) пока
-// отвечают 501 Not Implemented и будут реализованы в своих тикетах, но уже
-// сейчас проходят через auth-middleware наравне с готовыми защищёнными
-// операциями.
+// (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go), CRUD
+// интеграций с выдачей UUID-секрета — GET/POST /integrations,
+// GET/PATCH /integrations/{id} (FR B1, B2, B5, Gherkin §2, см. integrations.go),
+// а также аутентификация машины по UUID на WS-handshake — GET /machine/ws
+// (FR B3, B6, Gherkin §2, см. machine_ws.go). Доступ в систему закрытый:
+// аккаунт создаётся лишь при предъявлении активного секретного токена
+// регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи,
+// удаление интеграции) пока отвечают 501 Not Implemented и будут реализованы
+// в своих тикетах, но уже сейчас проходят через auth-middleware наравне с
+// готовыми защищёнными операциями.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
 // только готовые операции — GetHealthz, PostAuthRegister,
-// PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go) и
+// PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go),
 // GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId (см.
-// integrations.go). NewRouter монтирует chi-роутер из сгенерированного
-// HandlerWithOptions (он же поднимает GET /healthz и все маршруты API от корня
-// — Caddy роутит /api/* со стрипом префикса, поэтому пути монтируются от корня:
-// /auth/register, /healthz), подключая auth-middleware выборочно к защищённым
-// маршрутам (см. NewRouter и middleware.go). Слой данных — sqlc *db.Queries
-// поверх pgxpool; бизнес-логика (проверка токена, хэширование пароля,
-// шифрование UUID-секрета через internal/crypto) живёт в обработчике, SQL — в
-// db.
+// integrations.go) и GetMachineWs (см. machine_ws.go). NewRouter монтирует
+// chi-роутер из сгенерированного HandlerWithOptions (он же поднимает
+// GET /healthz и все маршруты API от корня — Caddy роутит /api/* со стрипом
+// префикса, поэтому пути монтируются от корня: /auth/register, /healthz),
+// подключая auth-middleware выборочно к защищённым маршрутам (см. NewRouter и
+// middleware.go). Слой данных — sqlc *db.Queries поверх pgxpool;
+// бизнес-логика (проверка токена, хэширование пароля, шифрование UUID-секрета
+// через internal/crypto) живёт в обработчике, SQL — в db.
 package api
 
 import (
@@ -92,6 +93,11 @@ type Querier interface {
 	GetIntegrationByIDAndUser(ctx context.Context, arg db.GetIntegrationByIDAndUserParams) (db.Integration, error)
 	// UpdateIntegration частично обновляет name/ip_hint владельца (FR B5).
 	UpdateIntegration(ctx context.Context, arg db.UpdateIntegrationParams) (db.Integration, error)
+	// GetIntegrationByUUIDHMAC ищет интеграцию по отпечатку UUID-секрета —
+	// путь аутентификации машины на WS-handshake /machine/ws, БЕЗ фильтра по
+	// user_id: владелец на этом шаге ещё не известен (FR B3, B6, тикет 2.3,
+	// см. machine_ws.go).
+	GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (db.Integration, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.

@@ -58,6 +58,9 @@ type fakeQuerier struct {
 
 	updateIntegrationResult db.Integration
 	updateIntegrationErr    error
+
+	getIntegrationByUUIDHMACResult db.Integration
+	getIntegrationByUUIDHMACErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -139,6 +142,13 @@ func (f fakeQuerier) UpdateIntegration(context.Context, db.UpdateIntegrationPara
 		return db.Integration{}, f.updateIntegrationErr
 	}
 	return f.updateIntegrationResult, nil
+}
+
+func (f fakeQuerier) GetIntegrationByUUIDHMAC(context.Context, string) (db.Integration, error) {
+	if f.getIntegrationByUUIDHMACErr != nil {
+		return db.Integration{}, f.getIntegrationByUUIDHMACErr
+	}
+	return f.getIntegrationByUUIDHMACResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api
