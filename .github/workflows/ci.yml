@@ -45,6 +45,10 @@ concurrency:
 
 permissions:
   contents: read
+  # pull-requests: read — нужен dorny/paths-filter@v3 на pull_request-событиях:
+  # без него джоба `changes` падает на Resource not accessible by integration
+  # при вызове GitHub API listFiles(pull_number) для списка изменённых файлов PR.
+  pull-requests: read
 
 env:
   GO_VERSION: "1.24"
