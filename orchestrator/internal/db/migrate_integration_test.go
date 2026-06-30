@@ -54,7 +54,20 @@ func startPostgres(ctx context.Context, t *testing.T) (string, func()) {
 			"POSTGRES_PASSWORD": pgPass,
 			"POSTGRES_DB":       pgDB,
 		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(2 * time.Minute),
+		// ВАЖНО: НЕ используем wait.ForListeningPort — у официального образа
+		// postgres entrypoint во время initdb кратко поднимает Postgres,
+		// останавливает его и поднимает заново для внешних соединений; порт
+		// 5432 в какой-то момент закрывается и переоткрывается, поэтому
+		// "слушает порт" может сработать между двумя стартами и первое
+		// реальное подключение клиента словит "connection reset by peer"
+		// (известная проблема именно с этим образом, см. testcontainers-go
+		// issues/docs про postgres wait strategy). Строка "database system is
+		// ready to accept connections" печатается в логах ДВАЖДЫ — один раз
+		// при временном старте initdb и один раз при финальном — поэтому ждём
+		// именно второе вхождение.
+		WaitingFor: wait.ForLog("database system is ready to accept connections").
+			WithOccurrence(2).
+			WithStartupTimeout(2 * time.Minute),
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
