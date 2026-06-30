@@ -95,7 +95,7 @@ func TestIntegration_Login_InvalidCredentials(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 
 	unknownUser := postJSON(t, router, "/auth/login", api.LoginRequest{Username: "ghost", Password: "whatever"})
 	if unknownUser.Code != http.StatusUnauthorized {
@@ -135,7 +135,7 @@ func TestIntegration_Login_Success(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 
 	rec := postJSON(t, router, "/auth/login", api.LoginRequest{Username: username, Password: password})
 	if rec.Code != http.StatusOK {
@@ -174,7 +174,7 @@ func TestIntegration_Refresh_RotationInvalidatesOldToken(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 
 	loginRec := postJSON(t, router, "/auth/login", api.LoginRequest{Username: username, Password: password})
 	if loginRec.Code != http.StatusOK {
@@ -237,7 +237,7 @@ func TestIntegration_Logout_RevokesTokenForRefresh(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey)))
+	router := api.NewRouter(api.NewServer(db.New(pool), nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
 
 	loginRec := postJSON(t, router, "/auth/login", api.LoginRequest{Username: username, Password: password})
 	if loginRec.Code != http.StatusOK {

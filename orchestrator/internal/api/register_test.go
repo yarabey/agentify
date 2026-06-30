@@ -46,6 +46,18 @@ type fakeQuerier struct {
 	// revokedHashes собирает хэши, переданные в RevokeRefreshTokenByHash —
 	// позволяет тестам проверить, что отозван именно ожидаемый (старый) токен.
 	revokedHashes *[]string
+
+	createIntegrationResult db.Integration
+	createIntegrationErr    error
+
+	listIntegrationsResult []db.Integration
+	listIntegrationsErr    error
+
+	getIntegrationResult db.Integration
+	getIntegrationErr    error
+
+	updateIntegrationResult db.Integration
+	updateIntegrationErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -101,15 +113,49 @@ func (f fakeQuerier) RevokeRefreshTokenByHash(_ context.Context, tokenHash strin
 	return f.revokeRefreshTokenByHashErr
 }
 
+func (f fakeQuerier) CreateIntegration(context.Context, db.CreateIntegrationParams) (db.Integration, error) {
+	if f.createIntegrationErr != nil {
+		return db.Integration{}, f.createIntegrationErr
+	}
+	return f.createIntegrationResult, nil
+}
+
+func (f fakeQuerier) ListIntegrationsByUser(context.Context, pgtype.UUID) ([]db.Integration, error) {
+	if f.listIntegrationsErr != nil {
+		return nil, f.listIntegrationsErr
+	}
+	return f.listIntegrationsResult, nil
+}
+
+func (f fakeQuerier) GetIntegrationByIDAndUser(context.Context, db.GetIntegrationByIDAndUserParams) (db.Integration, error) {
+	if f.getIntegrationErr != nil {
+		return db.Integration{}, f.getIntegrationErr
+	}
+	return f.getIntegrationResult, nil
+}
+
+func (f fakeQuerier) UpdateIntegration(context.Context, db.UpdateIntegrationParams) (db.Integration, error) {
+	if f.updateIntegrationErr != nil {
+		return db.Integration{}, f.updateIntegrationErr
+	}
+	return f.updateIntegrationResult, nil
+}
+
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api
 // (тикеты 1.2/1.3). Не секрет — используется только в тестовом процессе.
 const testJWTSigningKey = "unit-test-jwt-signing-key"
 
-// newTestServer собирает *Server с тестовым ключом подписи JWT поверх
-// переданного fakeQuerier/Querier — общий конструктор для всех unit-тестов
-// пакета api (регистрация, логин, refresh, logout).
+// testEncryptionKey32 — тестовый мастер-ключ шифрования РОВНО 32 байта для
+// unit-тестов пакета api (тикет 2.2, internal/crypto). Не секрет —
+// используется только в тестовом процессе, как и testJWTSigningKey.
+const testEncryptionKey32 = "0123456789abcdef0123456789abcdef"
+
+// newTestServer собирает *Server с тестовым ключом подписи JWT и тестовым
+// мастер-ключом шифрования поверх переданного fakeQuerier/Querier — общий
+// конструктор для всех unit-тестов пакета api (регистрация, логин, refresh,
+// logout, интеграции).
 func newTestServer(q Querier) *Server {
-	return NewServer(q, nil, []byte(testJWTSigningKey))
+	return NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
 }
 
 // doRegister прогоняет тело req через роутер с заданным fakeQuerier и возвращает

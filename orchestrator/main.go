@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 
@@ -37,6 +38,11 @@ const serviceName = "orchestrator"
 // envPrefix — префикс env-переменных оркестратора, чтобы три сервиса не
 // конфликтовали по именам в общем окружении (docker compose).
 const envPrefix = "ORCH_"
+
+// appEncryptionKeyLen — требуемая длина мастер-ключа шифрования после
+// base64-декодирования ORCH_APP_ENCRYPTION_KEY: 32 байта (AES-256, см.
+// internal/crypto.Encrypt).
+const appEncryptionKeyLen = 32
 
 // config — конфиг оркестратора: общий операционный базис плюс специфичные поля
 // под тем же префиксом ORCH_ (Redpanda, JWT появятся в следующих тикетах).
@@ -58,6 +64,18 @@ type config struct {
 	// поднятом API (DatabaseURL непуст) пустой JWTSigningKey — фатальная ошибка
 	// старта (см. run), а не тихий запуск с небезопасным ключом.
 	JWTSigningKey string `env:"JWT_SIGNING_KEY"`
+
+	// AppEncryptionKey — base64-кодированный мастер-ключ (32 байта после
+	// декодирования) для at-rest шифрования и HMAC-отпечатков (internal/crypto,
+	// тикет 2.2, зерно общего крипто-модуля тикета 11.1). Переменная
+	// ORCH_APP_ENCRYPTION_KEY генерируется ОДНОКРАТНО вручную (`openssl rand
+	// -base64 32`, см. docs/MANUAL_STEPS.md) и кладётся в секреты окружения —
+	// как и JWTSigningKey, здесь НЕТ дефолта и НЕ генерируется фолбэк: пустой
+	// или предсказуемый мастер-ключ означал бы, что UUID-секреты интеграций
+	// (FR B2) можно расшифровать/подделать HMAC без секрета, поэтому при
+	// поднятом API пустое/некорректное значение — фатальная ошибка старта
+	// (см. run), а не тихий запуск с небезопасным ключом.
+	AppEncryptionKey string `env:"APP_ENCRYPTION_KEY"`
 }
 
 func main() {
@@ -119,6 +137,21 @@ func run() error {
 			return fmt.Errorf("orchestrator: ORCH_JWT_SIGNING_KEY пуст — задайте секрет (см. docs/MANUAL_STEPS.md), пустой/предсказуемый ключ подписи JWT недопустим в проде")
 		}
 
+		// Мастер-ключ шифрования (тикет 2.2, internal/crypto): декодируем base64
+		// (как сгенерировано `openssl rand -base64 32`) и требуем РОВНО 32 байта
+		// после декодирования — иначе тихий запуск с нулевым/коротким/мусорным
+		// ключом сделал бы UUID-секреты интеграций расшифровываемыми/подделываемыми.
+		if cfg.AppEncryptionKey == "" {
+			return fmt.Errorf("orchestrator: ORCH_APP_ENCRYPTION_KEY пуст — задайте секрет (см. docs/MANUAL_STEPS.md), пустой/предсказуемый ключ шифрования недопустим в проде")
+		}
+		encryptionKey, err := base64.StdEncoding.DecodeString(cfg.AppEncryptionKey)
+		if err != nil {
+			return fmt.Errorf("orchestrator: ORCH_APP_ENCRYPTION_KEY не является валидным base64 (ожидается вывод `openssl rand -base64 32`): %w", err)
+		}
+		if len(encryptionKey) != appEncryptionKeyLen {
+			return fmt.Errorf("orchestrator: ORCH_APP_ENCRYPTION_KEY после base64-декодирования должен быть длиной %d байт, получено %d", appEncryptionKeyLen, len(encryptionKey))
+		}
+
 		pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 		if err != nil {
 			return fmt.Errorf("orchestrator: создание пула соединений к Postgres: %w", err)
@@ -127,7 +160,7 @@ func run() error {
 		// новые запросы уже не принимаются, активные доиграны.
 		defer pool.Close()
 
-		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey))
+		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
 		svc.SetHandler(api.NewRouter(server))
 	}
 

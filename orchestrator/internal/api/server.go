@@ -1,5 +1,5 @@
 // Package api — каркас HTTP-API оркестратора и реальные обработчики тикетов
-// 1.2/1.3/1.4.
+// 1.2/1.3/1.4/2.2.
 //
 // Назначение (бизнес): здесь живёт каркас единого REST-API оркестратора (через
 // который ходят web PWA и Telegram-бот, см. orchestrator/README.md), а реально
@@ -7,24 +7,30 @@
 // (FR A1, Gherkin §1), логин/refresh/logout — POST /auth/login,
 // POST /auth/refresh, POST /auth/logout (FR A3), и auth-middleware,
 // определяющий пользователя по access-токену на защищённых маршрутах
-// (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go). Доступ
-// в систему закрытый: аккаунт создаётся лишь при предъявлении активного
+// (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go), а также
+// CRUD интеграций с выдачей UUID-секрета — GET/POST /integrations,
+// GET/PATCH /integrations/{id} (FR B1, B2, B5, Gherkin §2, см. integrations.go).
+// Доступ в систему закрытый: аккаунт создаётся лишь при предъявлении активного
 // секретного токена регистрации; без него — отказ (FR A1). Остальные операции
-// контракта (интеграции/задачи — позже) пока отвечают 501 Not Implemented и
-// будут реализованы в своих тикетах, но уже сейчас проходят через
-// auth-middleware наравне с готовыми защищёнными операциями.
+// контракта (задачи, удаление интеграции, аутентификация машины — позже) пока
+// отвечают 501 Not Implemented и будут реализованы в своих тикетах, но уже
+// сейчас проходят через auth-middleware наравне с готовыми защищёнными
+// операциями.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
-// только готовые операции — GetHealthz, PostAuthRegister и
-// PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go). NewRouter монтирует
-// chi-роутер из сгенерированного HandlerWithOptions (он же поднимает GET /healthz и
-// все маршруты API от корня — Caddy роутит /api/* со стрипом префикса, поэтому
-// пути монтируются от корня: /auth/register, /healthz), подключая
-// auth-middleware выборочно к защищённым маршрутам (см. NewRouter и
-// middleware.go). Слой данных — sqlc *db.Queries поверх pgxpool; бизнес-логика
-// проверки токена и хэширования пароля живёт в обработчике, SQL — в db.
+// только готовые операции — GetHealthz, PostAuthRegister,
+// PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go) и
+// GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId (см.
+// integrations.go). NewRouter монтирует chi-роутер из сгенерированного
+// HandlerWithOptions (он же поднимает GET /healthz и все маршруты API от корня
+// — Caddy роутит /api/* со стрипом префикса, поэтому пути монтируются от корня:
+// /auth/register, /healthz), подключая auth-middleware выборочно к защищённым
+// маршрутам (см. NewRouter и middleware.go). Слой данных — sqlc *db.Queries
+// поверх pgxpool; бизнес-логика (проверка токена, хэширование пароля,
+// шифрование UUID-секрета через internal/crypto) живёт в обработчике, SQL — в
+// db.
 package api
 
 import (
@@ -42,6 +48,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/auth"
+	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
 
@@ -73,6 +80,18 @@ type Querier interface {
 	// RevokeRefreshTokenByHash отзывает refresh-токен по хэшу — ротация при
 	// /auth/refresh и явный отзыв при /auth/logout (FR A3).
 	RevokeRefreshTokenByHash(ctx context.Context, tokenHash string) error
+
+	// CreateIntegration вставляет новую интеграцию владельца с уже посчитанными
+	// uuid_hmac/uuid_enc (FR B1, B2, тикет 2.2).
+	CreateIntegration(ctx context.Context, arg db.CreateIntegrationParams) (db.Integration, error)
+	// ListIntegrationsByUser возвращает интеграции владельца — только свои
+	// (FR A4, I3, тикет 2.2).
+	ListIntegrationsByUser(ctx context.Context, userID pgtype.UUID) ([]db.Integration, error)
+	// GetIntegrationByIDAndUser ищет интеграцию по id, owner-scoped прямо в SQL
+	// (FR A4, I3) — чужая/несуществующая неотличимы (pgx.ErrNoRows → 404).
+	GetIntegrationByIDAndUser(ctx context.Context, arg db.GetIntegrationByIDAndUserParams) (db.Integration, error)
+	// UpdateIntegration частично обновляет name/ip_hint владельца (FR B5).
+	UpdateIntegration(ctx context.Context, arg db.UpdateIntegrationParams) (db.Integration, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.
@@ -86,19 +105,51 @@ type Server struct {
 	queries       Querier
 	logger        *slog.Logger
 	jwtSigningKey []byte
+
+	// integrationUUIDAEADKey/integrationUUIDHMACKey — подключи тикета 2.2,
+	// выведенные из мастер-ключа шифрования (encryptionKey параметр NewServer)
+	// через crypto.DeriveKey под разными purpose: один — для AEAD-шифрования
+	// UUID-секрета интеграции (показ владельцу, FR B2), другой — для его
+	// HMAC-отпечатка (поиск при аутентификации машины, тикет 2.3, FR B6).
+	// Мастер-ключ намеренно НЕ используется напрямую ни в Encrypt, ни в
+	// HMACSHA256 — reuse одного ключа в двух разных крипто-примитивах плохая
+	// крипто-гигиена (см. godoc internal/crypto.DeriveKey).
+	integrationUUIDAEADKey []byte
+	integrationUUIDHMACKey []byte
 }
 
-// NewServer собирает обработчик API оркестратора поверх слоя данных, логгера и
-// ключа подписи access-JWT.
+// integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
+// для crypto.DeriveKey, под которые выводятся подключи тикета 2.2. Значения
+// произвольны, но должны быть СТАБИЛЬНЫ между рестартами процесса (иначе ранее
+// зашифрованные/хэшированные UUID-секреты интеграций перестанут
+// расшифровываться/находиться) и РАЗНЫ между собой (иначе AEAD и HMAC делили
+// бы один и тот же фактический ключ).
+const (
+	integrationUUIDAEADKeyPurpose = "integration-uuid-aead"
+	integrationUUIDHMACKeyPurpose = "integration-uuid-hmac"
+)
+
+// NewServer собирает обработчик API оркестратора поверх слоя данных, логгера,
+// ключа подписи access-JWT и мастер-ключа шифрования.
 //
 // queries — sqlc-запросы (обычно db.New(pool)); logger — логгер сервиса (nil
 // допустим, тогда серверные ошибки не логируются); jwtSigningKey — секрет HMAC
 // для подписи/проверки access-токенов (JWT_SIGNING_KEY из окружения,
-// docs/MANUAL_STEPS.md) — НЕ генерируется и не подставляется по умолчанию здесь:
-// вызывающая сторона (orchestrator/main.go) отвечает за то, что ключ непуст в
-// проде. Возвращает *Server, готовый к монтированию через NewRouter.
-func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte) *Server {
-	return &Server{queries: queries, logger: logger, jwtSigningKey: jwtSigningKey}
+// docs/MANUAL_STEPS.md); encryptionKey — мастер-ключ шифрования, РОВНО 32
+// декодированных байта (APP_ENCRYPTION_KEY из окружения, тикет 2.2,
+// internal/crypto) — из него здесь же выводятся независимые подключи под
+// UUID-секрет интеграции (см. поля Server). Как и jwtSigningKey, НЕ
+// генерируется и не подставляется по умолчанию здесь: вызывающая сторона
+// (orchestrator/main.go) отвечает за то, что оба ключа непусты и корректной
+// длины в проде. Возвращает *Server, готовый к монтированию через NewRouter.
+func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encryptionKey []byte) *Server {
+	return &Server{
+		queries:                queries,
+		logger:                 logger,
+		jwtSigningKey:          jwtSigningKey,
+		integrationUUIDAEADKey: crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
+		integrationUUIDHMACKey: crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
+	}
 }
 
 // NewRouter монтирует chi-роутер оркестратора: общие middleware (recover,
