@@ -5,12 +5,21 @@
 // integration, чтобы обычный `make test` (unit) не требовал docker и был быстрым;
 // CI-джоба `integration` гоняет `go test -tags=integration ./...`.
 //
-// Проверяемые сценарии (приёмка 1.1):
+// Проверяемые сценарии (приёмка 1.1, плюс приёмка 2.1 — см. ниже):
 //   (a) миграция up/down — все goose-миграции применяются «вверх», таблицы auth
 //       (users/registration_tokens/refresh_tokens) появляются; затем откат «вниз»
 //       до версии 0 проходит без ошибок и удаляет таблицы (FR A1–A4);
 //   (b) CRUD-roundtrip sgened sqlc против реальной схемы: создать user → прочитать
 //       по username; вставить refresh_token → найти по hash → отозвать (FR A1, A3).
+//
+// Тикет 2.1 («Схема интеграций», deps: 1.1, миграция 00002_integrations.sql —
+// не редактируется этим тикетом, схема уже подготовлена) добавляет к (a)
+// проверку таблицы integrations и её ключевых колонок (id, user_id, name,
+// ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at)
+// после up и её исчезновение после down (FR B1–B6, Gherkin §2), а также
+// отдельный тест TestIntegration_IntegrationsUUIDHMACUnique — uuid_hmac должен
+// быть UNIQUE, что критично для будущей аутентификации машины по HMAC(UUID)
+// без коллизий (тикет 2.3, FR B6).
 //
 // Контейнер чистится через testcontainers terminate (defer) + Ryuk reaper.
 package db_test
@@ -18,10 +27,12 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -40,6 +51,11 @@ const (
 	pgUser  = "auth_test"
 	pgPass  = "auth_test"
 	pgDB    = "auth_test"
+
+	// pgUniqueViolationCode — SQLSTATE 23505 (unique_violation), используется в
+	// TestIntegration_IntegrationsUUIDHMACUnique для проверки UNIQUE на
+	// integrations.uuid_hmac (приёмка тикета 2.1).
+	pgUniqueViolationCode = "23505"
 )
 
 // startPostgres поднимает одиночный Postgres в контейнере и возвращает строку
@@ -131,8 +147,29 @@ func noTablesExist(ctx context.Context, t *testing.T, sqlDB *sql.DB, names ...st
 	}
 }
 
-// TestIntegration_MigrationUpDown — прямая приёмка 1.1: применяем все миграции
-// «вверх» (auth-таблицы появляются), затем откатываем «вниз» до 0 без ошибок.
+// columnsExist проверяет, что у таблицы есть все перечисленные колонки
+// (по information_schema.columns, без проверки типов — точное соответствие
+// типам/constraint'ам остаётся на ревью самой миграции; здесь нужна только
+// уверенность, что после up схема содержит ожидаемые поля).
+func columnsExist(ctx context.Context, t *testing.T, sqlDB *sql.DB, table string, columns ...string) {
+	t.Helper()
+	for _, col := range columns {
+		var exists bool
+		err := sqlDB.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)`, table, col).Scan(&exists)
+		if err != nil {
+			t.Fatalf("проверка колонки %s.%s: %v", table, col, err)
+		}
+		if !exists {
+			t.Fatalf("после миграции up колонка %s.%s не найдена", table, col)
+		}
+	}
+}
+
+// TestIntegration_MigrationUpDown — прямая приёмка 1.1 и 2.1: применяем все
+// миграции «вверх» (auth-таблицы и таблица integrations появляются), затем
+// откатываем «вниз» до 0 без ошибок (все таблицы исчезают).
 func TestIntegration_MigrationUpDown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -158,11 +195,107 @@ func TestIntegration_MigrationUpDown(t *testing.T) {
 	authTables := []string{"users", "registration_tokens", "refresh_tokens"}
 	tablesExist(ctx, t, sqlDB, authTables...)
 
+	// Тикет 2.1: таблица integrations (миграция 00002_integrations.sql) —
+	// сама таблица и её ключевые колонки, включая поля аутентификации машины
+	// uuid_hmac/uuid_enc (FR B1–B6, Gherkin §2).
+	const integrationsTable = "integrations"
+	tablesExist(ctx, t, sqlDB, integrationsTable)
+	columnsExist(ctx, t, sqlDB, integrationsTable,
+		"id", "user_id", "name", "ip_hint", "uuid_hmac", "uuid_enc",
+		"status", "last_seen_at", "created_at", "updated_at")
+
+	allTables := append(append([]string{}, authTables...), integrationsTable)
+
 	// Down: откатываем все миграции до версии 0 — проверяем обратимость схемы.
 	if derr := goose.DownToContext(ctx, sqlDB, ".", 0); derr != nil {
 		t.Fatalf("goose Down до 0: %v", derr)
 	}
-	noTablesExist(ctx, t, sqlDB, authTables...)
+	noTablesExist(ctx, t, sqlDB, allTables...)
+}
+
+// TestIntegration_IntegrationsUUIDHMACUnique — приёмка 2.1: integrations.uuid_hmac
+// обязан быть UNIQUE. Это не декоративное ограничение — будущая аутентификация
+// машины (тикет 2.3, FR B6) ищет интеграцию строго по HMAC(UUID) и обязана
+// получать не более одной строки; коллизия HMAC двух разных машин не должна
+// быть физически представима в схеме. Поднимаем отдельный контейнер (как
+// TestIntegration_AuthCRUDRoundtrip/TestIntegration_RLSCrossUserIsolation),
+// чтобы тест не зависел от состояния, оставленного TestIntegration_MigrationUpDown.
+func TestIntegration_IntegrationsUUIDHMACUnique(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn, cleanup := startPostgres(ctx, t)
+	defer cleanup()
+
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	goose.SetBaseFS(migrations.FS)
+	if derr := goose.SetDialect("postgres"); derr != nil {
+		t.Fatalf("goose SetDialect: %v", derr)
+	}
+	if uperr := goose.UpContext(ctx, sqlDB, "."); uperr != nil {
+		t.Fatalf("goose Up: %v", uperr)
+	}
+	_ = sqlDB.Close()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	// integrations.user_id — NOT NULL FK на users(id), нужен реальный владелец
+	// для обеих вставок (используем sqlc-запрос CreateUser, как и соседние тесты).
+	q := db.New(pool)
+	owner, err := q.CreateUser(ctx, db.CreateUserParams{
+		Username:     "uuid-hmac-owner",
+		PasswordHash: "argon2id$stub",
+		IsAdmin:      false,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	const sameHMAC = "hmac-duplicate-probe"
+	// Первая вставка с этим uuid_hmac должна пройти без ошибок.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO integrations (user_id, name, uuid_hmac, uuid_enc)
+		VALUES ($1, 'machine-one', $2, $3)`,
+		owner.ID, sameHMAC, []byte("ciphertext-one"))
+	if err != nil {
+		t.Fatalf("первая вставка integrations с uuid_hmac=%q: %v", sameHMAC, err)
+	}
+
+	// Вторая вставка с ТЕМ ЖЕ uuid_hmac (другие name/uuid_enc, тот же владелец)
+	// обязана упасть с нарушением уникальности (Postgres SQLSTATE 23505).
+	_, err = pool.Exec(ctx, `
+		INSERT INTO integrations (user_id, name, uuid_hmac, uuid_enc)
+		VALUES ($1, 'machine-two', $2, $3)`,
+		owner.ID, sameHMAC, []byte("ciphertext-two"))
+	if err == nil {
+		t.Fatal("вставка дубликата uuid_hmac прошла без ошибки — UNIQUE-ограничение не работает")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("ожидалась ошибка Postgres (*pgconn.PgError) при дубликате uuid_hmac, получено: %v", err)
+	}
+	if pgErr.Code != pgUniqueViolationCode {
+		t.Fatalf("ожидался SQLSTATE %s (unique_violation) при дубликате uuid_hmac, получено %s: %v",
+			pgUniqueViolationCode, pgErr.Code, pgErr)
+	}
+
+	// Контрольная вставка с ДРУГИМ uuid_hmac (тот же владелец) обязана пройти —
+	// доказывает, что отказ выше вызван именно дубликатом uuid_hmac, а не
+	// случайной поломкой INSERT/FK для этого пользователя.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO integrations (user_id, name, uuid_hmac, uuid_enc)
+		VALUES ($1, 'machine-three', 'hmac-distinct-probe', $2)`,
+		owner.ID, []byte("ciphertext-three"))
+	if err != nil {
+		t.Fatalf("вставка integrations с уникальным uuid_hmac неожиданно упала: %v", err)
+	}
 }
 
 // TestIntegration_AuthCRUDRoundtrip — короткий roundtrip sgened sqlc против
