@@ -14,8 +14,12 @@
 //     история); РЕАЛЬНАЯ Redpanda содержит ровно один конверт type=task_assigned
 //     в machine.commands с правильными task_id/integration_id/payload.text;
 //   - владение: POST /tasks на чужую интеграцию → 404 (FR A4, I3);
-//   - дубль Idempotency-Key одного пользователя → первый 201, второй 409
-//     (временное поведение до полноценного дедупа тикета 5.5).
+//   - дедуп (тикет 5.5, FR E7, §4 «Защита от двойной отправки»): повторный
+//     POST /tasks с тем же (user, Idempotency-Key) → 200 с ТЕМ ЖЕ id задачи
+//     (не 409, не новый 201), в БД ровно одна строка tasks на этот ключ, и
+//     количество task_events не растёт от повтора;
+//   - разные Idempotency-Key той же интеграции → две разные задачи (дедуп не
+//     блокирует легитимные повторные постановки).
 package api_test
 
 import (
@@ -491,10 +495,46 @@ func TestIntegration_PostTasks_ForeignIntegrationNotFound(t *testing.T) {
 	t.Logf("OK: POST /tasks на чужую интеграцию → 404")
 }
 
-// TestIntegration_PostTasks_DuplicateIdempotencyKeyConflicts — два POST
-// /tasks подряд с одинаковым (user, Idempotency-Key) → первый 201, второй
-// 409 (временное поведение до полноценного дедупа тикета 5.5).
-func TestIntegration_PostTasks_DuplicateIdempotencyKeyConflicts(t *testing.T) {
+// countTasksByUserAndIdempotencyKey — сколько строк tasks существует для
+// (user_id, idempotency_key); используется TestIntegration_PostTasks_
+// DuplicateIdempotencyKeyReturnsExisting, чтобы доказать, что повтор
+// постановки НЕ создаёт вторую строку (тикет 5.5, уникальный индекс
+// uq_tasks_idempotency — источник истины, обработчик лишь реагирует на его
+// коллизию).
+func countTasksByUserAndIdempotencyKey(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID, idempotencyKey string) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE user_id = $1 AND idempotency_key = $2`, userID, idempotencyKey).Scan(&count); err != nil {
+		t.Fatalf("SELECT count(*) FROM tasks: %v", err)
+	}
+	return count
+}
+
+// countTaskEvents — сколько записей task_events существует для задачи;
+// используется, чтобы доказать, что повторная постановка не пишет лишний
+// status_change (тикет 5.5: повтор не вызывает Transition повторно).
+func countTaskEvents(ctx context.Context, t *testing.T, pool *pgxpool.Pool, taskID uuid.UUID) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id = $1`, taskID).Scan(&count); err != nil {
+		t.Fatalf("SELECT count(*) FROM task_events: %v", err)
+	}
+	return count
+}
+
+// TestIntegration_PostTasks_DuplicateIdempotencyKeyReturnsExisting — приёмка
+// тикета 5.5 (FR E7, §4 «Защита от двойной отправки»): два POST /tasks
+// подряд с одинаковым (user, Idempotency-Key), через РЕАЛЬНЫЙ HTTP на
+// настоящем Postgres+Redpanda. Тело второго запроса намеренно ОТЛИЧАЕТСЯ
+// текстом — дедуп срабатывает только по (user_id, idempotency_key), не по
+// содержимому.
+//
+// Проверяется: первый ответ 201 (status=queued); второй ответ 200 (НЕ 409,
+// НЕ 201) с ТЕМ ЖЕ id задачи, что и первый; в БД ровно одна строка tasks для
+// этого (user_id, idempotency_key); количество task_events этой задачи не
+// выросло между первым и вторым запросом (повтор не порождает лишний
+// status_change, не вызывает Transition/публикацию повторно).
+func TestIntegration_PostTasks_DuplicateIdempotencyKeyReturnsExisting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -525,16 +565,109 @@ func TestIntegration_PostTasks_DuplicateIdempotencyKeyConflicts(t *testing.T) {
 	router := api.NewRouter(server)
 
 	const key = "duplicate-key-1"
-	body := api.TaskCreate{IntegrationId: uuid.UUID(integration.ID.Bytes), Text: "первая задача"}
+	integrationID := uuid.UUID(integration.ID.Bytes)
 
-	first := doPostTasksRequest(t, router, token, key, body)
+	first := doPostTasksRequest(t, router, token, key, api.TaskCreate{IntegrationId: integrationID, Text: "первая задача"})
 	if first.Code != http.StatusCreated {
 		t.Fatalf("первый POST: статус = %d (%s), ожидался 201", first.Code, first.Body.String())
 	}
-
-	second := doPostTasksRequest(t, router, token, key, body)
-	if second.Code != http.StatusConflict {
-		t.Fatalf("второй POST (тот же Idempotency-Key): статус = %d (%s), ожидался 409", second.Code, second.Body.String())
+	var firstTask api.Task
+	if err := json.Unmarshal(first.Body.Bytes(), &firstTask); err != nil {
+		t.Fatalf("unmarshal тела первого ответа: %v", err)
 	}
-	t.Logf("OK: повтор Idempotency-Key → 409")
+	if firstTask.Id == nil {
+		t.Fatal("id первого ответа пуст")
+	}
+	if firstTask.Status == nil || *firstTask.Status != api.TaskStatus("queued") {
+		t.Fatalf("status первого ответа = %v, ожидался queued", firstTask.Status)
+	}
+	taskID := *firstTask.Id
+
+	eventsAfterFirst := countTaskEvents(ctx, t, pool, taskID)
+
+	// Тело второго запроса намеренно другое — дедуп не должен зависеть от
+	// содержимого, только от (user_id, idempotency_key).
+	second := doPostTasksRequest(t, router, token, key, api.TaskCreate{IntegrationId: integrationID, Text: "другой текст в повторной постановке"})
+	if second.Code != http.StatusOK {
+		t.Fatalf("второй POST (тот же Idempotency-Key): статус = %d (%s), ожидался 200", second.Code, second.Body.String())
+	}
+	var secondTask api.Task
+	if err := json.Unmarshal(second.Body.Bytes(), &secondTask); err != nil {
+		t.Fatalf("unmarshal тела второго ответа: %v", err)
+	}
+	if secondTask.Id == nil || *secondTask.Id != taskID {
+		t.Fatalf("id второго ответа = %v, ожидался тот же, что у первого = %s", secondTask.Id, taskID)
+	}
+
+	// В БД ровно одна строка на этот (user_id, idempotency_key) — дубль не создан.
+	if n := countTasksByUserAndIdempotencyKey(ctx, t, pool, user.ID, key); n != 1 {
+		t.Fatalf("count(*) FROM tasks WHERE user_id/idempotency_key = %d, ожидался 1 (дубль не должен создаваться)", n)
+	}
+
+	// task_events не выросли — повтор не вызвал Transition/status_change заново.
+	if n := countTaskEvents(ctx, t, pool, taskID); n != eventsAfterFirst {
+		t.Fatalf("task_events для задачи после повтора = %d, ожидалось без изменений (%d) — повтор не должен писать новую историю", n, eventsAfterFirst)
+	}
+
+	t.Logf("OK: повтор Idempotency-Key → 200 с той же задачей %s, дубль в БД не создан, task_events не выросли", taskID)
+}
+
+// TestIntegration_PostTasks_DifferentIdempotencyKeysCreateDistinctTasks —
+// разные Idempotency-Key той же интеграции/пользователя создают ДВЕ разные
+// задачи (тикет 5.5): дедуп не должен блокировать легитимные повторные
+// постановки, только буквальный повтор того же ключа.
+func TestIntegration_PostTasks_DifferentIdempotencyKeysCreateDistinctTasks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	seed, doneRedpanda := startRedpandaForTasks(ctx, t)
+	defer doneRedpanda()
+	seeds := []string{seed}
+	waitRedpandaReadyForTasks(ctx, t, seeds)
+	if err := bus.EnsureMVPTopics(ctx, seeds); err != nil {
+		t.Fatalf("провижининг топиков: %v", err)
+	}
+
+	producer, err := bus.NewProducer(seeds)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	defer producer.Close()
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-distinct-keys")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-distinct-keys")
+	integrationID := uuid.UUID(integration.ID.Bytes)
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	server.SetTransitioner(task.NewTransitioner(pool))
+	server.SetCommandPublisher(producer)
+	router := api.NewRouter(server)
+
+	first := doPostTasksRequest(t, router, token, "distinct-key-1", api.TaskCreate{IntegrationId: integrationID, Text: "первая задача"})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("первый POST: статус = %d (%s), ожидался 201", first.Code, first.Body.String())
+	}
+	second := doPostTasksRequest(t, router, token, "distinct-key-2", api.TaskCreate{IntegrationId: integrationID, Text: "вторая задача"})
+	if second.Code != http.StatusCreated {
+		t.Fatalf("второй POST (другой Idempotency-Key): статус = %d (%s), ожидался 201", second.Code, second.Body.String())
+	}
+
+	var firstTask, secondTask api.Task
+	if err := json.Unmarshal(first.Body.Bytes(), &firstTask); err != nil {
+		t.Fatalf("unmarshal тела первого ответа: %v", err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondTask); err != nil {
+		t.Fatalf("unmarshal тела второго ответа: %v", err)
+	}
+	if firstTask.Id == nil || secondTask.Id == nil {
+		t.Fatal("id одного из ответов пуст")
+	}
+	if *firstTask.Id == *secondTask.Id {
+		t.Fatalf("разные Idempotency-Key дали одну и ту же задачу %s — дедуп не должен блокировать разные постановки", *firstTask.Id)
+	}
+	t.Logf("OK: разные Idempotency-Key → две разные задачи (%s, %s)", *firstTask.Id, *secondTask.Id)
 }

@@ -65,6 +65,9 @@ type fakeQuerier struct {
 	createTaskResult db.Task
 	createTaskErr    error
 
+	getTaskByUserAndIdempotencyKeyResult db.Task
+	getTaskByUserAndIdempotencyKeyErr    error
+
 	getTaskByIDAndUserResult db.Task
 	getTaskByIDAndUserErr    error
 
@@ -168,6 +171,13 @@ func (f fakeQuerier) CreateTask(context.Context, db.CreateTaskParams) (db.Task, 
 		return db.Task{}, f.createTaskErr
 	}
 	return f.createTaskResult, nil
+}
+
+func (f fakeQuerier) GetTaskByUserAndIdempotencyKey(context.Context, db.GetTaskByUserAndIdempotencyKeyParams) (db.Task, error) {
+	if f.getTaskByUserAndIdempotencyKeyErr != nil {
+		return db.Task{}, f.getTaskByUserAndIdempotencyKeyErr
+	}
+	return f.getTaskByUserAndIdempotencyKeyResult, nil
 }
 
 func (f fakeQuerier) GetTaskByIDAndUser(context.Context, db.GetTaskByIDAndUserParams) (db.Task, error) {

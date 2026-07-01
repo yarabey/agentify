@@ -31,8 +31,10 @@ type CreateTaskParams struct {
 // сделал Transitioner единственной точкой смены tasks.status, поэтому
 // обработчик POST /tasks (тикет 5.3) не пишет 'queued'/task_events напрямую.
 // Коллизия (user_id, idempotency_key) — SQLSTATE 23505 (uq_tasks_idempotency);
-// обработчик отвечает 409 (полноценное «вернуть существующую задачу, 200» —
-// отдельный тикет 5.5).
+// обработчик перехватывает её и обслуживает повтор через
+// GetTaskByUserAndIdempotencyKey ниже (тикет 5.5, FR E7, §4 «Защита от
+// двойной отправки»): существующая задача возвращается с 200, дубль не
+// создаётся.
 func (q *Queries) CreateTask(ctx context.Context, arg CreateTaskParams) (Task, error) {
 	row := q.db.QueryRow(ctx, createTask,
 		arg.UserID,
@@ -99,6 +101,37 @@ type GetTaskByIDAndUserParams struct {
 // задачей перед применением ответа пользователя.
 func (q *Queries) GetTaskByIDAndUser(ctx context.Context, arg GetTaskByIDAndUserParams) (Task, error) {
 	row := q.db.QueryRow(ctx, getTaskByIDAndUser, arg.ID, arg.UserID)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.IntegrationID,
+		&i.TextEnc,
+		&i.Status,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getTaskByUserAndIdempotencyKey = `-- name: GetTaskByUserAndIdempotencyKey :one
+SELECT id, user_id, integration_id, text_enc, status, idempotency_key, created_at, updated_at FROM tasks WHERE user_id = $1 AND idempotency_key = $2
+`
+
+type GetTaskByUserAndIdempotencyKeyParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	IdempotencyKey *string     `json:"idempotency_key"`
+}
+
+// Находит уже созданную задачу по (user_id, idempotency_key) после того, как
+// INSERT в CreateTask упал на uq_tasks_idempotency (SQLSTATE 23505) — это и
+// есть дедуп повторной постановки (тикет 5.5, FR E7): вместо создания дубля
+// обработчик POST /tasks перечитывает уже существующую строку и возвращает
+// её с 200, не трогая Transitioner и не публикуя task_assigned повторно (эта
+// задача уже прошла весь путь при первой, не повторной, постановке).
+func (q *Queries) GetTaskByUserAndIdempotencyKey(ctx context.Context, arg GetTaskByUserAndIdempotencyKeyParams) (Task, error) {
+	row := q.db.QueryRow(ctx, getTaskByUserAndIdempotencyKey, arg.UserID, arg.IdempotencyKey)
 	var i Task
 	err := row.Scan(
 		&i.ID,
