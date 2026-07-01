@@ -39,11 +39,25 @@
 #     бинаря+установка Node.js+самопроверка --version) внутри одноразового
 #     `docker run ubuntu:24.04` — чистая ОС без предустановленного Node,
 #     реально проверяющая ветку установки Node.js «с нуля».
+#   * Джоба `agent-service-test` (тикет 4.4, deps: 4.3) — CI-гейт приёмки
+#     тикета «после kill процесс поднимается» (FR C5: автозапуск + рестарт
+#     при сбое). В отличие от `agent-install-test` (тестирует ВНУТРИ `docker
+#     run ubuntu:24.04` — вложенный контейнер БЕЗ настоящего systemd) эта
+#     джоба проверяет РЕАЛЬНОЕ поведение systemd и поэтому запускается
+#     НАПРЯМУЮ на хосте раннера ubuntu-latest (без Docker-обёртки):
+#     GitHub-hosted ubuntu-latest — полноценная VM с systemd как PID 1 и
+#     passwordless sudo для пользователя runner. Собирает agentify-agent
+#     нативно (go build, без GoReleaser), неинтерактивно настраивает конфиг
+#     через уже готовый механизм тикета 4.3 (AGENTIFY_SETUP_*), ставит
+#     systemd-сервис через `sudo agentify-agent service-install`, убивает
+#     процесс (kill -9) и проверяет, что systemd его перезапустил (сервис
+#     снова active И MainPID изменился). Teardown (disable+rm unit) — always,
+#     даже при падении предыдущих шагов.
 #
 # Required-статусы для branch protection (настраивается вручную, MANUAL_STEPS —
 # в коде protection не задаётся): lint, build, test, generate-check, docs-check,
-# bdd, web, integration, agent-release-build, agent-install-test. См. README.md
-# раздел «CI».
+# bdd, web, integration, agent-release-build, agent-install-test,
+# agent-service-test. См. README.md раздел «CI».
 #
 # Секреты в YAML значениями НЕ храним (AGENTS.md §8) — этому workflow секреты не
 # нужны; при необходимости они приходят через GitHub Secrets/Environments (тикет 0.5).
@@ -360,6 +374,85 @@ jobs:
           '
       - name: agent-install-test итог
         run: 'echo "agent-install-test: install.sh отработал в чистом ubuntu:24.04, Node установлен, agentify-agent --version прошёл самопроверку"'
+
+  # --- Демонизация: после kill процесс поднимается (приёмка тикета 4.4) -----
+  # В отличие от agent-install-test (тестирует ВНУТРИ docker run ubuntu:24.04
+  # — вложенный контейнер БЕЗ настоящего systemd), эта джоба проверяет
+  # РЕАЛЬНОЕ поведение systemd (автозапуск + рестарт при сбое, FR C5) и
+  # поэтому запускается напрямую на хосте раннера ubuntu-latest: это
+  # полноценная VM с systemd как PID 1 и passwordless sudo для runner.
+  agent-service-test:
+    name: agent-service-test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build (нативно, без GoReleaser — кросс-таргет для этого теста не нужен)
+        run: go build -o ./agentify-agent-ci ./agent
+      # Неинтерактивная настройка конфига через уже готовый механизм тикета
+      # 4.3 (AGENTIFY_SETUP_* env + AGENTIFY_CONFIG_PATH). URL оркестратора
+      # заведомо недостижим — это ок: тест проверяет рестарт по kill, а не
+      # успешное WS-подключение (wsclient реконнектится сам внутри процесса,
+      # процесс из-за недостижимого адреса не падает; а даже если бы упал —
+      # это тоже штатно покрывается Restart=on-failure).
+      - name: agentify-agent setup (неинтерактивно, AGENTIFY_SETUP_*)
+        run: |
+          set -euo pipefail
+          export AGENTIFY_CONFIG_PATH="$HOME/.agentify/agent.env"
+          export AGENTIFY_SETUP_ORCHESTRATOR_URL="wss://orch.invalid.example.com/machine/ws"
+          export AGENTIFY_SETUP_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          export AGENTIFY_SETUP_PROVIDERS="claude"
+          export AGENTIFY_SETUP_CLAUDE_API_KEY="sk-ci-test"
+          ./agentify-agent-ci setup
+      - name: sudo agentify-agent service-install
+        run: sudo ./agentify-agent-ci service-install
+      - name: Проверить, что сервис активен
+        run: |
+          set -euo pipefail
+          if [ "$(sudo systemctl is-active agentify-agent.service)" != "active" ]; then
+            echo "FAIL: agentify-agent.service не active после service-install" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          echo "OK: agentify-agent.service active после service-install"
+      # Приёмка тикета 4.4 (docs/MVP_TICKETS.md): «после kill процесс
+      # поднимается» — kill -9 текущего MainPID, ждём RestartSec=2 (+запас),
+      # проверяем, что сервис снова active И MainPID изменился (доказывает
+      # именно перезапуск, а не то, что процесс просто не был убит).
+      - name: kill -9 MainPID и проверить рестарт
+        run: |
+          set -euo pipefail
+          pid_before="$(sudo systemctl show -p MainPID --value agentify-agent.service)"
+          echo "PID до kill: ${pid_before}"
+          sudo kill -9 "${pid_before}"
+          sleep 5
+          if [ "$(sudo systemctl is-active agentify-agent.service)" != "active" ]; then
+            echo "FAIL: agentify-agent.service не active после kill -9" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          pid_after="$(sudo systemctl show -p MainPID --value agentify-agent.service)"
+          echo "PID после рестарта: ${pid_after}"
+          if [ "${pid_after}" = "${pid_before}" ] || [ "${pid_after}" = "0" ]; then
+            echo "FAIL: MainPID не изменился (${pid_before} -> ${pid_after}) — процесс не перезапустился" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          echo "OK: agentify-agent.service перезапущен systemd после kill -9 (PID ${pid_before} -> ${pid_after})"
+      - name: Teardown (всегда)
+        if: always()
+        run: |
+          sudo systemctl disable --now agentify-agent.service || true
+          sudo rm -f /etc/systemd/system/agentify-agent.service
+          sudo systemctl daemon-reload
 
   # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
   # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим

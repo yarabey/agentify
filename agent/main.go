@@ -135,6 +135,18 @@ func main() {
 		}
 		return
 	}
+	// `agentify-agent service-install` — демонизация (тикет 4.4, deps: 4.3,
+	// FR C5): регистрирует текущий бинарь как системный сервис с
+	// автозапуском при загрузке ОС и рестартом при сбое (systemd на Linux,
+	// launchd на macOS), см. agent/service.go. Запускается один раз после
+	// `setup`, требует root/sudo.
+	if len(os.Args) > 1 && os.Args[1] == "service-install" {
+		if err := runServiceInstall(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "agent: service-install завершился с ошибкой:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "agent: фатальная ошибка:", err)
 		os.Exit(1)

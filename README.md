@@ -81,6 +81,7 @@ CI описан в [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (ти�
 | `integration` | `go test -tags=integration ./...` | testcontainers Postgres+Redpanda — каркас для 1.1/3.2/11.3 (тестов с тегом пока нет ⇒ no-op) |
 | `agent-release-build` | `goreleaser check` + `goreleaser build --snapshot --clean` | тикет 4.1: CI собирает все 4 кросс-таргета агента (darwin/linux × amd64/arm64) — без публикации; публикует релизы отдельный [`release-agent.yml`](.github/workflows/release-agent.yml) по git-тегу `v*` |
 | `agent-install-test` | `goreleaser release --snapshot ...` + `install/test-install.sh` в `docker run ubuntu:24.04` | тикет 4.2: `install/install.sh` (скачивание бинаря + sha256 + установка + Node.js) прогоняется целиком в чистом Ubuntu без предустановленного Node |
+| `agent-service-test` | `agentify-agent setup` + `sudo agentify-agent service-install` + `kill -9` MainPID | тикет 4.4: демонизация (FR C5) — в отличие от `agent-install-test` запускается напрямую на хосте раннера `ubuntu-latest` (реальный systemd как PID 1), проверяет, что после `kill` процесс поднимается заново (systemd `Restart=on-failure`) |
 | `web` | `npm ci` + `npm run gen:api` + `tsc` | TS-схема из контракта типизируется (без полного Vite — 9.1) |
 
 **Path-фильтры** (`dorny/paths-filter`, джоба `changes`): один корневой Go-модуль,
@@ -101,7 +102,7 @@ GitHub → Settings → Branches → Branch protection (для `main` и вет�
 required status checks по именам джоб:
 
 ```
-lint, build, test, generate-check, docs-check, bdd, integration, agent-release-build, agent-install-test, web
+lint, build, test, generate-check, docs-check, bdd, integration, agent-release-build, agent-install-test, agent-service-test, web
 ```
 
 > Замечание: джобы `lint/build/test/generate-check/docs-check/bdd/integration` и
