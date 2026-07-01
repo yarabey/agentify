@@ -30,6 +30,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/redpanda"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -116,6 +117,213 @@ func doPostTasksRequest(t *testing.T, router http.Handler, bearerToken, idempote
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
+}
+
+// noopCommandPublisher — минимальный api.CommandPublisher для
+// TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding (тикет 6.2):
+// этому тесту важны только HTTP-ответ и состояние реальной БД (tasks.status,
+// task_events.ref_event_id), а не то, что именно попадёт в Redpanda —
+// PostTasksIdAnswer публикует конверт user_answer уже ПОСЛЕ записи в БД
+// (tasks.go), но при nil CommandPublisher отвечает 500 (см. godoc
+// Server.commandPublisher в server.go), поэтому нужен хоть какой-то
+// publisher; поднимать отдельный контейнер Redpanda ради этого не нужно —
+// unit-тесты пакета api (tasks_test.go, fakePublisher) уже проверяют форму
+// публикуемого конверта на fake-querier'ах, здесь это не предмет проверки.
+type noopCommandPublisher struct{}
+
+func (noopCommandPublisher) PublishKeyed(_ context.Context, _, _ string, _ bus.Envelope) error {
+	return nil
+}
+
+// doPostTasksIdAnswerRequest шлёт POST /tasks/{id}/answer через httptest
+// поверх router с Bearer-токеном — аналог doPostTasksRequest для эндпоинта
+// ответа на вопрос агента (тикет 6.1/6.2).
+func doPostTasksIdAnswerRequest(t *testing.T, router http.Handler, bearerToken string, taskID uuid.UUID, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal тела: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/answer", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// findAgentQuestionEventID ищет среди agent_question-событий задачи то,
+// чей payload.question_id совпадает с искомым, и возвращает его event id —
+// тот же алгоритм сопоставления, что и PostTasksIdAnswer (tasks.go), нужен
+// здесь только чтобы ПОДГОТОВИТЬ (напрямую через Transitioner, в обход HTTP)
+// состояние "два вопроса в истории" перед вызовом реального обработчика.
+func findAgentQuestionEventID(ctx context.Context, t *testing.T, q *db.Queries, taskID pgtype.UUID, questionID uuid.UUID) pgtype.UUID {
+	t.Helper()
+	events, err := q.ListAgentQuestionEventsByTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("ListAgentQuestionEventsByTask: %v", err)
+	}
+	wanted := questionID.String()
+	for _, e := range events {
+		var payload bus.AgentQuestionPayload
+		if uerr := json.Unmarshal(e.PayloadEnc, &payload); uerr != nil {
+			continue
+		}
+		if payload.QuestionID == wanted {
+			return e.ID
+		}
+	}
+	t.Fatalf("agent_question с question_id=%s не найден среди событий задачи", wanted)
+	return pgtype.UUID{}
+}
+
+// TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding — приёмка
+// тикета 6.2 (FR F2, §5 «Несколько вопросов сопоставляются корректно»):
+// прогоняем задачу через ДВА реальных цикла вопрос/агент (первый цикл
+// полностью завершён running→waiting_user→running, второй остановлен на
+// waiting_user — вопрос q2 задан, ещё не отвечен) на настоящем Postgres, а
+// затем отвечаем на q2 через РЕАЛЬНЫЙ HTTP-хендлер PostTasksIdAnswer (не
+// fake-querier, в отличие от TestPostTasksIdAnswer_MatchesSpecificQuestionAmongMultiple
+// в tasks_test.go, который проверяет тот же алгоритм сопоставления на
+// моках) — проверяем 202, tasks.status в БД == running, и что ref_event_id
+// новой записи task_events(user_answer) в БД указывает ИМЕННО на event id
+// вопроса q2, а неq1.
+func TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-two-questions")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-two-questions")
+
+	idempotencyKey := "two-questions-key-1"
+	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integration.ID,
+		TextEnc:        []byte("сделай две вещи по очереди"),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	taskID := taskRow.ID
+
+	tr := task.NewTransitioner(pool)
+
+	// Довести задачу до running обычным Transition (created→queued→running).
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, terr := tr.Transition(ctx, taskID, trigger); terr != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, terr)
+		}
+	}
+
+	// --- Цикл 1: вопрос q1, ПОЛНОСТЬЮ отвечен (running→waiting_user→running),
+	// напрямую через Transitioner (в обход HTTP — здесь только подготовка
+	// истории, не предмет проверки этого теста).
+	question1ID := uuid.New()
+	question1Payload, merr := json.Marshal(bus.AgentQuestionPayload{QuestionID: question1ID.String(), Text: "продолжать с первым шагом?"})
+	if merr != nil {
+		t.Fatalf("marshal AgentQuestionPayload (q1): %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion, "agent_question", pgtype.UUID{}, question1Payload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(agent_question q1): %v", terr)
+	}
+	question1EventID := findAgentQuestionEventID(ctx, t, q, taskID, question1ID)
+
+	answer1Payload, merr := json.Marshal(bus.UserAnswerPayload{QuestionID: question1ID.String(), Text: "да, первым шагом"})
+	if merr != nil {
+		t.Fatalf("marshal UserAnswerPayload (q1): %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerUserAnswered, "user_answer", question1EventID, answer1Payload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(user_answer q1): %v", terr)
+	}
+
+	// --- Цикл 2: вопрос q2 задан (running→waiting_user), НЕ отвечен —
+	// задача сейчас ждёт ответа именно на q2.
+	question2ID := uuid.New()
+	question2Payload, merr := json.Marshal(bus.AgentQuestionPayload{QuestionID: question2ID.String(), Text: "продолжать со вторым шагом?"})
+	if merr != nil {
+		t.Fatalf("marshal AgentQuestionPayload (q2): %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion, "agent_question", pgtype.UUID{}, question2Payload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(agent_question q2): %v", terr)
+	}
+	question2EventID := findAgentQuestionEventID(ctx, t, q, taskID, question2ID)
+	if question2EventID == question1EventID {
+		t.Fatalf("id вопроса q2 совпал с id вопроса q1 = %v, ожидались разные события", question1EventID)
+	}
+
+	before := getTaskRowStatus(ctx, t, pool, taskID)
+	if before != string(task.StatusWaitingUser) {
+		t.Fatalf("подготовка: tasks.status = %s, хотим waiting_user (задача ждёт ответа на q2)", before)
+	}
+
+	// --- Теперь настоящий HTTP-запрос: отвечаем ИМЕННО на q2. ---
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	server.SetTransitioner(tr)
+	server.SetCommandPublisher(noopCommandPublisher{})
+	router := api.NewRouter(server)
+
+	rec := doPostTasksIdAnswerRequest(t, router, token, uuid.UUID(taskID.Bytes), api.PostTasksIdAnswerJSONBody{
+		QuestionId: question2ID,
+		Text:       "да, вторым шагом тоже",
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("статус = %d (%s), ожидался 202", rec.Code, rec.Body.String())
+	}
+
+	// БД: tasks.status снова 'running' (waiting_user → running).
+	after := getTaskRowStatus(ctx, t, pool, taskID)
+	if after != string(task.StatusRunning) {
+		t.Fatalf("tasks.status в БД = %s, ожидался running", after)
+	}
+
+	// БД: РОВНО одна новая запись user_answer, ссылающаяся именно на q2 (не q1).
+	rows, err := pool.Query(ctx, `SELECT id, ref_event_id FROM task_events WHERE task_id = $1 AND type = 'user_answer' ORDER BY seq`, taskID)
+	if err != nil {
+		t.Fatalf("SELECT task_events(user_answer): %v", err)
+	}
+	defer rows.Close()
+
+	var refEventIDs []pgtype.UUID
+	for rows.Next() {
+		var id, refEventID pgtype.UUID
+		if serr := rows.Scan(&id, &refEventID); serr != nil {
+			t.Fatalf("сканировать task_events(user_answer): %v", serr)
+		}
+		refEventIDs = append(refEventIDs, refEventID)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		t.Fatalf("итерация task_events(user_answer): %v", rerr)
+	}
+
+	if len(refEventIDs) != 2 {
+		t.Fatalf("ожидалось 2 записи task_events(user_answer) в БД (q1 из подготовки + q2 из HTTP-запроса), получено %d", len(refEventIDs))
+	}
+	if refEventIDs[0] != question1EventID {
+		t.Fatalf("ref_event_id первого user_answer = %v, хотим id вопроса q1 = %v", refEventIDs[0], question1EventID)
+	}
+	if refEventIDs[1] != question2EventID {
+		t.Fatalf("ref_event_id второго (нового, из HTTP-ответа) user_answer = %v, хотим id вопроса q2 = %v — ответ не должен привязаться к q1", refEventIDs[1], question2EventID)
+	}
+	t.Logf("OK: 202, tasks.status=running, ответ на q2 привязан именно к q2 (ref_event_id=%v), не к q1 (%v)", question2EventID, question1EventID)
+}
+
+// getTaskRowStatus — минимальный SELECT tasks.status по id, для проверок
+// TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding, где полный
+// снимок taskRow (пакет task, internal/task) недоступен пакету api_test.
+func getTaskRowStatus(ctx context.Context, t *testing.T, pool *pgxpool.Pool, taskID pgtype.UUID) string {
+	t.Helper()
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("SELECT tasks.status: %v", err)
+	}
+	return status
 }
 
 // TestIntegration_PostTasks_HappyPath — приёмочный сценарий тикета 5.3:
