@@ -15,8 +15,8 @@ package api
 // GET /integrations (там — только Integration без секрета). Список и доступ
 // по id жёстко owner-scoped (FR A4, I3): чужая интеграция не существует для
 // тебя, единый 404, без утечки самого факта существования id. Изменение
-// (PATCH) — частичное обновление name/ip_hint, без какой-либо логики про
-// активные задачи (та — отдельный тикет 2.5).
+// (PATCH, тикет 2.5) — частичное обновление name/ip_hint; активные задачи
+// интеграции не рвутся структурно (см. godoc PatchIntegrationsId ниже).
 //
 // Как устроено (тех): UUID-секрет в БД не хранится в открытом виде —
 // integrations.uuid_hmac хранит HMAC-SHA256 от него (для будущего поиска по
@@ -203,8 +203,18 @@ func (s *Server) GetIntegrationsId(w http.ResponseWriter, r *http.Request, id Id
 
 // PatchIntegrationsId реализует PATCH /integrations/{id} — частичное
 // редактирование name/ip_hint (FR B5, Gherkin §2 «Редактирование не рвёт
-// активные задачи» — сама семантика «не рвёт задачи» вне скоупа этого
-// тикета: задач ещё нет, см. тикет 2.5; здесь — только обновление полей).
+// активные задачи», тикет 2.5).
+//
+// «Не рвёт активные задачи» здесь выполняется структурно, а не отдельной
+// проверкой: UpdateIntegration (orchestrator/queries/integrations.sql)
+// пишет ТОЛЬКО в строку integrations (name/ip_hint/updated_at) и никогда не
+// затрагивает tasks/task_events, а сам id интеграции PATCH не меняет —
+// FK tasks.integration_id (ON DELETE RESTRICT, migrations/00003) тут ни при
+// чём. Это подтверждено приёмочным тестом
+// TestIntegration_Integrations_PatchDuringRunningTaskDoesNotBreakTask
+// (integrations_integration_test.go): PATCH во время running-задачи не
+// меняет tasks.status, не добавляет task_events, и FSM задачи продолжает
+// штатно переходить дальше уже после PATCH.
 //
 // Бизнес: PATCH-семантика частичного обновления — nil-указатель в теле
 // запроса значит «не менять», ненулевой (включая указатель на пустую
