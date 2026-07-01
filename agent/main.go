@@ -100,6 +100,18 @@ type config struct {
 	// Используется, только если задан OrchestratorWSURL (см. run) — без
 	// WS-транспорта слать heartbeat некуда.
 	HeartbeatInterval time.Duration `env:"HEARTBEAT_INTERVAL" envDefault:"15s"`
+
+	// ClaudeAPIKey — креды провайдера Claude (Anthropic API, тикет 9.7),
+	// записываются интерактивной настройкой (agent/setup.go, тикет 4.3, FR
+	// C2/C4) в локальный конфиг-файл 0600 и подхватываются отсюда через
+	// AGENT_CLAUDE_API_KEY; оркестратору не передаются. Пусто, если провайдер
+	// "claude" не выбран. Использование в проверке команд провайдера —
+	// тикет 4.5 (пока поле только хранится).
+	ClaudeAPIKey string `env:"CLAUDE_API_KEY"`
+
+	// ClaudeCodeAPIKey — креды провайдера Claude Code (тикет 4.5), аналогично
+	// ClaudeAPIKey. Переменная AGENT_CLAUDE_CODE_API_KEY.
+	ClaudeCodeAPIKey string `env:"CLAUDE_CODE_API_KEY"`
 }
 
 func main() {
@@ -109,6 +121,18 @@ func main() {
 	// platform.LoadConfig (на чистой системе AGENT_* переменных ещё нет).
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println(version)
+		return
+	}
+	// `agentify-agent setup` — интерактивная фаза настройки (тикет 4.3, FR
+	// C2), запускается пользователем после install.sh (тикет 4.2) и ДО
+	// первого запуска демона run() — она сама не поднимает WS-транспорт,
+	// только спрашивает адрес оркестратора/UUID/провайдера и пишет конфиг
+	// (agent/setup.go).
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		if err := runSetup(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "agent: setup завершился с ошибкой:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if err := run(); err != nil {
