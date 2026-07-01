@@ -283,6 +283,14 @@ func writeIntegrationNotFound(w http.ResponseWriter) {
 	writeError(w, http.StatusNotFound, "not_found", "интеграция не найдена")
 }
 
+// writeTaskNotFound отвечает единым 404 для owner-scoped операций над
+// задачей (тикет 6.1, FR A4, I3) — тот же приём, что и writeIntegrationNotFound
+// выше: используется и при «не существует», и при «существует, но чужая»,
+// намеренно неразличимо (см. PostTasksIdAnswer, tasks.go).
+func writeTaskNotFound(w http.ResponseWriter) {
+	writeError(w, http.StatusNotFound, "not_found", "задача не найдена")
+}
+
 // toIntegration конвертирует строку БД в контрактный Integration — БЕЗ
 // секрета (используется списком и ответом PATCH).
 func toIntegration(row db.Integration) Integration {

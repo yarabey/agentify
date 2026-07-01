@@ -54,19 +54,23 @@ package api
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
 // "unauthorized". При успехе соединение остаётся открытым; read-loop
-// (тикеты 3.4/3.6) разбирает каждый дальнейший кадр (см.
-// handleMachineFrame/parseAckFrame/handleMachineEvent) и активно обрабатывает
-// два типа: type==ack — пересылается зарегистрированному s.ackSink (мосту
-// оркестратора machine.commands → WS, commit-after-ACK, protocol.md §5, см.
-// godoc AckSink в server.go); type==heartbeat — публикуется через
-// зарегистрированный s.eventSink (presence-подсистема, FR B4, protocol.md §6,
-// см. godoc EventSink в server.go) с ПЕРЕЗАПИСАННЫМ на аутентифицированный DB
-// id полем IntegrationID, после чего агенту отправляется ack. Любой другой
-// тип кадра (task_accepted/agent_question/command_approval_request/... —
-// тикеты 3.5/5.x) и любой нераспознанный/битый кадр МОЛЧА игнорируются — ни
-// паники, ни закрытия соединения (нужно и чтобы коннект не выглядел
-// повисшим, и чтобы control-фреймы coder/websocket обрабатывались штатно —
-// см. godoc websocket.Conn "You must always read from the connection").
+// (тикеты 3.4/3.6/6.1) разбирает каждый дальнейший кадр (см.
+// handleMachineFrame/parseAckFrame/handleMachineEvent/handleAgentQuestion) и
+// активно обрабатывает три типа: type==ack — пересылается зарегистрированному
+// s.ackSink (мосту оркестратора machine.commands → WS, commit-after-ACK,
+// protocol.md §5, см. godoc AckSink в server.go); type==heartbeat —
+// публикуется через зарегистрированный s.eventSink (presence-подсистема,
+// FR B4, protocol.md §6, см. godoc EventSink в server.go) с ПЕРЕЗАПИСАННЫМ на
+// аутентифицированный DB id полем IntegrationID, после чего агенту
+// отправляется ack; type==agent_question (FR F1, тикет 6.1) — переводит
+// задачу running→waiting_user через taskTransitioner.TransitionWithEvent
+// СИНХРОННО (без отдельного Redpanda-потребителя, тот же приём, что и у
+// PostTasks/тикет 5.3), см. handleAgentQuestion. Любой другой тип кадра
+// (task_accepted/command_approval_request/... — тикеты 3.5/5.x) и любой
+// нераспознанный/битый кадр МОЛЧА игнорируются — ни паники, ни закрытия
+// соединения (нужно и чтобы коннект не выглядел повисшим, и чтобы
+// control-фреймы coder/websocket обрабатывались штатно — см. godoc
+// websocket.Conn "You must always read from the connection").
 //
 // IP клиента берётся из net.SplitHostPort(r.RemoteAddr) — прямого TCP-пира,
 // БЕЗ доверия заголовку X-Forwarded-For: в MVP нет инфраструктуры доверенных
@@ -80,6 +84,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -88,9 +93,12 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
+	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
 // wsCloseUnauthorized — close-код, которым GetMachineWs закрывает
@@ -157,15 +165,16 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	s.registerMachineConn(integrationID, conn)
 	defer s.unregisterMachineConn(integrationID, conn)
 
-	// Успешный hello: соединение остаётся открытым. Read-loop (тикеты 3.4/3.6):
-	// разбираем каждый дальнейший кадр и маршрутизируем по типу (см.
-	// handleMachineFrame) — ack пересылается мосту оркестратора (s.ackSink),
-	// heartbeat публикуется presence-подсистеме (s.eventSink, см.
-	// handleMachineEvent); любой иной тип кадра (а также нераспознанный/битый
+	// Успешный hello: соединение остаётся открытым. Read-loop (тикеты
+	// 3.4/3.6/6.1): разбираем каждый дальнейший кадр и маршрутизируем по типу
+	// (см. handleMachineFrame) — ack пересылается мосту оркестратора
+	// (s.ackSink), heartbeat публикуется presence-подсистеме (s.eventSink, см.
+	// handleMachineEvent), agent_question переводит задачу в waiting_user (см.
+	// handleAgentQuestion); любой иной тип кадра (а также нераспознанный/битый
 	// JSON) МОЛЧА игнорируется — обработка прочих типов
-	// (task_accepted/agent_question/command_approval_request/... — тикеты
-	// 3.5/5.x) вне объёма этого тикета, но получение такого кадра не должно
-	// ронять или закрывать соединение (см. godoc файла).
+	// (task_accepted/command_approval_request/... — тикеты 3.5/5.x) вне
+	// объёма этого тикета, но получение такого кадра не должно ронять или
+	// закрывать соединение (см. godoc файла).
 	for {
 		_, data, err := conn.Read(r.Context())
 		if err != nil {
@@ -176,17 +185,19 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMachineFrame разбирает один кадр, полученный ПОСЛЕ успешного hello
-// (тикеты 3.4/3.6, protocol.md §5/§6). Кадр разбирается как конверт ОДИН раз
-// и маршрутизируется по env.Type:
+// (тикеты 3.4/3.6/6.1, protocol.md §5/§6). Кадр разбирается как конверт ОДИН
+// раз и маршрутизируется по env.Type:
 //   - type==ack — commit-after-ack для machine.commands, пересылается
 //     s.ackSink (см. godoc AckSink в server.go);
 //   - type==heartbeat — событие машины (FR B4, protocol.md §6), см.
 //     handleMachineEvent;
+//   - type==agent_question — вопрос агента пользователю (FR F1, тикет 6.1),
+//     см. handleAgentQuestion;
 //   - любой другой тип, а также нераспознанный/битый кадр — безопасно
 //     игнорируется, без побочных эффектов (ни паники, ни закрытия
 //     соединения): обработка прочих типов кадров
-//     (task_accepted/agent_question/... — тикеты 3.5/5.x) не должна
-//     блокироваться/ломаться из-за их временного отсутствия здесь.
+//     (task_accepted/... — тикеты 3.5/5.x) не должна блокироваться/ломаться
+//     из-за их временного отсутствия здесь.
 func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
 	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -212,6 +223,8 @@ func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, i
 		sink.HandleAck(ackMessageID)
 	case bus.MessageTypeHeartbeat:
 		s.handleMachineEvent(ctx, conn, integrationID, env)
+	case bus.MessageTypeAgentQuestion:
+		s.handleAgentQuestion(ctx, conn, integrationID, env)
 	default:
 		// Прочие типы событий (тикеты 3.5/5.x) — вне объёма, молча игнорируем.
 	}
@@ -247,6 +260,92 @@ func (s *Server) handleMachineEvent(ctx context.Context, conn *websocket.Conn, i
 		return
 	}
 
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "heartbeat")
+}
+
+// handleAgentQuestion обрабатывает кадр agent_question (FR F1, тикет 6.1,
+// Gherkin §5 «Агент задаёт вопрос и получает ответ»): переводит связанную
+// задачу running→waiting_user, атомарно записывая событие agent_question в
+// task_events (task.Transitioner.TransitionWithEvent — единственная точка
+// смены tasks.status, тикет 5.2), и, при успехе, отвечает агенту ack-кадром
+// — тот же at-least-once принцип, что и у handleMachineEvent: провал любого
+// шага (невалидный payload/task_id, задача не найдена или принадлежит другой
+// интеграции, недопустимый переход FSM, transitioner не настроен) молча
+// пропускает ack — агент должен повторить попытку сам (durable outbox на
+// стороне агента, тикет 3.5), соединение при этом не закрывается и не
+// паникует (см. godoc файла).
+//
+// Обработка СИНХРОННАЯ, без отдельного Redpanda-потребителя — тот же приём,
+// что и PostTasks (тикет 5.3): весь путь агент→FSM укладывается в один вызов
+// в рамках уже открытого WS-соединения, отдельный consumer не добавляет
+// ничего, кроме задержки и лишнего состояния.
+//
+// Задача ищется owner-scoped по integration_id (GetTaskByIDAndIntegration,
+// НЕ по user_id — на этом пути аутентифицирована машина, а не пользователь,
+// см. тот же приём в комментарии к запросу в queries/tasks.sql), что не даёт
+// одной машине инжектировать событие в чужую задачу через подделанный
+// task_id в конверте.
+//
+// eventPayload, записываемый в task_events, — это RAW env.Payload конверта
+// (уже провалидированный как bus.AgentQuestionPayload здесь), а не повторно
+// сериализованная структура: тот же байтовый payload, что реально пришёл от
+// агента, без риска расхождения форм при последующем сопоставлении ответа
+// пользователя по question_id (см. PostTasksIdAnswer, tasks.go).
+func (s *Server) handleAgentQuestion(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	if env.TaskID == nil || *env.TaskID == "" {
+		s.logError("handleAgentQuestion", errors.New("конверт agent_question без task_id"))
+		return
+	}
+	taskUUID, err := uuid.Parse(*env.TaskID)
+	if err != nil {
+		s.logError("handleAgentQuestion: разобрать task_id", err)
+		return
+	}
+
+	var payload bus.AgentQuestionPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		s.logError("handleAgentQuestion: разобрать payload", err)
+		return
+	}
+	if payload.QuestionID == "" {
+		s.logError("handleAgentQuestion", errors.New("payload agent_question без question_id"))
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+		ID:            taskID,
+		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.logError("handleAgentQuestion", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
+			return
+		}
+		s.logError("GetTaskByIDAndIntegration", err)
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("handleAgentQuestion", errors.New("transitioner не настроен"))
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion, "agent_question", pgtype.UUID{}, env.Payload); err != nil {
+		s.logError("TransitionWithEvent(agent_question)", err)
+		return
+	}
+
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_question")
+}
+
+// writeMachineAck строит и отправляет ack-конверт (protocol.md §4/§5,
+// bus.AckPayload) в ответ на успешно обработанный кадр машины (heartbeat —
+// тикет 3.6, agent_question — тикет 6.1) — общая логика, вынесенная из
+// handleMachineEvent, чтобы не дублировать построение/маршалинг/таймаут
+// записи между обработчиками. logContext используется только в сообщении
+// лога при ошибке (различить источник в логах), на поведение не влияет.
+func (s *Server) writeMachineAck(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, ackMessageID, logContext string) {
 	ack := bus.Envelope{
 		MessageID:       bus.NewMessageID(),
 		IntegrationID:   integrationID.String(),
@@ -254,23 +353,23 @@ func (s *Server) handleMachineEvent(ctx context.Context, conn *websocket.Conn, i
 		Ts:              time.Now().UTC().Format(time.RFC3339),
 		ProtocolVersion: bus.ProtocolVersion,
 	}
-	payload, err := json.Marshal(bus.AckPayload{AckMessageID: env.MessageID})
+	payload, err := json.Marshal(bus.AckPayload{AckMessageID: ackMessageID})
 	if err != nil {
-		s.logError("marshal AckPayload для heartbeat", err)
+		s.logError("marshal AckPayload для "+logContext, err)
 		return
 	}
 	ack.Payload = payload
 
 	data, err := ack.Marshal()
 	if err != nil {
-		s.logError("marshal ack-конверта для heartbeat", err)
+		s.logError("marshal ack-конверта для "+logContext, err)
 		return
 	}
 
 	writeCtx, cancel := context.WithTimeout(ctx, machineEventAckWriteTimeout)
 	defer cancel()
 	if err := conn.Write(writeCtx, websocket.MessageText, data); err != nil {
-		s.logError("запись ack-кадра heartbeat в WS", err)
+		s.logError("запись ack-кадра "+logContext+" в WS", err)
 	}
 }
 

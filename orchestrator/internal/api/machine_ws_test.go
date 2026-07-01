@@ -37,8 +37,12 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/bus"
+	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
 // marshalEnvelope собирает и маршалит конверт для тестов parseAckFrame/
@@ -355,5 +359,206 @@ func TestHandleMachineFrame_HeartbeatNoSinkRegistered_DoesNotPanic(t *testing.T)
 	_, _, err := clientConn.Read(ctx)
 	if err == nil {
 		t.Fatal("клиент получил кадр, хотя EventSink не зарегистрирован")
+	}
+}
+
+// agentQuestionEnvelope собирает валидный конверт type==agent_question
+// (тикет 6.1, FR F1, protocol.md §4) для заданной задачи с
+// bus.AgentQuestionPayload{QuestionID, Text}.
+func agentQuestionEnvelope(t *testing.T, messageID, taskID, questionID, text string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.AgentQuestionPayload{QuestionID: questionID, Text: text})
+	if err != nil {
+		t.Fatalf("marshal AgentQuestionPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   uuid.New().String(), // перезаписывается на DB id в handleAgentQuestion не требуется — используется параметр integrationID
+		Type:            bus.MessageTypeAgentQuestion,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_HappyPath — agent_question успешно
+// переводит задачу running→waiting_user (fakeTransitioner) и агенту приходит
+// ack с ack_message_id исходного конверта (тикет 6.1, FR F1).
+func TestHandleMachineFrame_AgentQuestion_HappyPath(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	questionID := uuid.New().String()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	transitioner := &fakeTransitioner{to: task.StatusWaitingUser}
+	s.SetTransitioner(transitioner)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentQuestionEnvelope(t, messageID, taskID.String(), questionID, "какую версию Go использовать?")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("TransitionWithEvent вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerAgentQuestion {
+		t.Fatalf("TransitionWithEvent вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerAgentQuestion)
+	}
+	if transitioner.lastEventType != "agent_question" {
+		t.Fatalf("TransitionWithEvent вызван с eventType = %q, ожидался %q", transitioner.lastEventType, "agent_question")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	if ackEnv.Type != bus.MessageTypeAck {
+		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_TaskNotFoundOrWrongIntegration —
+// задача не найдена для этой интеграции (GetTaskByIDAndIntegration →
+// pgx.ErrNoRows, в т.ч. подделанный task_id чужой задачи) → ack НЕ
+// отправляется, соединение не падает (тикет 6.1, FR A4/I3 — та же логика,
+// что и owner-scoped проверки в HTTP-обработчиках).
+func TestHandleMachineFrame_AgentQuestion_TaskNotFoundOrWrongIntegration(t *testing.T) {
+	q := fakeQuerier{getTaskByIDAndIntegrationErr: pgx.ErrNoRows}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentQuestionEnvelope(t, bus.NewMessageID(), uuid.New().String(), uuid.New().String(), "вопрос")
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя задача не найдена для этой интеграции")
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_NoTransitionerConfigured —
+// transitioner не зарегистрирован (nil) → ack НЕ отправляется, паники нет.
+func TestHandleMachineFrame_AgentQuestion_NoTransitionerConfigured(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	// transitioner намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentQuestionEnvelope(t, bus.NewMessageID(), taskID.String(), uuid.New().String(), "вопрос")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя transitioner не настроен")
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_TransitionError — TransitionWithEvent
+// вернул ошибку (недопустимый переход FSM/сбой БД) → ack НЕ отправляется.
+func TestHandleMachineFrame_AgentQuestion_TransitionError(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{err: errors.New("недопустимый переход")})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentQuestionEnvelope(t, bus.NewMessageID(), taskID.String(), uuid.New().String(), "вопрос")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя TransitionWithEvent вернул ошибку")
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_InvalidPayload_DoesNotPanic — payload
+// без question_id (или отсутствующий task_id) → ack НЕ отправляется,
+// handleMachineFrame не паникует и не закрывает соединение (тот же принцип
+// «безопасно игнорировать», что и у ack/heartbeat).
+func TestHandleMachineFrame_AgentQuestion_InvalidPayload_DoesNotPanic(t *testing.T) {
+	taskID := uuid.New().String()
+	envNoQuestionID := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskID,
+		IntegrationID:   uuid.New().String(),
+		Type:            bus.MessageTypeAgentQuestion,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage(`{"text":"вопрос без question_id"}`),
+	}
+	envNoTaskID := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   uuid.New().String(),
+		Type:            bus.MessageTypeAgentQuestion,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage(`{"question_id":"q1","text":"вопрос без task_id"}`),
+	}
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	for name, env := range map[string]bus.Envelope{
+		"без question_id": envNoQuestionID,
+		"без task_id":     envNoTaskID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			_, _, err := clientConn.Read(ctx)
+			if err == nil {
+				t.Fatalf("%s: клиент получил ack, хотя payload/конверт невалиден", name)
+			}
+		})
 	}
 }
