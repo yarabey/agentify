@@ -32,3 +32,17 @@ UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1;
 INSERT INTO task_events (task_id, seq, type, ref_event_id, payload_enc)
 VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = $1), $2, $3, $4)
 RETURNING *;
+
+-- name: CreateTask :one
+-- Вставляет новую задачу СО СТАТУСОМ ПО УМОЛЧАНИЮ 'created' (схема,
+-- migrations/00003) — переход в 'queued' и запись task_events(status_change)
+-- выполняются ОТДЕЛЬНО, сразу после вставки, через
+-- task.Transitioner.Transition(ctx, id, task.TriggerEnqueued): тикет 5.2
+-- сделал Transitioner единственной точкой смены tasks.status, поэтому
+-- обработчик POST /tasks (тикет 5.3) не пишет 'queued'/task_events напрямую.
+-- Коллизия (user_id, idempotency_key) — SQLSTATE 23505 (uq_tasks_idempotency);
+-- обработчик отвечает 409 (полноценное «вернуть существующую задачу, 200» —
+-- отдельный тикет 5.5).
+INSERT INTO tasks (user_id, integration_id, text_enc, idempotency_key)
+VALUES ($1, $2, $3, $4)
+RETURNING *;

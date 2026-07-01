@@ -11,6 +11,49 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createTask = `-- name: CreateTask :one
+INSERT INTO tasks (user_id, integration_id, text_enc, idempotency_key)
+VALUES ($1, $2, $3, $4)
+RETURNING id, user_id, integration_id, text_enc, status, idempotency_key, created_at, updated_at
+`
+
+type CreateTaskParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	IntegrationID  pgtype.UUID `json:"integration_id"`
+	TextEnc        []byte      `json:"text_enc"`
+	IdempotencyKey *string     `json:"idempotency_key"`
+}
+
+// Вставляет новую задачу СО СТАТУСОМ ПО УМОЛЧАНИЮ 'created' (схема,
+// migrations/00003) — переход в 'queued' и запись task_events(status_change)
+// выполняются ОТДЕЛЬНО, сразу после вставки, через
+// task.Transitioner.Transition(ctx, id, task.TriggerEnqueued): тикет 5.2
+// сделал Transitioner единственной точкой смены tasks.status, поэтому
+// обработчик POST /tasks (тикет 5.3) не пишет 'queued'/task_events напрямую.
+// Коллизия (user_id, idempotency_key) — SQLSTATE 23505 (uq_tasks_idempotency);
+// обработчик отвечает 409 (полноценное «вернуть существующую задачу, 200» —
+// отдельный тикет 5.5).
+func (q *Queries) CreateTask(ctx context.Context, arg CreateTaskParams) (Task, error) {
+	row := q.db.QueryRow(ctx, createTask,
+		arg.UserID,
+		arg.IntegrationID,
+		arg.TextEnc,
+		arg.IdempotencyKey,
+	)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.IntegrationID,
+		&i.TextEnc,
+		&i.Status,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTaskStatusForUpdate = `-- name: GetTaskStatusForUpdate :one
 
 SELECT status FROM tasks WHERE id = $1 FOR UPDATE
