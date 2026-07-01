@@ -77,8 +77,21 @@ import (
 
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/notify"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
+
+// fakeNotifier — подменный Notifier для unit-тестов handleAgentQuestion
+// (тикет 7.1): фиксирует все вызовы Notify для проверки в тестах.
+type fakeNotifier struct {
+	calls []notify.Notification
+	err   error
+}
+
+func (f *fakeNotifier) Notify(_ context.Context, n notify.Notification) error {
+	f.calls = append(f.calls, n)
+	return f.err
+}
 
 // marshalEnvelope собирает и маршалит конверт для тестов parseAckFrame/
 // handleMachineFrame — обёртка над bus.Envelope.Marshal с t.Fatalf на ошибку.
@@ -464,6 +477,153 @@ func TestHandleMachineFrame_AgentQuestion_HappyPath(t *testing.T) {
 	}
 	if ackEnv.Type != bus.MessageTypeAck {
 		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_HappyPath_PublishesNotification —
+// успешный переход running→waiting_user, если Notifier зарегистрирован,
+// публикует ровно одно доменное уведомление notify.KindAgentQuestion с
+// правильными TaskID/UserID/Payload/CreatedAt (тикет 7.1, FR G1).
+func TestHandleMachineFrame_AgentQuestion_HappyPath_PublishesNotification(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	userID := uuid.New()
+	questionID := uuid.New().String()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+			UserID:        pgtype.UUID{Bytes: userID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+	notifier := &fakeNotifier{}
+	s.SetNotifier(notifier)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentQuestionEnvelope(t, messageID, taskID.String(), questionID, "какую версию Go использовать?")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if len(notifier.calls) != 1 {
+		t.Fatalf("Notify вызван %d раз(а), ожидался 1", len(notifier.calls))
+	}
+	got := notifier.calls[0]
+	if got.TaskID.Bytes != taskID {
+		t.Fatalf("Notify получил TaskID = %s, ожидался %s", uuid.UUID(got.TaskID.Bytes), taskID)
+	}
+	if got.UserID.Bytes != userID {
+		t.Fatalf("Notify получил UserID = %s, ожидался %s", uuid.UUID(got.UserID.Bytes), userID)
+	}
+	if got.Kind != notify.KindAgentQuestion {
+		t.Fatalf("Notify получил Kind = %q, ожидался %q", got.Kind, notify.KindAgentQuestion)
+	}
+	if len(got.Payload) == 0 {
+		t.Fatal("Notify получил пустой Payload")
+	}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("Notify получил нулевой CreatedAt")
+	}
+
+	// Ack агенту всё равно должен прийти — уведомление не блокирует основной поток.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := clientConn.Read(ctx); err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_NoNotifierConfigured_StillAcks —
+// Notifier не зарегистрирован (nil, по умолчанию) → handleAgentQuestion
+// молча не формирует уведомление, но ack агенту приходит как обычно (тикет
+// 7.1: отсутствие notify-подсистемы не должно ломать основной поток
+// вопрос/ответ).
+func TestHandleMachineFrame_AgentQuestion_NoNotifierConfigured_StillAcks(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+	// notifier намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentQuestionEnvelope(t, messageID, taskID.String(), uuid.New().String(), "вопрос")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_AgentQuestion_NotifierError_StillAcks — Notify
+// вернул ошибку (публикация уведомления не удалась) → ошибка только
+// логируется, ack агенту ВСЁ РАВНО приходит (тикет 7.1: уведомление вторично
+// относительно перехода FSM и не должно блокировать/дублировать основной
+// поток вопрос/ответ).
+func TestHandleMachineFrame_AgentQuestion_NotifierError_StillAcks(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+	s.SetNotifier(&fakeNotifier{err: errors.New("канал недоступен")})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentQuestionEnvelope(t, messageID, taskID.String(), uuid.New().String(), "вопрос")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
 	}
 	var ackPayload bus.AckPayload
 	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {

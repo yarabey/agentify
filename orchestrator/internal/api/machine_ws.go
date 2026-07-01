@@ -119,6 +119,7 @@ import (
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/notify"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
@@ -344,6 +345,13 @@ func (s *Server) handleMachineEvent(ctx context.Context, conn *websocket.Conn, i
 // сериализованная структура: тот же байтовый payload, что реально пришёл от
 // агента, без риска расхождения форм при последующем сопоставлении ответа
 // пользователя по question_id (см. PostTasksIdAnswer, tasks.go).
+//
+// Уведомление (тикет 7.1, FR G1): при успешном переходе, если Notifier
+// зарегистрирован (см. SetNotifier в server.go), формируется и публикуется
+// notify.Notification{Kind: notify.KindAgentQuestion} — не блокирующий
+// побочный эффект, ошибка которого только логируется и никак не мешает
+// последующей отправке ack агенту (сама доставка уведомления пользователю —
+// предмет тикетов 7.2/web WS и 7.3/Telegram, здесь её нет).
 func (s *Server) handleAgentQuestion(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
 	if env.TaskID == nil || *env.TaskID == "" {
 		s.logError("handleAgentQuestion", errors.New("конверт agent_question без task_id"))
@@ -366,10 +374,11 @@ func (s *Server) handleAgentQuestion(ctx context.Context, conn *websocket.Conn, 
 	}
 
 	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
-	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+	taskRow, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
 		ID:            taskID,
 		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-	}); err != nil {
+	})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.logError("handleAgentQuestion", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
 			return
@@ -387,6 +396,18 @@ func (s *Server) handleAgentQuestion(ctx context.Context, conn *websocket.Conn, 
 	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion, "agent_question", pgtype.UUID{}, env.Payload); err != nil {
 		s.logError("TransitionWithEvent(agent_question)", err)
 		return
+	}
+
+	if notifier := s.getNotifier(); notifier != nil {
+		if err := notifier.Notify(ctx, notify.Notification{
+			TaskID:    taskID,
+			UserID:    taskRow.UserID,
+			Kind:      notify.KindAgentQuestion,
+			Payload:   env.Payload,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			s.logError("Notify(agent_question)", err)
+		}
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_question")

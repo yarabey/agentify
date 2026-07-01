@@ -60,6 +60,7 @@ import (
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/notify"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
@@ -195,6 +196,15 @@ type Server struct {
 	eventSink   EventSink
 	eventSinkMu sync.RWMutex
 
+	// notifier — получатель доменных событий уведомления (тикет 7.1, FR G1,
+	// см. Notifier). nil по умолчанию — событие уведомления тогда просто не
+	// формируется (штатно, пока notify-подсистема не настроена, например до
+	// реализации тикетов 7.2/7.3, и в тестах, не относящихся к тикету 7.1).
+	// Регистрируется один раз при старте через SetNotifier, читается под
+	// notifierMu — тот же принцип, что и у ackSink/eventSink.
+	notifier   Notifier
+	notifierMu sync.RWMutex
+
 	// transitioner — единственная точка смены статуса задачи (тикет 5.2, см.
 	// taskTransitioner). Устанавливается один раз при старте через
 	// SetTransitioner (orchestrator/main.go), сразу после NewServer — в
@@ -248,6 +258,23 @@ type EventSink interface {
 	// публикация не удалась, ack агенту отправлять НЕЛЬЗЯ (агент повторит
 	// через свой durable outbox, тикет 3.5).
 	HandleEvent(ctx context.Context, env bus.Envelope) error
+}
+
+// Notifier — получатель доменных событий уведомления (тикет 7.1, FR G1):
+// handleAgentQuestion (machine_ws.go) сообщает о вопросе агента, не зная
+// ничего о реальных каналах доставки (web WebSocket — тикет 7.2, Telegram —
+// тикет 7.3) — та же граница между транспортным/API-слоем и
+// бизнес-подсистемой, что и у AckSink/EventSink выше. nil по умолчанию —
+// тогда уведомление просто не формируется (штатно, если notify-подсистема ещё
+// не настроена, например до реализации 7.2/7.3, и в тестах, не относящихся к
+// тикету 7.1).
+type Notifier interface {
+	// Notify публикует доменное событие уведомления. Ошибка — публикация не
+	// удалась; вызывающий (handleAgentQuestion) ТОЛЬКО логирует её и
+	// продолжает штатно отправлять ack агенту — уведомление вторично
+	// относительно смены статуса задачи, его сбой не должен блокировать или
+	// дублировать основной поток вопрос/ответ.
+	Notify(ctx context.Context, n notify.Notification) error
 }
 
 // CommandPublisher — публикатор команд машине в топик machine.commands
@@ -395,6 +422,27 @@ func (s *Server) getEventSink() EventSink {
 	s.eventSinkMu.RLock()
 	defer s.eventSinkMu.RUnlock()
 	return s.eventSink
+}
+
+// SetNotifier регистрирует получателя доменных событий уведомления (тикет
+// 7.1, см. godoc Notifier). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), после конструирования notify-подсистемы (тикеты
+// 7.2/7.3) и до начала обслуживания HTTP/WS-трафика; nil — допустимое
+// значение (в т.ч. явный сброс) — тогда handleAgentQuestion молча не
+// формирует уведомление, что штатно, пока notify-подсистема не настроена
+// (например, до реализации тикетов 7.2/7.3) и в тестах, не относящихся к
+// тикету 7.1.
+func (s *Server) SetNotifier(n Notifier) {
+	s.notifierMu.Lock()
+	defer s.notifierMu.Unlock()
+	s.notifier = n
+}
+
+// getNotifier читает текущий Notifier под notifierMu (см. godoc полей Server).
+func (s *Server) getNotifier() Notifier {
+	s.notifierMu.RLock()
+	defer s.notifierMu.RUnlock()
+	return s.notifier
 }
 
 // SetTransitioner регистрирует единственную точку смены статуса задачи
