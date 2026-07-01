@@ -19,12 +19,22 @@ import (
 // Run и запоминает переданный текст задачи. Если block не nil, Run
 // блокируется до его закрытия (или отмены ctx) — используется, чтобы
 // сымитировать «ещё выполняющуюся» задачу в тестах дедупликации.
+//
+// Approve (тикет 6.5) потокобезопасно запоминает последний вызов
+// (approveCalls/lastRequestID/lastDecision) и возвращает настраиваемую
+// approveErr — имитирует ошибки Provider.Approve (claudecode.ErrUnknownRequest
+// и т.п.) в тестах onCommandDecision.
 type fakeRunner struct {
 	mu    sync.Mutex
 	calls int
 	texts []string
 	block chan struct{}
 	err   error
+
+	approveCalls  int
+	lastRequestID string
+	lastDecision  string
+	approveErr    error
 }
 
 func (f *fakeRunner) Run(ctx context.Context, text string) error {
@@ -48,6 +58,15 @@ func (f *fakeRunner) count() int {
 	return f.calls
 }
 
+func (f *fakeRunner) Approve(requestID, decision string) error {
+	f.mu.Lock()
+	f.approveCalls++
+	f.lastRequestID = requestID
+	f.lastDecision = decision
+	f.mu.Unlock()
+	return f.approveErr
+}
+
 // fakePublisher — заглушка claudecode.Publisher: в тестах этого файла
 // newProvider подменяется, поэтому Enqueue реально никогда не вызывается, но
 // поле claudecode.Config.Publisher должно быть чем-то заполнено при реальном
@@ -69,6 +88,25 @@ func taskAssignedEnvelope(t *testing.T, taskID, text string) bus.Envelope {
 		TaskID:          &taskID,
 		IntegrationID:   "44444444-4444-4444-4444-444444444444",
 		Type:            bus.MessageTypeTaskAssigned,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// commandDecisionEnvelope собирает тестовый конверт type=="command_decision"
+// (тикет 6.5) с заданным task_id/request_id/decision.
+func commandDecisionEnvelope(t *testing.T, taskID, requestID, decision string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.CommandDecisionPayload{RequestID: requestID, Decision: decision})
+	if err != nil {
+		t.Fatalf("marshal CommandDecisionPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskID,
+		IntegrationID:   "44444444-4444-4444-4444-444444444444",
+		Type:            bus.MessageTypeCommandDecision,
 		Ts:              time.Now().UTC().Format(time.RFC3339),
 		ProtocolVersion: bus.ProtocolVersion,
 		Payload:         payload,
@@ -304,4 +342,176 @@ func TestNewTaskAcceptor_InvalidAllowlistPattern_ReturnsError(t *testing.T) {
 	if acceptor != nil {
 		t.Fatal("newTaskAcceptor вернул не-nil acceptor при ошибке")
 	}
+}
+
+// TestTaskAcceptor_OnCommandDecision_HappyPath_Reject_CallsApprove — тикет
+// 6.5, FR F3, Gherkin §5 «Отклонение команды»: решение reject, пришедшее для
+// уже активной задачи, доходит до ЕЁ КОНКРЕТНОГО runner'а через Approve.
+func TestTaskAcceptor_OnCommandDecision_HappyPath_Reject_CallsApprove(t *testing.T) {
+	block := make(chan struct{})
+	runner := &fakeRunner{block: block}
+	orig := newProvider
+	newProvider = func(claudecode.Config) (taskRunner, error) { return runner, nil }
+	defer func() { newProvider = orig }()
+
+	sender := &fakeEventSender{}
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+	acceptor.sender = sender
+
+	taskID := "66666666-6666-6666-6666-666666666666"
+	assigned := taskAssignedEnvelope(t, taskID, "задача с согласованием")
+	if err := acceptor.onTaskAssigned(context.Background(), assigned); err != nil {
+		t.Fatalf("onTaskAssigned вернул ошибку: %v", err)
+	}
+	waitForCount(t, 2*time.Second, 1, runner.count)
+
+	decision := commandDecisionEnvelope(t, taskID, "req-1", "reject")
+	if err := acceptor.onCommandDecision(context.Background(), decision); err != nil {
+		t.Fatalf("onCommandDecision вернул ошибку: %v", err)
+	}
+
+	runner.mu.Lock()
+	approveCalls, lastRequestID, lastDecision := runner.approveCalls, runner.lastRequestID, runner.lastDecision
+	runner.mu.Unlock()
+	if approveCalls != 1 {
+		t.Fatalf("Approve вызван %d раз(а), ожидался 1", approveCalls)
+	}
+	if lastRequestID != "req-1" {
+		t.Fatalf("Approve вызван с requestID=%q, ожидался %q", lastRequestID, "req-1")
+	}
+	if lastDecision != "reject" {
+		t.Fatalf("Approve вызван с decision=%q, ожидался %q", lastDecision, "reject")
+	}
+
+	close(block)
+}
+
+// TestTaskAcceptor_OnCommandDecision_HappyPath_Approve_CallsApprove —
+// симметричная проверка: путь общий и для decision=="approve".
+func TestTaskAcceptor_OnCommandDecision_HappyPath_Approve_CallsApprove(t *testing.T) {
+	block := make(chan struct{})
+	runner := &fakeRunner{block: block}
+	orig := newProvider
+	newProvider = func(claudecode.Config) (taskRunner, error) { return runner, nil }
+	defer func() { newProvider = orig }()
+
+	sender := &fakeEventSender{}
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+	acceptor.sender = sender
+
+	taskID := "77777777-7777-7777-7777-777777777777"
+	assigned := taskAssignedEnvelope(t, taskID, "задача с согласованием")
+	if err := acceptor.onTaskAssigned(context.Background(), assigned); err != nil {
+		t.Fatalf("onTaskAssigned вернул ошибку: %v", err)
+	}
+	waitForCount(t, 2*time.Second, 1, runner.count)
+
+	decision := commandDecisionEnvelope(t, taskID, "req-2", "approve")
+	if err := acceptor.onCommandDecision(context.Background(), decision); err != nil {
+		t.Fatalf("onCommandDecision вернул ошибку: %v", err)
+	}
+
+	runner.mu.Lock()
+	approveCalls, lastRequestID, lastDecision := runner.approveCalls, runner.lastRequestID, runner.lastDecision
+	runner.mu.Unlock()
+	if approveCalls != 1 {
+		t.Fatalf("Approve вызван %d раз(а), ожидался 1", approveCalls)
+	}
+	if lastRequestID != "req-2" {
+		t.Fatalf("Approve вызван с requestID=%q, ожидался %q", lastRequestID, "req-2")
+	}
+	if lastDecision != "approve" {
+		t.Fatalf("Approve вызван с decision=%q, ожидался %q", lastDecision, "approve")
+	}
+
+	close(block)
+}
+
+// TestTaskAcceptor_OnCommandDecision_TaskNotActive_ReturnsError — решение для
+// task_id, которого нет в active (задача не запускалась/уже завершилась) —
+// ошибка без паники.
+func TestTaskAcceptor_OnCommandDecision_TaskNotActive_ReturnsError(t *testing.T) {
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	decision := commandDecisionEnvelope(t, "88888888-8888-8888-8888-888888888888", "req-3", "reject")
+	if err := acceptor.onCommandDecision(context.Background(), decision); err == nil {
+		t.Fatal("onCommandDecision вернул nil для неактивной задачи, ожидалась ошибка")
+	}
+}
+
+// TestTaskAcceptor_OnCommandDecision_MissingTaskID_ReturnsError — конверт
+// command_decision без task_id — невалидная команда, ошибка без паники.
+func TestTaskAcceptor_OnCommandDecision_MissingTaskID_ReturnsError(t *testing.T) {
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	decision := commandDecisionEnvelope(t, "not-used", "req-4", "reject")
+	decision.TaskID = nil
+
+	if err := acceptor.onCommandDecision(context.Background(), decision); err == nil {
+		t.Fatal("onCommandDecision вернул nil при отсутствующем task_id, ожидалась ошибка")
+	}
+}
+
+// TestTaskAcceptor_OnCommandDecision_InvalidPayload_ReturnsError — payload,
+// который не разбирается как bus.CommandDecisionPayload, — ошибка без ack
+// (ack здесь не проверяется напрямую, только сам возврат ошибки).
+func TestTaskAcceptor_OnCommandDecision_InvalidPayload_ReturnsError(t *testing.T) {
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	taskID := "99999999-9999-9999-9999-999999999999"
+	decision := commandDecisionEnvelope(t, taskID, "req-5", "reject")
+	decision.Payload = json.RawMessage(`{"decision": 123}`) // decision не строка — не разбирается
+
+	if err := acceptor.onCommandDecision(context.Background(), decision); err == nil {
+		t.Fatal("onCommandDecision вернул nil при невалидном payload, ожидалась ошибка")
+	}
+}
+
+// TestTaskAcceptor_OnCommandDecision_ApproveReturnsError_PropagatesError —
+// runner.Approve вернул ошибку (например claudecode.ErrUnknownRequest) —
+// onCommandDecision пробрасывает именно эту ошибку.
+func TestTaskAcceptor_OnCommandDecision_ApproveReturnsError_PropagatesError(t *testing.T) {
+	wantErr := errors.New("claudecode: неизвестный или уже разрешённый request_id")
+	block := make(chan struct{})
+	runner := &fakeRunner{block: block, approveErr: wantErr}
+	orig := newProvider
+	newProvider = func(claudecode.Config) (taskRunner, error) { return runner, nil }
+	defer func() { newProvider = orig }()
+
+	sender := &fakeEventSender{}
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+	acceptor.sender = sender
+
+	taskID := "10101010-1010-1010-1010-101010101010"
+	assigned := taskAssignedEnvelope(t, taskID, "задача с согласованием")
+	if err := acceptor.onTaskAssigned(context.Background(), assigned); err != nil {
+		t.Fatalf("onTaskAssigned вернул ошибку: %v", err)
+	}
+	waitForCount(t, 2*time.Second, 1, runner.count)
+
+	decision := commandDecisionEnvelope(t, taskID, "req-6", "reject")
+	err = acceptor.onCommandDecision(context.Background(), decision)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("onCommandDecision вернул %v, ожидался %v", err, wantErr)
+	}
+
+	close(block)
 }
