@@ -643,3 +643,228 @@ func TestIntegration_TransitionWithEvent_InvalidRollsBack(t *testing.T) {
 			len(eventsBefore), len(eventsAfter))
 	}
 }
+
+// TestIntegration_TransitionWithEvent_CommandApprovalHappyPath — приёмка
+// тикетов 6.3/6.4/6.5 (FR F3): агент запросил согласование команды вне
+// allowlist (running→waiting_user) и пользователь вынес решение
+// (waiting_user→running), зеркально TestIntegration_TransitionWithEvent_HappyPath
+// (тикет 6.1), но для пары command_approval_request/user_decision — каждый
+// переход атомарно пишет ДВЕ записи task_events (бизнес-событие и
+// status_change) со строго возрастающим seq, причём user_decision несёт
+// ref_event_id, указывающий РОВНО на строку task_events исходного
+// command_approval_request.
+func TestIntegration_TransitionWithEvent_CommandApprovalHappyPath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	q := db.New(pool)
+	taskID := seedTask(ctx, t, pool, q, "approval-owner")
+
+	tr := task.NewTransitioner(pool)
+
+	// Довести задачу до running обычным Transition (без доп. события).
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, err := tr.Transition(ctx, taskID, trigger); err != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, err)
+		}
+	}
+
+	// Агент запрашивает согласование команды вне allowlist: running →
+	// waiting_user, ref_event_id запроса NULL.
+	approvalPayload := []byte(`{"request_id":"r-1","command":"rm -rf /tmp/x","reason":"вне allowlist"}`)
+	from, to, err := tr.TransitionWithEvent(ctx, taskID, task.TriggerApprovalRequested,
+		"command_approval_request", pgtype.UUID{}, approvalPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(command_approval_request): %v", err)
+	}
+	if from != task.StatusRunning || to != task.StatusWaitingUser {
+		t.Fatalf("command_approval_request: from=%s to=%s, хотим running→waiting_user", from, to)
+	}
+
+	events := listTaskEventsFull(ctx, t, pool, taskID)
+	// seq 1=enqueued(status_change) 2=task_accepted(status_change)
+	// 3=command_approval_request 4=status_change(→waiting_user)
+	if len(events) != 4 {
+		t.Fatalf("после command_approval_request ожидалось 4 события, получено %d", len(events))
+	}
+	approvalEvent := events[2]
+	if approvalEvent.seq != 3 || approvalEvent.evtType != "command_approval_request" {
+		t.Fatalf("событие 3 = (seq=%d, type=%s), хотим (3, command_approval_request)", approvalEvent.seq, approvalEvent.evtType)
+	}
+	if approvalEvent.refEventID.Valid {
+		t.Fatalf("ref_event_id запроса согласования должен быть NULL, получено %v", approvalEvent.refEventID)
+	}
+	statusChangeAfterApproval := events[3]
+	if statusChangeAfterApproval.seq != 4 || statusChangeAfterApproval.evtType != "status_change" {
+		t.Fatalf("событие 4 = (seq=%d, type=%s), хотим (4, status_change)", statusChangeAfterApproval.seq, statusChangeAfterApproval.evtType)
+	}
+
+	row := getTaskRow(ctx, t, pool, taskID)
+	if row.status != string(task.StatusWaitingUser) {
+		t.Fatalf("tasks.status в БД = %s, хотим waiting_user", row.status)
+	}
+
+	// Пользователь выносит решение: waiting_user → running, ref_event_id
+	// указывает ИМЕННО на event.id запроса согласования (approvalEvent.id), а
+	// не на что-то другое.
+	decisionPayload := []byte(`{"request_id":"r-1","decision":"reject"}`)
+	from, to, err = tr.TransitionWithEvent(ctx, taskID, task.TriggerCommandDecision,
+		"user_decision", approvalEvent.id, decisionPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(user_decision): %v", err)
+	}
+	if from != task.StatusWaitingUser || to != task.StatusRunning {
+		t.Fatalf("user_decision: from=%s to=%s, хотим waiting_user→running", from, to)
+	}
+
+	events = listTaskEventsFull(ctx, t, pool, taskID)
+	if len(events) != 6 {
+		t.Fatalf("после user_decision ожидалось 6 событий, получено %d", len(events))
+	}
+	decisionEvent := events[4]
+	if decisionEvent.seq != 5 || decisionEvent.evtType != "user_decision" {
+		t.Fatalf("событие 5 = (seq=%d, type=%s), хотим (5, user_decision)", decisionEvent.seq, decisionEvent.evtType)
+	}
+	if decisionEvent.refEventID != approvalEvent.id {
+		t.Fatalf("ref_event_id решения = %v, хотим id запроса согласования %v", decisionEvent.refEventID, approvalEvent.id)
+	}
+	statusChangeAfterDecision := events[5]
+	if statusChangeAfterDecision.seq != 6 || statusChangeAfterDecision.evtType != "status_change" {
+		t.Fatalf("событие 6 = (seq=%d, type=%s), хотим (6, status_change)", statusChangeAfterDecision.seq, statusChangeAfterDecision.evtType)
+	}
+
+	row = getTaskRow(ctx, t, pool, taskID)
+	if row.status != string(task.StatusRunning) {
+		t.Fatalf("tasks.status в БД = %s, хотим running", row.status)
+	}
+}
+
+// TestIntegration_TransitionWithEvent_FullLifecycleAuditTrail — приёмка
+// тикета 6.6 (FR F4: «Все действия агента и решения пользователя фиксируются
+// для аудита»). В отличие от пофичевых тестов выше — HappyPath/
+// TwoQuestionsCorrectBinding (тикеты 6.1/6.2, agent_question/user_answer) и
+// CommandApprovalHappyPath (тикеты 6.3/6.4/6.5, command_approval_request/
+// user_decision, добавлен этим же тикетом) — этот тест ХОЛИСТИЧЕСКИЙ: он
+// прогоняет ОБЕ ветки подряд для ОДНОЙ задачи и проверяет ПОЛНЫЙ,
+// упорядоченный по seq список событий task_events без единого пропуска — то
+// есть буквально доказывает «каждое решение оставляет запись» для всего
+// смёрженного на момент 6.6 функционала (deps 6.1). agent_completed/
+// agent_progress сознательно НЕ используются — они вне scope 6.6 (см. тикеты
+// 8.1 и Phase 2+ соответственно), тест намеренно завершается в состоянии
+// running после второго цикла.
+func TestIntegration_TransitionWithEvent_FullLifecycleAuditTrail(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	q := db.New(pool)
+	taskID := seedTask(ctx, t, pool, q, "full-lifecycle-owner")
+
+	tr := task.NewTransitioner(pool)
+
+	// --- created → queued → running (seq 1, 2: status_change) ---
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, err := tr.Transition(ctx, taskID, trigger); err != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, err)
+		}
+	}
+
+	// --- Цикл вопрос/ответ (тикеты 6.1/6.2, FR F1/F2): seq 3=agent_question
+	// 4=status_change 5=user_answer 6=status_change ---
+	questionPayload := []byte(`{"question_id":"q-1","text":"продолжать?"}`)
+	from, to, err := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion,
+		"agent_question", pgtype.UUID{}, questionPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(agent_question): %v", err)
+	}
+	if from != task.StatusRunning || to != task.StatusWaitingUser {
+		t.Fatalf("agent_question: from=%s to=%s, хотим running→waiting_user", from, to)
+	}
+	questionEvent := listTaskEventsFull(ctx, t, pool, taskID)[2]
+
+	answerPayload := []byte(`{"question_id":"q-1","text":"да"}`)
+	from, to, err = tr.TransitionWithEvent(ctx, taskID, task.TriggerUserAnswered,
+		"user_answer", questionEvent.id, answerPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(user_answer): %v", err)
+	}
+	if from != task.StatusWaitingUser || to != task.StatusRunning {
+		t.Fatalf("user_answer: from=%s to=%s, хотим waiting_user→running", from, to)
+	}
+
+	// --- Цикл согласования команды (тикеты 6.3/6.4/6.5, FR F3): seq
+	// 7=command_approval_request 8=status_change 9=user_decision
+	// 10=status_change; decision=="approve" для симметрии с
+	// CommandApprovalHappyPath (там reject) ---
+	approvalPayload := []byte(`{"request_id":"r-1","command":"git push --force","reason":"вне allowlist"}`)
+	from, to, err = tr.TransitionWithEvent(ctx, taskID, task.TriggerApprovalRequested,
+		"command_approval_request", pgtype.UUID{}, approvalPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(command_approval_request): %v", err)
+	}
+	if from != task.StatusRunning || to != task.StatusWaitingUser {
+		t.Fatalf("command_approval_request: from=%s to=%s, хотим running→waiting_user", from, to)
+	}
+	approvalEvent := listTaskEventsFull(ctx, t, pool, taskID)[6]
+
+	decisionPayload := []byte(`{"request_id":"r-1","decision":"approve"}`)
+	from, to, err = tr.TransitionWithEvent(ctx, taskID, task.TriggerCommandDecision,
+		"user_decision", approvalEvent.id, decisionPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(user_decision): %v", err)
+	}
+	if from != task.StatusWaitingUser || to != task.StatusRunning {
+		t.Fatalf("user_decision: from=%s to=%s, хотим waiting_user→running", from, to)
+	}
+
+	// --- Холистическая проверка: ПОЛНЫЙ, упорядоченный по seq список
+	// task_events без единого пропуска (буквальная приёмка FR F4) ---
+	wantTrail := []struct {
+		seq     int64
+		evtType string
+	}{
+		{1, "status_change"},
+		{2, "status_change"},
+		{3, "agent_question"},
+		{4, "status_change"},
+		{5, "user_answer"},
+		{6, "status_change"},
+		{7, "command_approval_request"},
+		{8, "status_change"},
+		{9, "user_decision"},
+		{10, "status_change"},
+	}
+
+	events := listTaskEventsFull(ctx, t, pool, taskID)
+	if len(events) != len(wantTrail) {
+		t.Fatalf("аудиторский след: ожидалось %d событий task_events, получено %d", len(wantTrail), len(events))
+	}
+	for i, want := range wantTrail {
+		got := events[i]
+		if got.seq != want.seq || got.evtType != want.evtType {
+			t.Fatalf("аудиторский след: событие %d = (seq=%d, type=%s), хотим (seq=%d, type=%s)",
+				i+1, got.seq, got.evtType, want.seq, want.evtType)
+		}
+	}
+
+	// Дополнительно: ref_event_id ответа/решения указывают именно на "свои"
+	// запросы (agent_question/command_approval_request), а не перепутаны.
+	if events[4].refEventID != questionEvent.id {
+		t.Fatalf("аудиторский след: ref_event_id user_answer = %v, хотим id agent_question = %v",
+			events[4].refEventID, questionEvent.id)
+	}
+	if events[8].refEventID != approvalEvent.id {
+		t.Fatalf("аудиторский след: ref_event_id user_decision = %v, хотим id command_approval_request = %v",
+			events[8].refEventID, approvalEvent.id)
+	}
+
+	row := getTaskRow(ctx, t, pool, taskID)
+	if row.status != string(task.StatusRunning) {
+		t.Fatalf("итоговый tasks.status в БД = %s, хотим running", row.status)
+	}
+}
