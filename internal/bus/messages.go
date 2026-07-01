@@ -115,3 +115,31 @@ type UserAnswerPayload struct {
 	QuestionID string `json:"question_id"`
 	Text       string `json:"text"`
 }
+
+// CommandApprovalRequestPayload — payload сообщения type ==
+// MessageTypeCommandApprovalRequest (тикет 4.5/6.1, FR F3): провайдер
+// (agent/internal/provider/claudecode) перехватил запрос CLI на выполнение
+// команды вне allowlist (control_request/can_use_tool) и просит решение
+// пользователя перед тем, как ответить CLI и продолжить задачу.
+type CommandApprovalRequestPayload struct {
+	// RequestID — идентификатор control_request исходного протокола CLI;
+	// используется для сопоставления с последующим CommandDecisionPayload
+	// (ref_event_id) и передаётся Provider.Approve при разрешении.
+	RequestID string `json:"request_id"`
+	// Command — команда, которую CLI просит разрешить выполнить (например,
+	// содержимое поля input.command запроса can_use_tool).
+	Command string `json:"command"`
+	// Reason — человекочитаемая причина, почему требуется согласование (для
+	// отображения пользователю); тикетом 4.5 не детализируется.
+	Reason string `json:"reason"`
+}
+
+// CommandDecisionPayload — payload сообщения type == MessageTypeCommandDecision
+// (тикет 4.5/6.1, FR F3): решение пользователя по ранее запрошенному
+// согласованию команды, идентифицированному request_id того же запроса.
+type CommandDecisionPayload struct {
+	RequestID string `json:"request_id"`
+	// Decision — "approve" или "reject" (тот же словарь, что и
+	// Provider.Approve, и таблица protocol.md §4).
+	Decision string `json:"decision"`
+}
