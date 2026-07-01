@@ -359,6 +359,62 @@ func (q *Queries) ListStaleTasksWithRecoveredMachine(ctx context.Context, lastSe
 	return items, nil
 }
 
+const listWaitingUserTasksWithStaleQuestion = `-- name: ListWaitingUserTasksWithStaleQuestion :many
+SELECT tasks.id AS task_id, tasks.user_id AS user_id, latest.id AS question_event_id, latest.created_at AS question_created_at
+FROM tasks
+JOIN LATERAL (
+    SELECT id, created_at FROM task_events
+    WHERE task_events.task_id = tasks.id AND task_events.type = 'agent_question'
+    ORDER BY seq DESC
+    LIMIT 1
+) latest ON true
+WHERE tasks.status = 'waiting_user'
+  AND latest.created_at < $1
+`
+
+type ListWaitingUserTasksWithStaleQuestionRow struct {
+	TaskID            pgtype.UUID        `json:"task_id"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	QuestionEventID   pgtype.UUID        `json:"question_event_id"`
+	QuestionCreatedAt pgtype.Timestamptz `json:"question_created_at"`
+}
+
+// «Таймаут ответа» (тикет 6.7, FR F5): находит задачи в waiting_user, чей
+// САМЫЙ ПОСЛЕДНИЙ (по seq) agent_question устарел дольше порога — cutoff
+// считает вызывающая сторона (task.AnswerTimeoutWorker), здесь только
+// сравнение с created_at найденной записи. JOIN LATERAL, а не просто
+// MAX(created_at) по task_events, потому что вызывающей стороне нужен именно
+// id КОНКРЕТНОЙ записи task_events (question_event_id) — для дедупликации
+// повторных напоминаний по одному и тому же вопросу между тиками воркера, а
+// не только временная метка последнего вопроса. Результат передаётся в
+// notify.Notification (напоминание пользователю) и, при настроенном
+// поведении auto_cancel, в task.Transitioner.Transition(...,
+// TriggerCancelRequested).
+func (q *Queries) ListWaitingUserTasksWithStaleQuestion(ctx context.Context, dollar_1 pgtype.Timestamptz) ([]ListWaitingUserTasksWithStaleQuestionRow, error) {
+	rows, err := q.db.Query(ctx, listWaitingUserTasksWithStaleQuestion, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWaitingUserTasksWithStaleQuestionRow{}
+	for rows.Next() {
+		var i ListWaitingUserTasksWithStaleQuestionRow
+		if err := rows.Scan(
+			&i.TaskID,
+			&i.UserID,
+			&i.QuestionEventID,
+			&i.QuestionCreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateTaskStatus = `-- name: UpdateTaskStatus :exec
 UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1
 `

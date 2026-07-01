@@ -132,6 +132,23 @@ type config struct {
 	// заметно больше OfflineThreshold (45s), чтобы задача помечалась зависшей
 	// уже ПОСЛЕ того, как сама интеграция определённо помечена offline.
 	StaleThreshold time.Duration `env:"STALE_THRESHOLD" envDefault:"120s"`
+
+	// AnswerTimeoutThreshold — порог устаревания последнего agent_question
+	// активной (waiting_user) задачи, после которого пользователю отправляется
+	// напоминание (FR F5, тикет 6.7). Переменная ORCH_ANSWER_TIMEOUT_THRESHOLD.
+	// Продуктовое решение об окончательном значении не зафиксировано
+	// (docs/MANUAL_STEPS.md) — дефолт 5m выбран с расчётом на реальное время
+	// человека на прочтение и написание ответа (заметно больше StaleThreshold,
+	// который про технический разрыв соединения машины, а не про человека).
+	AnswerTimeoutThreshold time.Duration `env:"ANSWER_TIMEOUT_THRESHOLD" envDefault:"5m"`
+
+	// AnswerTimeoutBehavior — что делать после напоминания (FR F5, решение F2,
+	// docs/MANUAL_STEPS.md — не зафиксировано продуктом): "wait" (дефолт,
+	// продолжать ждать бессрочно) или "auto_cancel" (автоматически перевести
+	// задачу в cancelled — ТОЛЬКО статус в БД, без гарантированной доставки
+	// команды отмены на машину, см. task.AnswerTimeoutBehaviorAutoCancel и
+	// тикет 8.4). Переменная ORCH_ANSWER_TIMEOUT_BEHAVIOR.
+	AnswerTimeoutBehavior string `env:"ANSWER_TIMEOUT_BEHAVIOR" envDefault:"wait"`
 }
 
 func main() {
@@ -231,6 +248,26 @@ func run() error {
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
 		server.SetTransitioner(task.NewTransitioner(pool))
 		svc.SetHandler(api.NewRouter(server))
+
+		// Таймаут ответа пользователя (тикет 6.7, FR F5): в отличие от
+		// StaleWorker/presence-подсистемы ниже, НЕ зависит от Redpanda/heartbeat —
+		// работает напрямую по tasks/task_events, поэтому запускается
+		// безусловно при наличии БД, а не только когда задан ORCH_REDPANDA_SEEDS.
+		// notifier=nil: реальная доставка напоминания (web WS/Telegram) появится
+		// в тикетах 7.2/7.3 — тогда эта же строка получит конкретный экземпляр
+		// (тот же паттерн отложенного wiring, что и Notifier в api.Server,
+		// тикет 7.1).
+		answerTimeoutWorker, err := task.NewAnswerTimeoutWorker(
+			task.NewTransitioner(pool), db.New(pool), nil,
+			task.WithAnswerTimeoutThreshold(cfg.AnswerTimeoutThreshold),
+			task.WithAnswerTimeoutBehavior(task.AnswerTimeoutBehavior(cfg.AnswerTimeoutBehavior)),
+		)
+		if err != nil {
+			return fmt.Errorf("orchestrator: сборка task.AnswerTimeoutWorker: %w", err)
+		}
+		g.Go(func() error {
+			return answerTimeoutWorker.Run(gctx)
+		})
 
 		// Мост Redpanda → WS (тикет 3.4, protocol.md §5): опционален, как и
 		// WS-транспорт агента в agent/main.go. Нужен и сервер (источник
