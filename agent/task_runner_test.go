@@ -35,6 +35,9 @@ type fakeRunner struct {
 	lastRequestID string
 	lastDecision  string
 	approveErr    error
+
+	closeCalls int
+	closeErr   error
 }
 
 func (f *fakeRunner) Run(ctx context.Context, text string) error {
@@ -65,6 +68,19 @@ func (f *fakeRunner) Approve(requestID, decision string) error {
 	f.lastDecision = decision
 	f.mu.Unlock()
 	return f.approveErr
+}
+
+func (f *fakeRunner) Close() error {
+	f.mu.Lock()
+	f.closeCalls++
+	f.mu.Unlock()
+	return f.closeErr
+}
+
+func (f *fakeRunner) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeCalls
 }
 
 // fakePublisher — заглушка claudecode.Publisher: в тестах этого файла
@@ -110,6 +126,21 @@ func commandDecisionEnvelope(t *testing.T, taskID, requestID, decision string) b
 		Ts:              time.Now().UTC().Format(time.RFC3339),
 		ProtocolVersion: bus.ProtocolVersion,
 		Payload:         payload,
+	}
+}
+
+// cancelEnvelope собирает тестовый конверт type=="cancel" (тикет 8.4) с
+// заданным task_id.
+func cancelEnvelope(t *testing.T, taskID string) bus.Envelope {
+	t.Helper()
+	return bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskID,
+		IntegrationID:   "44444444-4444-4444-4444-444444444444",
+		Type:            bus.MessageTypeCancel,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage("{}"),
 	}
 }
 
@@ -511,6 +542,108 @@ func TestTaskAcceptor_OnCommandDecision_ApproveReturnsError_PropagatesError(t *t
 	err = acceptor.onCommandDecision(context.Background(), decision)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("onCommandDecision вернул %v, ожидался %v", err, wantErr)
+	}
+
+	close(block)
+}
+
+// TestTaskAcceptor_OnCancel_HappyPath_CallsClose — тикет 8.4, FR E6, Gherkin
+// §8 «Отмена доходит до машины»: cancel, пришедший для уже активной задачи,
+// доходит до ЕЁ КОНКРЕТНОГО runner'а через Close.
+func TestTaskAcceptor_OnCancel_HappyPath_CallsClose(t *testing.T) {
+	block := make(chan struct{})
+	runner := &fakeRunner{block: block}
+	orig := newProvider
+	newProvider = func(claudecode.Config) (taskRunner, error) { return runner, nil }
+	defer func() { newProvider = orig }()
+
+	sender := &fakeEventSender{}
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+	acceptor.sender = sender
+
+	taskID := "20202020-2020-2020-2020-202020202020"
+	assigned := taskAssignedEnvelope(t, taskID, "задача для отмены")
+	if err := acceptor.onTaskAssigned(context.Background(), assigned); err != nil {
+		t.Fatalf("onTaskAssigned вернул ошибку: %v", err)
+	}
+	waitForCount(t, 2*time.Second, 1, runner.count)
+
+	cancel := cancelEnvelope(t, taskID)
+	if err := acceptor.onCancel(context.Background(), cancel); err != nil {
+		t.Fatalf("onCancel вернул ошибку: %v", err)
+	}
+
+	if runner.closeCount() != 1 {
+		t.Fatalf("Close вызван %d раз(а), ожидался 1", runner.closeCount())
+	}
+
+	close(block)
+}
+
+// TestTaskAcceptor_OnCancel_NoActiveTask_ReturnsNilNoOp — cancel для task_id,
+// которого нет в active (задача уже завершилась/никогда не запускалась) —
+// это НЕ ошибка, а штатный no-op (в отличие от onCommandDecision, см. годок
+// onCancel).
+func TestTaskAcceptor_OnCancel_NoActiveTask_ReturnsNilNoOp(t *testing.T) {
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	cancel := cancelEnvelope(t, "30303030-3030-3030-3030-303030303030")
+	if err := acceptor.onCancel(context.Background(), cancel); err != nil {
+		t.Fatalf("onCancel вернул ошибку %v для неактивной задачи, ожидался nil (no-op)", err)
+	}
+}
+
+// TestTaskAcceptor_OnCancel_MissingTaskID_ReturnsError — конверт cancel без
+// task_id — невалидная команда, ошибка без паники.
+func TestTaskAcceptor_OnCancel_MissingTaskID_ReturnsError(t *testing.T) {
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	cancel := cancelEnvelope(t, "not-used")
+	cancel.TaskID = nil
+
+	if err := acceptor.onCancel(context.Background(), cancel); err == nil {
+		t.Fatal("onCancel вернул nil при отсутствующем task_id, ожидалась ошибка")
+	}
+}
+
+// TestTaskAcceptor_OnCancel_CloseError_Propagated — runner.Close вернул
+// ошибку (саму остановку выполнить не удалось) — onCancel пробрасывает эту
+// же ошибку (обёрнутую через %w).
+func TestTaskAcceptor_OnCancel_CloseError_Propagated(t *testing.T) {
+	wantErr := errors.New("не удалось остановить подпроцесс")
+	block := make(chan struct{})
+	runner := &fakeRunner{block: block, closeErr: wantErr}
+	orig := newProvider
+	newProvider = func(claudecode.Config) (taskRunner, error) { return runner, nil }
+	defer func() { newProvider = orig }()
+
+	sender := &fakeEventSender{}
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+	acceptor.sender = sender
+
+	taskID := "40404040-4040-4040-4040-404040404040"
+	assigned := taskAssignedEnvelope(t, taskID, "задача с ошибкой остановки")
+	if err := acceptor.onTaskAssigned(context.Background(), assigned); err != nil {
+		t.Fatalf("onTaskAssigned вернул ошибку: %v", err)
+	}
+	waitForCount(t, 2*time.Second, 1, runner.count)
+
+	cancel := cancelEnvelope(t, taskID)
+	err = acceptor.onCancel(context.Background(), cancel)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("onCancel вернул %v, ожидался %v", err, wantErr)
 	}
 
 	close(block)

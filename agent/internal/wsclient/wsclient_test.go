@@ -1188,3 +1188,196 @@ func TestHandleFrame_CommandDecision_NoHandlerConfigured_NoAckNoPanic(t *testing
 		t.Fatal("Run должен был вернуть ошибку отмены ctx, получен nil")
 	}
 }
+
+// fakeCancelHandler — подменный Config.OnCancel для тестов (тикет 8.4):
+// запоминает все полученные конверты и возвращает настраиваемую ошибку (err).
+// Зеркало fakeCommandDecisionHandler.
+type fakeCancelHandler struct {
+	err error
+
+	mu       sync.Mutex
+	received []bus.Envelope
+}
+
+func (h *fakeCancelHandler) handle(_ context.Context, env bus.Envelope) error {
+	h.mu.Lock()
+	h.received = append(h.received, env)
+	h.mu.Unlock()
+	return h.err
+}
+
+func (h *fakeCancelHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.received)
+}
+
+// cancelEnvelope собирает валидный конверт type==cancel (protocol.md §4,
+// тикет 8.4) с заданными message_id/task_id.
+func cancelEnvelope(t *testing.T, messageID, integrationID, taskID string) bus.Envelope {
+	t.Helper()
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   integrationID,
+		Type:            bus.MessageTypeCancel,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage("{}"),
+	}
+}
+
+// TestHandleFrame_Cancel_HappyPath_SendsAck — cancel с настроенным OnCancel,
+// вернувшим nil, → клиент вызывает колбэк и немедленно отвечает ack с
+// правильным ack_message_id (тикет 8.4, FR E6, Gherkin §8 «Отмена доходит до
+// машины»).
+func TestHandleFrame_Cancel_HappyPath_SendsAck(t *testing.T) {
+	srv := newFakeServer(t, false /* держим соединение живым */)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeCancelHandler{}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnCancel:          handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	taskID := uuid.NewString()
+	env := cancelEnvelope(t, messageID, integrationUUID, taskID)
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if !waitForAck(t, srv, messageID, 3*time.Second) {
+		t.Fatal("сервер не получил ack на cancel, хотя OnCancel вернул nil")
+	}
+	if handler.count() != 1 {
+		t.Fatalf("OnCancel вызван %d раз(а), ожидался 1", handler.count())
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_Cancel_HandlerError_NoAck — OnCancel вернул ошибку (саму
+// остановку выполнить не удалось) → клиент НЕ отправляет ack (агент получит
+// редоставку cancel от моста, тикет 8.4).
+func TestHandleFrame_Cancel_HandlerError_NoAck(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeCancelHandler{err: errors.New("не удалось остановить провайдер")}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnCancel:          handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := cancelEnvelope(t, messageID, integrationUUID, uuid.NewString())
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	// handler.count()==1 подтверждает, что колбэк реально был вызван (не
+	// просто гонка "сервер ещё не отправил кадр") — только после этого имеет
+	// смысл проверять отсутствие ack.
+	deadline := time.Now().Add(2 * time.Second)
+	for handler.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if handler.count() != 1 {
+		t.Fatal("OnCancel не был вызван за отведённое время")
+	}
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnCancel вернул ошибку")
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_Cancel_NoHandlerConfigured_NoAckNoPanic — OnCancel не
+// настроен (nil, значение по умолчанию Config) → cancel молча игнорируется:
+// ack не отправляется, клиент не паникует и продолжает работать (тикет 8.4).
+func TestHandleFrame_Cancel_NoHandlerConfigured_NoAckNoPanic(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		// OnCancel намеренно не задан.
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := cancelEnvelope(t, messageID, integrationUUID, uuid.NewString())
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnCancel не настроен")
+	}
+
+	cancel()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run должен был вернуть ошибку отмены ctx, получен nil")
+	}
+}

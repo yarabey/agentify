@@ -39,9 +39,13 @@
 //     (FR F3, тикет 6.5) — вызывает Config.OnCommandDecision и, при успехе,
 //     так же немедленно отвечает ack-кадром; бизнес-логика применения решения
 //     к конкретному активному провайдеру задачи (agent/task_runner.go)
-//     аналогично живёт вне wsclient. Любой иной/нераспознанный кадр молча
-//     игнорируется (обработка user_answer/cancel/ping — EPIC 5.x/6.x, вне
-//     объёма).
+//     аналогично живёт вне wsclient; а также type==cancel (FR E6, тикет
+//     8.4, Gherkin §8 «Отмена доходит до машины») — вызывает Config.OnCancel
+//     и, при успехе, так же немедленно отвечает ack-кадром; бизнес-логика
+//     остановки активного провайдера конкретной задачи (agent/task_runner.go,
+//     onCancel вызывает runner.Close()) аналогично живёт вне wsclient. Любой
+//     иной/нераспознанный кадр молча игнорируется (обработка user_answer/
+//     ping — EPIC 5.x/6.x, вне объёма).
 //   - send-loop читает outbox.Pending() и последовательно шлёт каждое
 //     событие, ждёт ack именно на его message_id (или разрыва
 //     сессии/отмены ctx — БЕЗ отдельного внутреннего таймера "нет ack →
@@ -179,6 +183,25 @@ type Config struct {
 	// но логируется предупреждением (см. handleFrame) — отличимо от штатного
 	// игнорирования прочих типов.
 	OnCommandDecision func(ctx context.Context, env bus.Envelope) error
+
+	// OnCancel — колбэк входящей команды cancel (тикет 8.4, FR E6, Gherkin §8
+	// «Отмена доходит до машины»): пользователь отменил задачу, нужно
+	// остановить её активного провайдера (agent/task_runner.go, onCancel вызывает
+	// runner.Close()). Вызывается синхронно из read-loop сессии СРАЗУ по
+	// получении кадра — та же дисциплина, что и у OnTaskAssigned/
+	// OnCommandDecision (реализация обязана вернуться быстро). В отличие от
+	// OnCommandDecision, отсутствие активной задачи для указанного в конверте
+	// task_id — НЕ ошибка (реализация в agent/task_runner.go возвращает nil): это
+	// штатный no-op, задача уже не активна и никогда не станет активной вновь
+	// (в отличие от command_decision, который обязан рано или поздно
+	// примениться). Возвращает ошибку ТОЛЬКО если саму остановку выполнить не
+	// удалось (runner.Close() вернул ошибку) — в этом случае wsclient НЕ
+	// отправляет ack (агент получит редоставку cancel от моста, тот же
+	// at-least-once принцип, что и у остальных путей протокола). Пусто (nil) →
+	// cancel молча игнорируется, как и любой нераспознанный кадр, но
+	// логируется предупреждением (см. handleFrame) — отличимо от штатного
+	// игнорирования прочих типов.
+	OnCancel func(ctx context.Context, env bus.Envelope) error
 }
 
 // validate проверяет обязательные поля Config (см. godoc New).
@@ -481,10 +504,10 @@ type connSession struct {
 }
 
 // readLoop читает входящие кадры до ошибки/закрытия соединения. Распознаёт
-// type==ack, type==task_assigned и type==command_decision (см. handleFrame)
-// — любой иной или нераспознанный кадр молча игнорируется (обработка
-// user_answer/cancel/ping — вне объёма тикетов 5.4/6.5, EPIC 5.x/6.x; тот же
-// принцип, что handleMachineFrame в orchestrator/internal/api/machine_ws.go).
+// type==ack, type==task_assigned, type==command_decision и type==cancel (см.
+// handleFrame) — любой иной или нераспознанный кадр молча игнорируется
+// (обработка user_answer/ping — вне объёма, EPIC 5.x/6.x; тот же принцип,
+// что handleMachineFrame в orchestrator/internal/api/machine_ws.go).
 func (s *connSession) readLoop(ctx context.Context) error {
 	for {
 		_, data, err := s.conn.Read(ctx)
@@ -507,6 +530,9 @@ func (s *connSession) readLoop(ctx context.Context) error {
 //   - type==command_decision (FR F3, тикет 6.5) вызывает
 //     Config.OnCommandDecision — та же дисциплина ack, что и у
 //     task_assigned (см. handleCommandDecisionFrame);
+//   - type==cancel (FR E6, тикет 8.4, Gherkin §8 «Отмена доходит до
+//     машины») вызывает Config.OnCancel — та же дисциплина ack, что и у
+//     task_assigned/command_decision (см. handleCancelFrame);
 //   - любой другой/нераспознанный кадр — no-op (см. godoc readLoop).
 func (s *connSession) handleFrame(ctx context.Context, data []byte) {
 	if ackMessageID, ok := parseAckFrame(data); ok {
@@ -524,6 +550,8 @@ func (s *connSession) handleFrame(ctx context.Context, data []byte) {
 		s.handleTaskAssignedFrame(ctx, env)
 	case bus.MessageTypeCommandDecision:
 		s.handleCommandDecisionFrame(ctx, env)
+	case bus.MessageTypeCancel:
+		s.handleCancelFrame(ctx, env)
 	default:
 		// Любой другой/нераспознанный тип — no-op (см. godoc readLoop).
 	}
@@ -594,6 +622,38 @@ func (s *connSession) handleCommandDecisionFrame(ctx context.Context, env bus.En
 
 	if err := s.writeAck(ctx, env.MessageID); err != nil {
 		s.c.logger.Warn("запись ack-кадра command_decision в WS",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// handleCancelFrame обрабатывает уже разобранный кадр type==cancel (FR E6,
+// тикет 8.4, Gherkin §8 «Отмена доходит до машины», см. годок handleFrame и
+// Config.OnCancel) — зеркало handleCommandDecisionFrame: при отсутствующем
+// хэндлере или его ошибке ack не отправляется (at-least-once, редоставка
+// той же команды отмены); при успехе — немедленно отправляет ack-кадр.
+func (s *connSession) handleCancelFrame(ctx context.Context, env bus.Envelope) {
+	if s.c.cfg.OnCancel == nil {
+		s.c.logger.Warn("cancel получен, но OnCancel не настроен — кадр проигнорирован",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+		)
+		return
+	}
+
+	if err := s.c.cfg.OnCancel(ctx, env); err != nil {
+		s.c.logger.Warn("OnCancel вернул ошибку — ack не отправлен, ожидаем redelivery",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	if err := s.writeAck(ctx, env.MessageID); err != nil {
+		s.c.logger.Warn("запись ack-кадра cancel в WS",
 			slog.String("integration_id", s.c.cfg.IntegrationUUID),
 			slog.String("message_id", env.MessageID),
 			slog.String("error", err.Error()),

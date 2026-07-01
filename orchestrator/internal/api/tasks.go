@@ -8,7 +8,9 @@ package api
 // требует согласования»), подтверждение пользователем завершения задачи
 // (тикет 8.2, FR E2, PostTasksIdConfirm, Gherkin §7 «Пользователь
 // подтверждает завершение») и отклонение результата на доработку (тикет 8.3,
-// FR E2, PostTasksIdReject, Gherkin §7 «Пользователь отклоняет результат»).
+// FR E2, PostTasksIdReject, Gherkin §7 «Пользователь отклоняет результат») и
+// отмена задачи, доходящая до машины (тикет 8.4, FR E6, PostTasksIdCancel,
+// Gherkin §8 «Отмена доходит до машины»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -640,6 +642,121 @@ func (s *Server) PostTasksIdReject(w http.ResponseWriter, r *http.Request, id Id
 	}
 
 	writeJSON(w, http.StatusOK, toTask(row, to))
+}
+
+// PostTasksIdCancel реализует POST /tasks/{id}/cancel — отмена задачи
+// пользователем, доходящая до машины (тикет 8.4, FR E6, Gherkin §8 «Отмена
+// доходит до машины»: Дано задача выполняется на машине, Когда я отменяю
+// задачу, Тогда команда отмены доходит до машины, И агент останавливается, И
+// статус во всех каналах становится "отменена").
+//
+// Алгоритм: авторизация (JWT, тот же путь, что и остальные обработчики этого
+// файла) → проверить владение задачей (id пути, owner-scoped, единый 404 —
+// как и в PostTasksIdConfirm/PostTasksIdApprove/PostTasksIdAnswer) →
+// перевести задачу в cancelled через task.Transitioner.Transition с
+// триггером task.TriggerCancelRequested (единственная точка смены
+// tasks.status и записи task_events(status_change), тикет 5.2; рёбра FSM
+// Queued/Running/WaitingUser/AwaitingConfirm/Stale → Cancelled уже заведены
+// тикетом 5.2 в fsm.go) → опубликовать конверт cancel в machine.commands,
+// партиционированный по integration_id (ADR 0001), чтобы агент реально
+// остановил активного провайдера задачи (agent/task_runner.go, onCancel
+// вызывает runner.Close() → claudecode.Provider.Close, тикет 4.5 — уже
+// готовый SIGKILL подпроцессу) → 202 без тела.
+//
+// Как и PostTasksIdConfirm/PostTasksIdReject (в отличие от
+// PostTasksIdAnswer/PostTasksIdApprove), здесь используется именно
+// task.Transitioner.Transition, а НЕ TransitionWithEvent: в CHECK-констрейнте
+// task_events.type (миграция 00003, не редактируется) нет отдельного типа
+// события под отмену, а аудит самого перехода статуса и так фиксируется
+// штатной записью status_change ({from, to, trigger}) внутри Transition —
+// дополнительно писать нечего.
+//
+// Порядок Transition→Publish — тот же принятый риск, что и в PostTasks/
+// PostTasksIdApprove/PostTasksIdAnswer: если Publish упадёт уже ПОСЛЕ
+// успешного Transition, задача в БД уже cancelled, а агент не уведомлён о
+// необходимости остановиться — это не новая проблема, существующий паттерн
+// во всех обработчиках, публикующих команду машине.
+//
+// Недопустимый переход (задача уже в терминальном статусе — completed/
+// cancelled/failed) — ошибка от task.NextStatus внутри
+// transitioner.Transition, транслируется в 500 общей веткой ниже, тем же
+// паттерном, что и в остальных обработчиках этого файла — отдельной ветки
+// для этого случая не заведено.
+//
+// НЕ реализует safe-stop/graceful-stop семантику (проверка «критическая
+// операция», предупреждение о невозможности мгновенной остановки,
+// Gherkin §8 «Приоритет сохранности данных при отмене») — это отдельный
+// тикет 8.5 (deps: 8.4, 4.5). Здесь остановка — это просто SIGKILL через уже
+// готовый Close() агента, без какой-либо проверки состояния выполняемой
+// команды.
+func (s *Server) PostTasksIdCancel(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	taskUUID := uuid.UUID(id)
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+
+	// Владение задачей — owner-scoped прямо в SQL (FR A4, I3), как и владение
+	// задачей в PostTasksIdConfirm/PostTasksIdReject/PostTasksIdApprove/
+	// PostTasksIdAnswer: чужая/несуществующая задача неотличимы, единый 404.
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("PostTasksIdCancel", errors.New("transitioner не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	if _, _, err := transitioner.Transition(ctx, taskID, task.TriggerCancelRequested); err != nil {
+		s.logError("Transition(cancel_requested)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	publisher := s.getCommandPublisher()
+	if publisher == nil {
+		s.logError("PostTasksIdCancel", errors.New("CommandPublisher не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	taskIDStr := taskUUID.String()
+	integrationID := uuid.UUID(row.IntegrationID.Bytes)
+	env := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskIDStr,
+		IntegrationID:   integrationID.String(),
+		Type:            bus.MessageTypeCancel,
+		Seq:             1,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage("{}"),
+	}
+	if err := publisher.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
+		s.logError("PublishKeyed(cancel)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 // toTask конвертирует строку БД (уже после Transition) в контрактный Task.

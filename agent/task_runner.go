@@ -69,7 +69,7 @@ import (
 )
 
 // taskRunner — узкий интерфейс исполнения одной задачи провайдером: только
-// то, что нужно taskAcceptor (Run, Approve). *claudecode.Provider
+// то, что нужно taskAcceptor (Run, Approve, Close). *claudecode.Provider
 // удовлетворяет ему структурно, без адаптера (тот же приём сужения
 // интерфейса, что и eventSender/Outbox/Querier в других частях проекта) —
 // это позволяет TestTaskAcceptor_* подменить провайдера фейком через
@@ -86,6 +86,14 @@ type taskRunner interface {
 	// вызов для правильного активного экземпляра провайдера конкретной
 	// задачи.
 	Approve(requestID, decision string) error
+
+	// Close принудительно останавливает выполнение задачи этим провайдером
+	// (тикет 8.4, FR E6, Gherkin §8 «Отмена доходит до машины»). См.
+	// claudecode.Provider.Close (тикет 4.5) — реализация уже полностью готова
+	// там (SIGKILL подпроцессу), здесь только её вызов из onCancel для
+	// правильного активного экземпляра провайдера конкретной задачи. Безопасен
+	// к повторному вызову.
+	Close() error
 }
 
 // newProvider — фабрика taskRunner, используемая onTaskAssigned. Отдельная
@@ -258,6 +266,41 @@ func (a *taskAcceptor) onCommandDecision(_ context.Context, env bus.Envelope) er
 	}
 
 	return runner.Approve(payload.RequestID, payload.Decision)
+}
+
+// onCancel — реализация wsclient.Config.OnCancel (тикет 8.4, FR E6, Gherkin
+// §8 «Отмена доходит до машины»): останавливает активный провайдер задачи
+// через runner.Close() (см. claudecode.Provider.Close, тикет 4.5 — SIGKILL
+// подпроцессу). runTask (см. её годок) сам уберёт task_id из a.active, когда
+// Run вернёт управление после Close — здесь ничего чистить не нужно.
+//
+// В ОТЛИЧИЕ от onCommandDecision: отсутствие активного runner'а для task_id
+// (нет в a.active) — НЕ ошибка, а штатный no-op (возвращается nil, ack
+// отправляется). Обоснование: onCommandDecision обязан рано или поздно
+// применить решение к живой задаче (иначе смысл декоратора теряется, и
+// возврат ошибки корректно вызывает redelivery, пока решение не найдёт
+// адресата), тогда как задача, cancel для которой пришёл, когда она уже не
+// активна (уже завершилась/провалилась/была отменена ранее), НИКОГДА не
+// станет активной вновь — возврат ошибки здесь привёл бы к бесконечному
+// неразрешимому циклу redelivery от моста оркестратора.
+func (a *taskAcceptor) onCancel(_ context.Context, env bus.Envelope) error {
+	if env.TaskID == nil || *env.TaskID == "" {
+		return errors.New("agent: cancel без task_id")
+	}
+	taskID := *env.TaskID
+
+	a.mu.Lock()
+	runner, ok := a.active[taskID]
+	a.mu.Unlock()
+	if !ok {
+		a.logger.Info("agent: cancel получен для уже неактивной задачи — no-op", slog.String("task_id", taskID))
+		return nil
+	}
+
+	if err := runner.Close(); err != nil {
+		return fmt.Errorf("agent: остановить провайдер задачи %s: %w", taskID, err)
+	}
+	return nil
 }
 
 // hasClaudeCodeConfigured — единственная поддерживаемая в MVP проверка

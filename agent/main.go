@@ -232,6 +232,7 @@ func run() error {
 			Providers:         cfg.Providers,
 			OnTaskAssigned:    acceptor.onTaskAssigned,
 			OnCommandDecision: acceptor.onCommandDecision,
+			OnCancel:          acceptor.onCancel,
 		}, store, wsclient.WithLogger(svc.Logger()))
 		if err != nil {
 			return fmt.Errorf("agent: AGENT_ORCHESTRATOR_WS_URL задан, но конфиг WS-клиента невалиден — задайте корректный AGENT_INTEGRATION_UUID (UUID, выданный при создании интеграции, см. docs/MANUAL_STEPS.md и POST /integrations, тикет 2.2): %w", err)
