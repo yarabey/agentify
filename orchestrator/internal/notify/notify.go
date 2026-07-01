@@ -25,9 +25,11 @@ import (
 )
 
 // KindAgentQuestion — вид уведомления "агент задал вопрос по задаче" (FR G1,
-// FR F1, тикет 6.1/7.1). Единственный вид, формируемый в MVP тикета 7.1;
-// уведомления по другим важным сменам статуса (например, таймаут/stale,
-// тикет 6.7) добавят собственные константы Kind, когда придёт их очередь.
+// FR F1, тикет 6.1/7.1). Первый вид, сформированный в MVP тикета 7.1; с
+// тикетом 9.5 к нему добавились KindCommandApprovalRequest и
+// KindAgentCompleted — все важные смены статуса, о которых должен быть
+// уведомлён пользователь (FR G1), формируют собственные константы Kind по
+// мере появления соответствующих переходов FSM.
 const KindAgentQuestion = "agent_question"
 
 // KindAnswerReminder — вид уведомления "пользователь давно не отвечает на
@@ -35,6 +37,23 @@ const KindAgentQuestion = "agent_question"
 // когда самый свежий agent_question активной (waiting_user) задачи устарел
 // дольше настраиваемого порога.
 const KindAnswerReminder = "answer_reminder"
+
+// KindCommandApprovalRequest — вид уведомления "агент запросил согласование
+// команды вне allowlist" (FR F1/F3, тикет 6.4): формируется
+// api.Server.handleCommandApprovalRequest (тикет 9.5) при успешном переходе
+// running→waiting_user по кадру command_approval_request — пользователь
+// должен узнать об этом в реальном времени, не дожидаясь перезагрузки
+// страницы (Gherkin §5 «Команда вне allowlist требует согласования»).
+const KindCommandApprovalRequest = "command_approval_request"
+
+// KindAgentCompleted — вид уведомления "задача ожидает подтверждения
+// завершения" (FR E2, тикет 8.1): формируется
+// api.Server.handleAgentCompleted (тикет 9.5) при успешном переходе
+// running→awaiting_confirm по кадру agent_completed — завершение задачи
+// подтверждает только явное действие пользователя (FR E2), но само появление
+// такого запроса должно быть видно в реальном времени (Gherkin §7 «Агент
+// сообщил о завершении — задача ещё не закрыта»).
+const KindAgentCompleted = "agent_completed"
 
 // Notification — доменное событие уведомления (FR G1, тикет 7.1): пользователь
 // (UserID) должен быть уведомлён о событии Kind по задаче TaskID. Payload —

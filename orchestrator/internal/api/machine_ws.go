@@ -539,6 +539,14 @@ func (s *Server) handleAgentError(ctx context.Context, conn *websocket.Conn, int
 // здесь Summary НЕ обязателен — протокол (protocol.md §4) не требует
 // непустой сводки, пустой summary не делает кадр невалидным (агент мог
 // просто не дать текстовое резюме завершения).
+//
+// Уведомление (тикет 9.5, FR E2/G1): при успешном переходе, если Notifier
+// зарегистрирован (см. SetNotifier в server.go), формируется и публикуется
+// notify.Notification{Kind: notify.KindAgentCompleted} — не блокирующий
+// побочный эффект, ошибка которого только логируется и никак не мешает
+// последующей отправке ack агенту (тот же приём, что и в
+// handleAgentQuestion); сама доставка уведомления пользователю — предмет
+// тикета 7.2 (web WS)/7.3 (Telegram), здесь её нет.
 func (s *Server) handleAgentCompleted(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
 	if env.TaskID == nil || *env.TaskID == "" {
 		s.logError("handleAgentCompleted", errors.New("конверт agent_completed без task_id"))
@@ -557,10 +565,11 @@ func (s *Server) handleAgentCompleted(ctx context.Context, conn *websocket.Conn,
 	}
 
 	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
-	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+	taskRow, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
 		ID:            taskID,
 		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-	}); err != nil {
+	})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.logError("handleAgentCompleted", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
 			return
@@ -578,6 +587,18 @@ func (s *Server) handleAgentCompleted(ctx context.Context, conn *websocket.Conn,
 	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerAgentCompleted, "agent_completed", pgtype.UUID{}, env.Payload); err != nil {
 		s.logError("TransitionWithEvent(agent_completed)", err)
 		return
+	}
+
+	if notifier := s.getNotifier(); notifier != nil {
+		if err := notifier.Notify(ctx, notify.Notification{
+			TaskID:    taskID,
+			UserID:    taskRow.UserID,
+			Kind:      notify.KindAgentCompleted,
+			Payload:   env.Payload,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			s.logError("Notify(agent_completed)", err)
+		}
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_completed")
@@ -739,6 +760,14 @@ func (s *Server) handleTaskAccepted(ctx context.Context, conn *websocket.Conn, i
 // обязательны к валидации — протокол (bus.CommandApprovalRequestPayload) не
 // делает их обязательными на этом пути; они лишь описательные для
 // пользователя, принимающего решение.
+//
+// Уведомление (тикет 9.5, FR F1/G1): при успешном переходе, если Notifier
+// зарегистрирован (см. SetNotifier в server.go), формируется и публикуется
+// notify.Notification{Kind: notify.KindCommandApprovalRequest} — не
+// блокирующий побочный эффект, ошибка которого только логируется и никак не
+// мешает последующей отправке ack агенту (тот же приём, что и в
+// handleAgentQuestion); сама доставка уведомления пользователю — предмет
+// тикета 7.2 (web WS)/7.3 (Telegram), здесь её нет.
 func (s *Server) handleCommandApprovalRequest(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
 	if env.TaskID == nil || *env.TaskID == "" {
 		s.logError("handleCommandApprovalRequest", errors.New("конверт command_approval_request без task_id"))
@@ -761,10 +790,11 @@ func (s *Server) handleCommandApprovalRequest(ctx context.Context, conn *websock
 	}
 
 	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
-	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+	taskRow, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
 		ID:            taskID,
 		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-	}); err != nil {
+	})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.logError("handleCommandApprovalRequest", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
 			return
@@ -782,6 +812,18 @@ func (s *Server) handleCommandApprovalRequest(ctx context.Context, conn *websock
 	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerApprovalRequested, "command_approval_request", pgtype.UUID{}, env.Payload); err != nil {
 		s.logError("TransitionWithEvent(command_approval_request)", err)
 		return
+	}
+
+	if notifier := s.getNotifier(); notifier != nil {
+		if err := notifier.Notify(ctx, notify.Notification{
+			TaskID:    taskID,
+			UserID:    taskRow.UserID,
+			Kind:      notify.KindCommandApprovalRequest,
+			Payload:   env.Payload,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			s.logError("Notify(command_approval_request)", err)
+		}
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "command_approval_request")

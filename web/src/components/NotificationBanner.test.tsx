@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NotificationBanner } from "@/components/NotificationBanner";
 import { AuthProvider } from "@/context/AuthContext";
+import { NotificationProvider } from "@/context/NotificationContext";
 import { setTokens } from "@/lib/tokenStore";
 
 /**
@@ -61,7 +62,9 @@ class FakeWebSocket {
 function renderBanner() {
   return render(
     <AuthProvider>
-      <NotificationBanner />
+      <NotificationProvider>
+        <NotificationBanner />
+      </NotificationProvider>
     </AuthProvider>,
   );
 }
@@ -125,6 +128,50 @@ describe("NotificationBanner (тикет 7.2, FR G1)", () => {
 
     expect(
       await screen.findByText("Агент задал вопрос по задаче"),
+    ).toBeInTheDocument();
+  });
+
+  it("показывает уведомление 'Агент запросил согласование команды' при command_approval_request (тикет 9.5, FR F1/F3)", async () => {
+    setTokens({ accessToken: "test-access-token", refreshToken: "r" });
+    renderBanner();
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    socket.simulateOpen();
+    await waitFor(() => expect(socket.sent).toHaveLength(1));
+
+    socket.simulateMessage(
+      JSON.stringify({
+        kind: "command_approval_request",
+        task_id: "11111111-1111-1111-1111-111111111111",
+        created_at: "2026-07-01T12:00:00Z",
+      }),
+    );
+
+    expect(
+      await screen.findByText("Агент запросил согласование команды"),
+    ).toBeInTheDocument();
+  });
+
+  it("показывает уведомление 'Задача ожидает вашего подтверждения завершения' при agent_completed (тикет 9.5, FR E2)", async () => {
+    setTokens({ accessToken: "test-access-token", refreshToken: "r" });
+    renderBanner();
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    socket.simulateOpen();
+    await waitFor(() => expect(socket.sent).toHaveLength(1));
+
+    socket.simulateMessage(
+      JSON.stringify({
+        kind: "agent_completed",
+        task_id: "11111111-1111-1111-1111-111111111111",
+        created_at: "2026-07-01T12:00:00Z",
+      }),
+    );
+
+    expect(
+      await screen.findByText("Задача ожидает вашего подтверждения завершения"),
     ).toBeInTheDocument();
   });
 

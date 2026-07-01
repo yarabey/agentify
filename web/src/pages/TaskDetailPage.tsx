@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
 import { apiClient } from "@/api/client";
 import type { components } from "@/api/schema";
 import { Button } from "@/components/ui/button";
+import { useNotificationContext } from "@/context/NotificationContext";
 import { TASK_STATUS_LABELS } from "@/lib/taskStatus";
 
 type TaskEvent = components["schemas"]["TaskEvent"];
@@ -165,11 +166,14 @@ function AnswerQuestionForm({
 }
 
 /**
- * Блок действий над активной задачей (тикет 8.8, FR H2, Gherkin §10
- * «Действия из истории в web»): отмена, ответ на вопрос агента, явное
- * подтверждение завершения — ровно эти три действия, никакого
- * согласования/отклонения команды (FR F3, вне объёма H2/§10) и никакого
- * отклонения результата на доработку (тоже вне объёма).
+ * Блок действий над активной задачей (тикет 8.8, дополнено тикетом 9.5, FR
+ * H2/F1/G1, Gherkin §5 «Команда вне allowlist требует согласования»/
+ * «Отклонение команды» и §10 «Действия из истории в web»): отмена, ответ на
+ * вопрос агента, явное подтверждение завершения, а теперь ещё и
+ * одобрение/отклонение команды вне allowlist — в отличие от тикета 8.8, где
+ * согласование команды было явно исключено, 9.5 явно включает его (FR F1:
+ * «агент может задать вопрос ИЛИ запросить разрешение на команду»).
+ * Отклонение результата на доработку по-прежнему вне объёма.
  */
 function TaskActions({
   taskId,
@@ -210,12 +214,48 @@ function TaskActions({
     onSuccess: onChanged,
   });
 
+  // canApprove/canReject используют `id` ПОСЛЕДНЕГО события журнала как
+  // `request_id` — API-схема TaskEvent не отдаёт `ref_event_id`, тот же приём
+  // позиционного определения "на какой запрос отвечаем", что и у canAnswer/
+  // AnswerQuestionForm выше (самый свежий запрос в упорядоченном по `seq`
+  // журнале).
+  const approveMutation = useMutation({
+    mutationFn: async () => {
+      const result = await apiClient.POST("/tasks/{id}/approve", {
+        params: { path: { id: taskId } },
+        body: { request_id: lastEvent?.id ?? "", decision: "approve" },
+      });
+      if (!result.response.ok) {
+        throw new Error("failed to approve command");
+      }
+      return result;
+    },
+    onSuccess: onChanged,
+  });
+
+  const rejectMutation = useMutation({
+    mutationFn: async () => {
+      const result = await apiClient.POST("/tasks/{id}/approve", {
+        params: { path: { id: taskId } },
+        body: { request_id: lastEvent?.id ?? "", decision: "reject" },
+      });
+      if (!result.response.ok) {
+        throw new Error("failed to reject command");
+      }
+      return result;
+    },
+    onSuccess: onChanged,
+  });
+
   const canCancel = isActive;
   const canConfirm = status === "awaiting_confirm";
   const canAnswer =
     status === "waiting_user" && lastEvent?.type === "agent_question";
+  const canApprove =
+    status === "waiting_user" &&
+    lastEvent?.type === "command_approval_request";
 
-  if (!canCancel && !canConfirm && !canAnswer) {
+  if (!canCancel && !canConfirm && !canAnswer && !canApprove) {
     return null;
   }
 
@@ -266,25 +306,65 @@ function TaskActions({
           onAnswered={onChanged}
         />
       )}
+      {canApprove && lastEvent && (
+        <div className="flex flex-col gap-3 rounded-md border border-border p-4">
+          <h2 className="text-lg font-semibold">
+            Согласование команды
+          </h2>
+          {describePayload(lastEvent.payload) && (
+            <p className="text-sm">{describePayload(lastEvent.payload)}</p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              disabled={approveMutation.isPending}
+              onClick={() => approveMutation.mutate()}
+            >
+              {approveMutation.isPending ? "Одобряем…" : "Одобрить"}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={rejectMutation.isPending}
+              onClick={() => rejectMutation.mutate()}
+            >
+              {rejectMutation.isPending ? "Отклоняем…" : "Отклонить"}
+            </Button>
+          </div>
+          {approveMutation.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              Не удалось одобрить команду. Попробуйте ещё раз.
+            </p>
+          )}
+          {rejectMutation.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              Не удалось отклонить команду. Попробуйте ещё раз.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 /**
- * Карточка задачи с журналом событий (`/tasks/{id}`, тикеты 9.4 + 8.8, FR H1,
- * H2, Gherkin §10 «История» и «Действия из истории в web»).
+ * Карточка задачи с журналом событий (`/tasks/{id}`, тикеты 9.4 + 8.8 + 9.5,
+ * FR H1, H2, F1, G1, E2, Gherkin §10 «История»/«Действия из истории в web» и
+ * §5 «Вопрос-ответ и согласование команд»).
  *
  * Интерактивные действия (отмена, ответ на вопрос агента, подтверждение
- * завершения) доступны условно по текущему статусу задачи, см.
- * `TaskActions`. Согласование/отклонение команды вне allowlist (FR F3) и
- * отклонение результата на доработку — отдельные механизмы, НЕ упомянутые в
- * FR H2/Gherkin §10, здесь сознательно не реализованы. Живое обновление по
- * WebSocket (авто-refetch по приходу события) — тикет 9.5 «Живой диалог»;
- * здесь — обычная ручная инвалидация react-query после каждого действия.
+ * завершения, одобрение/отклонение команды вне allowlist) доступны условно по
+ * текущему статусу задачи, см. `TaskActions`. Отклонение результата на
+ * доработку — отдельный механизм, вне объёма.
+ *
+ * Живое обновление по WebSocket (тикет 9.5 «Живой диалог»): `lastFrame` из
+ * `NotificationContext` (единственное WS-соединение пользователя, см. этот
+ * контекст и `Layout`) сравнивается с открытой задачей (`id` из URL) — если
+ * совпало, вызывается та же инвалидация react-query, что и после успешных
+ * действий (`handleActionSuccess`), без перезагрузки страницы.
  */
 export function TaskDetailPage(): JSX.Element {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
+  const { lastFrame } = useNotificationContext();
 
   const taskQuery = useQuery({
     queryKey: ["tasks", id],
@@ -323,6 +403,17 @@ export function TaskDetailPage(): JSX.Element {
     void queryClient.invalidateQueries({ queryKey: ["tasks", id, "events"] });
     void queryClient.invalidateQueries({ queryKey: ["tasks"] });
   }
+
+  // Живой диалог (тикет 9.5): любое уведомление по WS про ЭТУ задачу
+  // (новый вопрос, запрос согласования команды, подтверждение завершения)
+  // триггерит тот же рефетч, что и успешное действие пользователя — карточка
+  // обновляется, пока вкладка открыта на нужной задаче, без перезагрузки.
+  useEffect(() => {
+    if (lastFrame && lastFrame.task_id === id) {
+      handleActionSuccess();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- реагируем строго на новый lastFrame/смену открытой задачи, handleActionSuccess пересоздаётся каждый рендер
+  }, [lastFrame, id]);
 
   const lastEvent = eventsQuery.data?.[eventsQuery.data.length - 1];
 

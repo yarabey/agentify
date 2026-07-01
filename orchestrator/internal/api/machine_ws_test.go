@@ -57,6 +57,15 @@
 //   - задача не найдена/принадлежит другой интеграции, transitioner не
 //     настроен, TransitionWithEvent вернул ошибку, конверт без task_id,
 //     payload без request_id → ack НЕ отправляется, паники нет.
+//
+// А также приёмочное требование тикета 9.5 («Живой диалог», FR F1/G1/E2):
+//   - успешные handleCommandApprovalRequest и handleAgentCompleted, если
+//     Notifier зарегистрирован, публикуют ровно одно доменное уведомление
+//     (notify.KindCommandApprovalRequest/notify.KindAgentCompleted
+//     соответственно) с правильными TaskID/UserID/Payload/CreatedAt — по
+//     аналогии с handleAgentQuestion (тикет 7.1);
+//   - при отсутствии Notifier оба обработчика по-прежнему не падают и ack
+//     всё равно уходит.
 package api
 
 import (
@@ -836,6 +845,108 @@ func TestHandleMachineFrame_CommandApprovalRequest_HappyPath(t *testing.T) {
 	}
 }
 
+// TestHandleMachineFrame_CommandApprovalRequest_HappyPath_PublishesNotification
+// — успешный переход running→waiting_user, если Notifier зарегистрирован,
+// публикует ровно одно доменное уведомление notify.KindCommandApprovalRequest
+// с правильными TaskID/UserID/Payload/CreatedAt (тикет 9.5, FR F1/G1).
+func TestHandleMachineFrame_CommandApprovalRequest_HappyPath_PublishesNotification(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	userID := uuid.New()
+	requestID := uuid.New().String()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+			UserID:        pgtype.UUID{Bytes: userID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+	notifier := &fakeNotifier{}
+	s.SetNotifier(notifier)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := commandApprovalRequestEnvelope(t, messageID, taskID.String(), requestID, "rm -rf /tmp/build", "нужно очистить директорию сборки")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if len(notifier.calls) != 1 {
+		t.Fatalf("Notify вызван %d раз(а), ожидался 1", len(notifier.calls))
+	}
+	got := notifier.calls[0]
+	if got.TaskID.Bytes != taskID {
+		t.Fatalf("Notify получил TaskID = %s, ожидался %s", uuid.UUID(got.TaskID.Bytes), taskID)
+	}
+	if got.UserID.Bytes != userID {
+		t.Fatalf("Notify получил UserID = %s, ожидался %s", uuid.UUID(got.UserID.Bytes), userID)
+	}
+	if got.Kind != notify.KindCommandApprovalRequest {
+		t.Fatalf("Notify получил Kind = %q, ожидался %q", got.Kind, notify.KindCommandApprovalRequest)
+	}
+	if len(got.Payload) == 0 {
+		t.Fatal("Notify получил пустой Payload")
+	}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("Notify получил нулевой CreatedAt")
+	}
+
+	// Ack агенту всё равно должен прийти — уведомление не блокирует основной поток.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := clientConn.Read(ctx); err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_NoNotifierConfigured_StillAcks
+// — Notifier не зарегистрирован (nil, по умолчанию) →
+// handleCommandApprovalRequest молча не формирует уведомление, но ack агенту
+// приходит как обычно (тикет 9.5: отсутствие notify-подсистемы не должно
+// ломать основной поток согласования команды).
+func TestHandleMachineFrame_CommandApprovalRequest_NoNotifierConfigured_StillAcks(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+	// notifier намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := commandApprovalRequestEnvelope(t, messageID, taskID.String(), uuid.New().String(), "rm -rf /tmp/build", "нужно очистить директорию сборки")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
 // TestHandleMachineFrame_CommandApprovalRequest_TaskNotFoundOrWrongIntegration
 // — задача не найдена для этой интеграции (GetTaskByIDAndIntegration →
 // pgx.ErrNoRows, в т.ч. подделанный task_id чужой задачи) → ack НЕ
@@ -1419,6 +1530,107 @@ func TestHandleMachineFrame_AgentCompleted_HappyPath(t *testing.T) {
 	}
 	if ackEnv.Type != bus.MessageTypeAck {
 		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_AgentCompleted_HappyPath_PublishesNotification —
+// успешный переход running→awaiting_confirm, если Notifier зарегистрирован,
+// публикует ровно одно доменное уведомление notify.KindAgentCompleted с
+// правильными TaskID/UserID/Payload/CreatedAt (тикет 9.5, FR E2/G1).
+func TestHandleMachineFrame_AgentCompleted_HappyPath_PublishesNotification(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	userID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+			UserID:        pgtype.UUID{Bytes: userID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusAwaitingConfirm})
+	notifier := &fakeNotifier{}
+	s.SetNotifier(notifier)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentCompletedEnvelope(t, messageID, taskID.String(), "готово, тесты зелёные")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if len(notifier.calls) != 1 {
+		t.Fatalf("Notify вызван %d раз(а), ожидался 1", len(notifier.calls))
+	}
+	got := notifier.calls[0]
+	if got.TaskID.Bytes != taskID {
+		t.Fatalf("Notify получил TaskID = %s, ожидался %s", uuid.UUID(got.TaskID.Bytes), taskID)
+	}
+	if got.UserID.Bytes != userID {
+		t.Fatalf("Notify получил UserID = %s, ожидался %s", uuid.UUID(got.UserID.Bytes), userID)
+	}
+	if got.Kind != notify.KindAgentCompleted {
+		t.Fatalf("Notify получил Kind = %q, ожидался %q", got.Kind, notify.KindAgentCompleted)
+	}
+	if len(got.Payload) == 0 {
+		t.Fatal("Notify получил пустой Payload")
+	}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("Notify получил нулевой CreatedAt")
+	}
+
+	// Ack агенту всё равно должен прийти — уведомление не блокирует основной поток.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := clientConn.Read(ctx); err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+}
+
+// TestHandleMachineFrame_AgentCompleted_NoNotifierConfigured_StillAcks —
+// Notifier не зарегистрирован (nil, по умолчанию) → handleAgentCompleted
+// молча не формирует уведомление, но ack агенту приходит как обычно (тикет
+// 9.5: отсутствие notify-подсистемы не должно ломать основной поток
+// подтверждения завершения).
+func TestHandleMachineFrame_AgentCompleted_NoNotifierConfigured_StillAcks(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusAwaitingConfirm})
+	// notifier намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentCompletedEnvelope(t, messageID, taskID.String(), "готово, тесты зелёные")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
 	}
 	var ackPayload bus.AckPayload
 	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {

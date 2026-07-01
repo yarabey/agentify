@@ -4,30 +4,83 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiClient } from "@/api/client";
+import { AuthProvider } from "@/context/AuthContext";
+import { NotificationProvider } from "@/context/NotificationContext";
+import { setTokens } from "@/lib/tokenStore";
 import { TaskDetailPage } from "@/pages/TaskDetailPage";
 
 /**
- * Тесты карточки задачи с журналом событий (тикет 9.4, DoD "рендер журнала")
- * и действий над активной задачей (тикет 8.8, FR H2, Gherkin §10 «Действия
- * из истории в web»). Мокаем `apiClient.GET`/`apiClient.POST` через
- * `mockImplementation`, различая эндпоинты по первому аргументу (шаблон
- * пути) — так же, как в `IntegrationsPage.test.tsx` ("повторный показ UUID
- * запрашивает GET /integrations/{id}").
+ * Тесты карточки задачи с журналом событий (тикет 9.4, DoD "рендер журнала"),
+ * действий над активной задачей (тикет 8.8, FR H2, Gherkin §10 «Действия из
+ * истории в web») и живого диалога (тикет 9.5, FR F1/G1/E2, Gherkin §5).
+ * Мокаем `apiClient.GET`/`apiClient.POST` через `mockImplementation`,
+ * различая эндпоинты по первому аргументу (шаблон пути) — так же, как в
+ * `IntegrationsPage.test.tsx` ("повторный показ UUID запрашивает GET
+ * /integrations/{id}").
+ *
+ * `TaskDetailPage` теперь читает `useNotificationContext()` (тикет 9.5),
+ * поэтому рендерим её под реальными `AuthProvider`/`NotificationProvider` —
+ * тот же `FakeWebSocket`, что и в `NotificationBanner.test.tsx`, подменяет
+ * jsdom-недостающий `WebSocket`, чтобы тесты живого обновления могли вручную
+ * протолкнуть кадр уведомления через настоящий контекст, а не мок хука.
  */
 const TASK_ID = "11111111-1111-1111-1111-111111111111";
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
+
+  readonly url: string;
+  readyState = FakeWebSocket.CONNECTING;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  sent: string[] = [];
+
+  constructor(url: string) {
+    this.url = url;
+    FakeWebSocket.instances.push(this);
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.();
+  }
+
+  simulateOpen(): void {
+    this.readyState = FakeWebSocket.OPEN;
+    this.onopen?.();
+  }
+
+  simulateMessage(data: string): void {
+    this.onmessage?.({ data });
+  }
+}
 
 function renderTaskDetailPage(taskId = TASK_ID) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[`/tasks/${taskId}`]}>
-        <Routes>
-          <Route path="/tasks/:id" element={<TaskDetailPage />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
+    <AuthProvider>
+      <NotificationProvider>
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/tasks/${taskId}`]}>
+            <Routes>
+              <Route path="/tasks/:id" element={<TaskDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      </NotificationProvider>
+    </AuthProvider>,
   );
 }
 
@@ -314,6 +367,140 @@ describe("TaskDetailPage: действия из истории (тикет 8.8, 
         "/tasks/{id}/cancel",
         expect.objectContaining({ params: { path: { id: TASK_ID } } }),
       ),
+    );
+  });
+});
+
+describe("TaskDetailPage: живой диалог (тикет 9.5, FR F1/G1/E2)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("waiting_user + последнее событие command_approval_request: показаны «Одобрить»/«Отклонить», клик «Одобрить» шлёт POST /tasks/{id}/approve с decision=approve", async () => {
+    mockGet(
+      { ...TASK, status: "waiting_user" },
+      [
+        {
+          id: "e1",
+          seq: 1,
+          type: "command_approval_request",
+          payload: { command: "apt upgrade -y", reason: "обновление системы" },
+          created_at: "2026-07-01T00:00:00Z",
+        },
+      ],
+    );
+    const postSpy = vi
+      .spyOn(apiClient, "POST")
+      .mockResolvedValue({
+        data: undefined,
+        error: undefined,
+        response: jsonResponse(202),
+      } as never);
+
+    renderTaskDetailPage();
+
+    expect(
+      await screen.findByRole("button", { name: "Одобрить" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Отклонить" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("apt upgrade -y")).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Одобрить" }));
+
+    await waitFor(() =>
+      expect(postSpy).toHaveBeenCalledWith(
+        "/tasks/{id}/approve",
+        expect.objectContaining({
+          params: { path: { id: TASK_ID } },
+          body: { request_id: "e1", decision: "approve" },
+        }),
+      ),
+    );
+  });
+
+  it("клик «Отклонить» шлёт POST /tasks/{id}/approve с decision=reject, БЕЗ window.confirm", async () => {
+    mockGet(
+      { ...TASK, status: "waiting_user" },
+      [
+        {
+          id: "e1",
+          seq: 1,
+          type: "command_approval_request",
+          payload: { command: "rm -rf /tmp/build", reason: "очистка сборки" },
+          created_at: "2026-07-01T00:00:00Z",
+        },
+      ],
+    );
+    const postSpy = vi
+      .spyOn(apiClient, "POST")
+      .mockResolvedValue({
+        data: undefined,
+        error: undefined,
+        response: jsonResponse(202),
+      } as never);
+    const confirmSpy = vi.spyOn(window, "confirm");
+
+    renderTaskDetailPage();
+
+    const rejectButton = await screen.findByRole("button", {
+      name: "Отклонить",
+    });
+    fireEvent.click(rejectButton);
+
+    await waitFor(() =>
+      expect(postSpy).toHaveBeenCalledWith(
+        "/tasks/{id}/approve",
+        expect.objectContaining({
+          params: { path: { id: TASK_ID } },
+          body: { request_id: "e1", decision: "reject" },
+        }),
+      ),
+    );
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("приёмочный сценарий 9.5: вопрос агента приходит по WS, пока задача открыта, и триггерит рефетч без перезагрузки", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+    FakeWebSocket.instances = [];
+    setTokens({ accessToken: "test-access-token", refreshToken: "r" });
+
+    const getSpy = mockGet({ ...TASK, status: "running" }, [
+      {
+        id: "e1",
+        seq: 1,
+        type: "status_change",
+        payload: { status: "running" },
+        created_at: "2026-07-01T00:00:00Z",
+      },
+    ]);
+
+    renderTaskDetailPage();
+
+    // Первичная загрузка карточки — GET уже вызывался.
+    await screen.findByText("Проверь дисковое место");
+    const callsBeforeNotification = getSpy.mock.calls.length;
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    socket.simulateOpen();
+    await waitFor(() => expect(socket.sent).toHaveLength(1));
+
+    // Агент задал вопрос по ЭТОЙ же задаче — приходит кадр уведомления по WS
+    // (см. `orchestrator/internal/api/client_ws.go`, `clientNotificationFrame`).
+    socket.simulateMessage(
+      JSON.stringify({
+        kind: "agent_question",
+        task_id: TASK_ID,
+        created_at: "2026-07-01T12:00:00Z",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(getSpy.mock.calls.length).toBeGreaterThan(callsBeforeNotification),
     );
   });
 });
