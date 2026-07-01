@@ -46,3 +46,28 @@ RETURNING *;
 INSERT INTO tasks (user_id, integration_id, text_enc, idempotency_key)
 VALUES ($1, $2, $3, $4)
 RETURNING *;
+
+-- name: GetTaskByIDAndUser :one
+-- Ищет задачу по id, owner-scoped прямо в SQL (FR A4, I3) — чужая/несуществующая
+-- задача неотличимы, единый 404 (тот же приём, что GetIntegrationByIDAndUser,
+-- тикет 2.2). Используется PostTasksIdAnswer (тикет 6.1) для проверки владения
+-- задачей перед применением ответа пользователя.
+SELECT * FROM tasks WHERE id = $1 AND user_id = $2;
+
+-- name: GetTaskByIDAndIntegration :one
+-- Ищет задачу по id, scoped по integration_id, а не по user_id (FR A4, I3,
+-- аналогия с GetTaskByIDAndUser выше) — используется на WS-пути (handleAgentQuestion,
+-- machine_ws.go, тикет 6.1), где аутентифицирована МАШИНА (integration_id), а не
+-- пользователь: проверяет, что вопрос агента адресован задаче именно ЭТОЙ
+-- интеграции, не давая одной машине инжектировать событие в чужую задачу.
+SELECT * FROM tasks WHERE id = $1 AND integration_id = $2;
+
+-- name: ListAgentQuestionEventsByTask :many
+-- Возвращает все события agent_question задачи, самые новые первыми — источник
+-- для сопоставления ответа пользователя (question_id из тела запроса) с
+-- конкретной записью task_events (её id становится ref_event_id ответа, тикет
+-- 6.1, FR F2). Сопоставление по question_id внутри payload_enc выполняется НА
+-- СТОРОНЕ GO (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
+-- payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
+-- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+SELECT * FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER BY seq DESC;

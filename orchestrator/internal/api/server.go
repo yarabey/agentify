@@ -113,6 +113,21 @@ type Querier interface {
 	// (тикет 5.3, FR E1) — постановку в очередь выполняет отдельно
 	// task.Transitioner (см. PostTasks в tasks.go).
 	CreateTask(ctx context.Context, arg db.CreateTaskParams) (db.Task, error)
+
+	// GetTaskByIDAndUser ищет задачу по id, owner-scoped прямо в SQL (FR A4,
+	// I3) — чужая/несуществующая неотличимы (pgx.ErrNoRows → 404). Используется
+	// PostTasksIdAnswer (тикет 6.1) для проверки владения задачей перед
+	// применением ответа пользователя (см. tasks.go).
+	GetTaskByIDAndUser(ctx context.Context, arg db.GetTaskByIDAndUserParams) (db.Task, error)
+	// GetTaskByIDAndIntegration ищет задачу по id, scoped по integration_id
+	// (а не user_id) — путь WS-события агента (тикет 6.1, handleAgentQuestion
+	// в machine_ws.go), где аутентифицирована машина, не пользователь.
+	GetTaskByIDAndIntegration(ctx context.Context, arg db.GetTaskByIDAndIntegrationParams) (db.Task, error)
+	// ListAgentQuestionEventsByTask возвращает события agent_question задачи
+	// (самые новые первыми) — источник сопоставления ответа пользователя
+	// (question_id) с конкретной записью task_events (тикет 6.1, FR F2, см.
+	// PostTasksIdAnswer в tasks.go).
+	ListAgentQuestionEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]db.TaskEvent, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.
@@ -237,15 +252,22 @@ type CommandPublisher interface {
 	PublishKeyed(ctx context.Context, topic, keyField string, env bus.Envelope) error
 }
 
-// taskTransitioner — узкий интерфейс на *task.Transitioner.Transition,
-// нужный PostTasks (тикет 5.3) для перевода новой задачи created→queued
-// (FR E1, единственная точка смены статуса — тикет 5.2). Сужение — для
-// юнит-тестов: PostTasks не завязан на весь *task.Transitioner (который сам
-// требует *pgxpool.Pool, недоступный обработчикам через узкий Querier) —
-// тесты подставляют фейк, реализующий только этот метод (см. tasks_test.go).
-// *task.Transitioner удовлетворяет этому интерфейсу структурно.
+// taskTransitioner — узкий интерфейс на *task.Transitioner.{Transition,
+// TransitionWithEvent}, нужный PostTasks (тикет 5.3) для перевода новой
+// задачи created→queued и PostTasksIdAnswer/handleAgentQuestion (тикет 6.1)
+// для переходов running↔waiting_user с атомарной записью
+// agent_question/user_answer (FR E1, единственная точка смены статуса —
+// тикет 5.2). Сужение — для юнит-тестов: обработчики не завязаны на весь
+// *task.Transitioner (который сам требует *pgxpool.Pool, недоступный
+// обработчикам через узкий Querier) — тесты подставляют фейк, реализующий
+// только эти методы (см. tasks_test.go). *task.Transitioner удовлетворяет
+// этому интерфейсу структурно.
 type taskTransitioner interface {
 	Transition(ctx context.Context, taskID pgtype.UUID, trigger task.Trigger) (from, to task.Status, err error)
+	// TransitionWithEvent — см. task.Transitioner.TransitionWithEvent (тикет
+	// 6.1): атомарно пишет бизнес-событие (agent_question/user_answer) перед
+	// status_change в одной транзакции с самим переходом.
+	TransitionWithEvent(ctx context.Context, taskID pgtype.UUID, trigger task.Trigger, eventType string, refEventID pgtype.UUID, eventPayload []byte) (from, to task.Status, err error)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose

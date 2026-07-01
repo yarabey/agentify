@@ -97,3 +97,21 @@ type HelloPayload struct {
 type TaskAssignedPayload struct {
 	Text string `json:"text"`
 }
+
+// AgentQuestionPayload — payload сообщения type == MessageTypeAgentQuestion
+// (тикет 6.1, FR F1): вопрос агента пользователю, требующий решения перед
+// продолжением задачи.
+type AgentQuestionPayload struct {
+	// QuestionID — идентификатор вопроса, присвоенный агентом; используется
+	// для сопоставления с последующим ответом пользователя (ref_event_id).
+	QuestionID string `json:"question_id"`
+	Text       string `json:"text"`
+}
+
+// UserAnswerPayload — payload сообщения type == MessageTypeUserAnswer
+// (тикет 6.1, FR F2): ответ пользователя на вопрос агента, идентифицированный
+// question_id того же вопроса.
+type UserAnswerPayload struct {
+	QuestionID string `json:"question_id"`
+	Text       string `json:"text"`
+}

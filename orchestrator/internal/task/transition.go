@@ -50,7 +50,36 @@ type statusChangePayload struct {
 // (NextStatus вернул ошибку) откатывает транзакцию и НЕ пишет ничего —
 // возвращённый from при этом всё равно заполнен (полезно вызывающей стороне
 // для сообщения об ошибке), to — пустая строка.
+//
+// Тонкая обёртка над transition без дополнительного бизнес-события — см.
+// TransitionWithEvent для варианта, атомарно пишущего ещё и
+// agent_question/user_answer.
 func (t *Transitioner) Transition(ctx context.Context, taskID pgtype.UUID, trigger Trigger) (from, to Status, err error) {
+	return t.transition(ctx, taskID, trigger, "", pgtype.UUID{}, nil)
+}
+
+// TransitionWithEvent атомарно пишет дополнительное бизнес-событие
+// (agent_question/user_answer, тикет 6.1, FR F1/F2) и status_change В ОДНОЙ
+// транзакции под той же блокировкой строки tasks (FOR UPDATE), что и сам
+// переход статуса — это необходимо, чтобы избежать гонки за seq при
+// отдельной от Transition вставке (см. комментарий InsertNextTaskEvent в
+// queries/tasks.sql: гонка за MAX(seq) исключена ТОЛЬКО внутри транзакции,
+// держащей FOR UPDATE-лок строки tasks).
+//
+// eventType/refEventID/eventPayload описывают событие, которое должно быть
+// записано ДО status_change (например, agent_question при переходе в
+// waiting_user, или user_answer с ref_event_id исходного вопроса при
+// переходе обратно в running). eventType не должен быть пустым — для
+// перехода без дополнительного события используй Transition.
+func (t *Transitioner) TransitionWithEvent(ctx context.Context, taskID pgtype.UUID, trigger Trigger, eventType string, refEventID pgtype.UUID, eventPayload []byte) (from, to Status, err error) {
+	return t.transition(ctx, taskID, trigger, eventType, refEventID, eventPayload)
+}
+
+// transition — общая реализация Transition/TransitionWithEvent (см. их
+// godoc). Если eventType непуст, ПЕРЕД записью status_change (но ПОСЛЕ
+// UpdateTaskStatus, внутри той же транзакции) вставляется дополнительная
+// запись task_events с переданными eventType/refEventID/eventPayload.
+func (t *Transitioner) transition(ctx context.Context, taskID pgtype.UUID, trigger Trigger, eventType string, refEventID pgtype.UUID, eventPayload []byte) (from, to Status, err error) {
 	tx, err := t.pool.Begin(ctx)
 	if err != nil {
 		return "", "", fmt.Errorf("task: begin tx: %w", err)
@@ -75,6 +104,17 @@ func (t *Transitioner) Transition(ctx context.Context, taskID pgtype.UUID, trigg
 		Status: string(to),
 	}); uerr != nil {
 		return from, "", fmt.Errorf("task: обновить статус: %w", uerr)
+	}
+
+	if eventType != "" {
+		if _, ierr := q.InsertNextTaskEvent(ctx, db.InsertNextTaskEventParams{
+			TaskID:     taskID,
+			Type:       eventType,
+			RefEventID: refEventID,
+			PayloadEnc: eventPayload,
+		}); ierr != nil {
+			return from, "", fmt.Errorf("task: записать task_events(%s): %w", eventType, ierr)
+		}
 	}
 
 	payload, merr := json.Marshal(statusChangePayload{From: from, To: to, Trigger: trigger})

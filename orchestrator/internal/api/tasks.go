@@ -1,7 +1,9 @@
 package api
 
 // tasks.go — постановка задачи в очередь к машине (тикет 5.3, FR E1, E4, §4
-// «Постановка задачи из канала» (web/telegram)).
+// «Постановка задачи из канала» (web/telegram)) и ответ пользователя на
+// вопрос агента (тикет 6.1, FR F1, F2, PostTasksIdAnswer, Gherkin §5 «Агент
+// задаёт вопрос и получает ответ»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -163,6 +165,149 @@ func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTa
 	}
 
 	writeJSON(w, http.StatusCreated, toTask(row, to))
+}
+
+// PostTasksIdAnswer реализует POST /tasks/{id}/answer — ответ пользователя на
+// вопрос агента (тикет 6.1, FR F1, F2, Gherkin §5 «Агент задаёт вопрос и
+// получает ответ»).
+//
+// Алгоритм: авторизация (JWT, тот же путь, что и PostTasks) → декодировать и
+// провалидировать тело (question_id, text обязательны) → проверить владение
+// задачей (id пути, owner-scoped, единый 404 — как и с интеграцией в
+// PostTasks) → сопоставить question_id тела запроса с КОНКРЕТНОЙ записью
+// task_events(agent_question) этой задачи (ListAgentQuestionEventsByTask +
+// сравнение payload.question_id на стороне Go — см. godoc самого запроса в
+// queries/tasks.sql про то, почему не SQL-side JSON-экстракция; сопоставление
+// именно по question_id, а не «последний вопрос задачи», важно уже для этого
+// тикета, а не только для 6.2 «несколько вопросов сопоставляются корректно»)
+// → перевести задачу waiting_user→running через
+// task.Transitioner.TransitionWithEvent, атомарно записав user_answer с
+// ref_event_id найденного вопроса (FR F2) → опубликовать конверт user_answer
+// в machine.commands, партиционированный по integration_id (ADR 0001) → 202.
+//
+// Несопоставленный question_id (валиден как UUID, но не найден среди
+// agent_question именно этой задачи) — отдельный 404 not_found: тот же код,
+// что и «задача не найдена», но другое сообщение, различать причины 404
+// здесь не требуется ни FR, ни Gherkin (в отличие от единого 404 при владении
+// задачей/интеграцией, где неразличимость — сознательное требование FR A4/I3
+// против утечки существования чужого объекта; вопрос агента не является
+// объектом, которым можно чужим владеть).
+func (s *Server) PostTasksIdAnswer(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	var req PostTasksIdAnswerJSONBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "тело запроса не является валидным JSON")
+		return
+	}
+	if strings.TrimSpace(req.Text) == "" {
+		writeError(w, http.StatusBadRequest, "validation_error", "text обязателен")
+		return
+	}
+
+	taskUUID := uuid.UUID(id)
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+
+	// Владение задачей — owner-scoped прямо в SQL (FR A4, I3), как и владение
+	// интеграцией в PostTasks: чужая/несуществующая задача неотличимы, единый
+	// 404.
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	questionEvents, err := s.queries.ListAgentQuestionEventsByTask(ctx, taskID)
+	if err != nil {
+		s.logError("ListAgentQuestionEventsByTask", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	questionIDStr := uuid.UUID(req.QuestionId).String()
+	var matched *db.TaskEvent
+	for i := range questionEvents {
+		var qp bus.AgentQuestionPayload
+		if err := json.Unmarshal(questionEvents[i].PayloadEnc, &qp); err != nil {
+			// Битый/несовместимый payload у конкретной записи не должен ронять
+			// весь поиск — пропускаем её и продолжаем сопоставление остальных.
+			continue
+		}
+		if qp.QuestionID == questionIDStr {
+			matched = &questionEvents[i]
+			break
+		}
+	}
+	if matched == nil {
+		writeError(w, http.StatusNotFound, "not_found", "вопрос не найден")
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("PostTasksIdAnswer", errors.New("transitioner не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	answerPayload, err := json.Marshal(bus.UserAnswerPayload{QuestionID: questionIDStr, Text: req.Text})
+	if err != nil {
+		s.logError("json.Marshal(UserAnswerPayload)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerUserAnswered, "user_answer", matched.ID, answerPayload); err != nil {
+		s.logError("TransitionWithEvent(user_answer)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	publisher := s.getCommandPublisher()
+	if publisher == nil {
+		s.logError("PostTasksIdAnswer", errors.New("CommandPublisher не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	taskIDStr := taskUUID.String()
+	integrationID := uuid.UUID(row.IntegrationID.Bytes)
+	env := bus.Envelope{
+		MessageID:     bus.NewMessageID(),
+		TaskID:        &taskIDStr,
+		IntegrationID: integrationID.String(),
+		Type:          bus.MessageTypeUserAnswer,
+		// Seq: упрощение по образцу PostTasks (тикет 5.3) — сквозной счётчик
+		// seq для machine.commands конкретной задачи здесь не заводится
+		// (вне объёма 6.1); порядок и так гарантирован партиционированием по
+		// integration_id (ADR 0001) и тем, что до user_answer агент уже
+		// получил ack на этот WS-путь синхронно.
+		Seq:             1,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         answerPayload,
+	}
+	if err := publisher.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
+		s.logError("PublishKeyed(user_answer)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 // toTask конвертирует строку БД (уже после Transition) в контрактный Task.

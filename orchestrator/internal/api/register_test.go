@@ -64,6 +64,15 @@ type fakeQuerier struct {
 
 	createTaskResult db.Task
 	createTaskErr    error
+
+	getTaskByIDAndUserResult db.Task
+	getTaskByIDAndUserErr    error
+
+	getTaskByIDAndIntegrationResult db.Task
+	getTaskByIDAndIntegrationErr    error
+
+	listAgentQuestionEventsByTaskResult []db.TaskEvent
+	listAgentQuestionEventsByTaskErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -161,6 +170,27 @@ func (f fakeQuerier) CreateTask(context.Context, db.CreateTaskParams) (db.Task, 
 	return f.createTaskResult, nil
 }
 
+func (f fakeQuerier) GetTaskByIDAndUser(context.Context, db.GetTaskByIDAndUserParams) (db.Task, error) {
+	if f.getTaskByIDAndUserErr != nil {
+		return db.Task{}, f.getTaskByIDAndUserErr
+	}
+	return f.getTaskByIDAndUserResult, nil
+}
+
+func (f fakeQuerier) GetTaskByIDAndIntegration(context.Context, db.GetTaskByIDAndIntegrationParams) (db.Task, error) {
+	if f.getTaskByIDAndIntegrationErr != nil {
+		return db.Task{}, f.getTaskByIDAndIntegrationErr
+	}
+	return f.getTaskByIDAndIntegrationResult, nil
+}
+
+func (f fakeQuerier) ListAgentQuestionEventsByTask(context.Context, pgtype.UUID) ([]db.TaskEvent, error) {
+	if f.listAgentQuestionEventsByTaskErr != nil {
+		return nil, f.listAgentQuestionEventsByTaskErr
+	}
+	return f.listAgentQuestionEventsByTaskResult, nil
+}
+
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api
 // (тикеты 1.2/1.3). Не секрет — используется только в тестовом процессе.
 const testJWTSigningKey = "unit-test-jwt-signing-key"
@@ -200,7 +230,7 @@ func TestRegisterValidationRejectsEmptyFields(t *testing.T) {
 	cases := map[string]RegisterRequest{
 		"пустой username": {Username: "", Password: "p", RegistrationToken: "secret"},
 		"пустой password": {Username: "u", Password: "  ", RegistrationToken: "secret"},
-		"пустой токен":     {Username: "u", Password: "p", RegistrationToken: ""},
+		"пустой токен":    {Username: "u", Password: "p", RegistrationToken: ""},
 	}
 	for name, body := range cases {
 		rec := doRegister(t, q, body)

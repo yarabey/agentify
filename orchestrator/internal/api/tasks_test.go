@@ -26,16 +26,28 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
-// fakeTransitioner — подменный taskTransitioner для unit-тестов PostTasks:
-// возвращает настраиваемый статус to (или ошибку) и запоминает последние
-// переданные аргументы, чтобы тесты могли проверить, что PostTasks вызвал
-// Transition с правильным (taskID, TriggerEnqueued).
+// fakeTransitioner — подменный taskTransitioner для unit-тестов PostTasks/
+// PostTasksIdAnswer: возвращает настраиваемый статус to (или ошибку) и
+// запоминает последние переданные аргументы, чтобы тесты могли проверить,
+// что обработчик вызвал Transition/TransitionWithEvent с правильными
+// аргументами.
+//
+// lastEventType/lastRefEventID/lastEventPayload — ОТДЕЛЬНЫЕ поля от
+// lastTaskID/lastTrigger (которые делят Transition и TransitionWithEvent):
+// тестам PostTasksIdAnswer (тикет 6.1) нужно проверить именно эти три
+// аргумента TransitionWithEvent (тип события/ref_event_id/payload), не
+// задевая существующие тесты PostTasks, которые проверяют только
+// lastTaskID/lastTrigger через Transition.
 type fakeTransitioner struct {
 	to  task.Status
 	err error
 
 	lastTaskID  pgtype.UUID
 	lastTrigger task.Trigger
+
+	lastEventType    string
+	lastRefEventID   pgtype.UUID
+	lastEventPayload []byte
 }
 
 func (f *fakeTransitioner) Transition(_ context.Context, taskID pgtype.UUID, trigger task.Trigger) (task.Status, task.Status, error) {
@@ -45,6 +57,18 @@ func (f *fakeTransitioner) Transition(_ context.Context, taskID pgtype.UUID, tri
 		return "", "", f.err
 	}
 	return task.StatusCreated, f.to, nil
+}
+
+func (f *fakeTransitioner) TransitionWithEvent(_ context.Context, taskID pgtype.UUID, trigger task.Trigger, eventType string, refEventID pgtype.UUID, eventPayload []byte) (task.Status, task.Status, error) {
+	f.lastTaskID = taskID
+	f.lastTrigger = trigger
+	f.lastEventType = eventType
+	f.lastRefEventID = refEventID
+	f.lastEventPayload = eventPayload
+	if f.err != nil {
+		return "", "", f.err
+	}
+	return task.StatusWaitingUser, f.to, nil
 }
 
 // publishCall — один вызов fakePublisher.PublishKeyed, зафиксированный для
@@ -392,5 +416,401 @@ func TestPostTasks_HappyPath(t *testing.T) {
 	}
 	if payload.Text != text {
 		t.Errorf("payload.Text = %q, ожидался %q", payload.Text, text)
+	}
+}
+
+// agentQuestionEvent строит db.TaskEvent с type=agent_question, пригодную
+// подставить в fakeQuerier.listAgentQuestionEventsByTaskResult (тикет 6.1):
+// payload сериализуется как bus.AgentQuestionPayload{QuestionID, Text} —
+// та же форма, что реально пишет handleAgentQuestion (machine_ws.go).
+func agentQuestionEvent(t *testing.T, eventID uuid.UUID, questionID, text string) db.TaskEvent {
+	t.Helper()
+	payload, err := json.Marshal(bus.AgentQuestionPayload{QuestionID: questionID, Text: text})
+	if err != nil {
+		t.Fatalf("marshal AgentQuestionPayload: %v", err)
+	}
+	return db.TaskEvent{
+		ID:         pgtype.UUID{Bytes: eventID, Valid: true},
+		Type:       "agent_question",
+		PayloadEnc: payload,
+	}
+}
+
+// doPostTasksIdAnswer прогоняет POST /tasks/{id}/answer через роутер,
+// собранный из postTasksServer, с Bearer-токеном userID, и возвращает
+// записанный ответ.
+func doPostTasksIdAnswer(t *testing.T, cfg postTasksServer, userID, taskID uuid.UUID, body any) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(cfg.q)
+	s.SetTransitioner(cfg.transitioner)
+	s.SetCommandPublisher(cfg.publisher)
+	router := NewRouter(s)
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal тела: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/answer", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPostTasksIdAnswer_RequiresBearerToken — без Authorization-заголовка
+// auth-middleware отвечает 401, не доходя до PostTasksIdAnswer (тикет 1.4).
+func TestPostTasksIdAnswer_RequiresBearerToken(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	s.SetTransitioner(&fakeTransitioner{})
+	s.SetCommandPublisher(&fakePublisher{})
+	router := NewRouter(s)
+
+	body, _ := json.Marshal(PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "42"})
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+uuid.New().String()+"/answer", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_MalformedJSON — невалидный JSON body → 400.
+func TestPostTasksIdAnswer_MalformedJSON(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	s := newTestServer(fakeQuerier{})
+	s.SetTransitioner(&fakeTransitioner{})
+	s.SetCommandPublisher(&fakePublisher{})
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/answer", bytes.NewReader([]byte("{not json")))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("статус = %d (%s), ожидался 400", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_EmptyTextRejected — пустой (после TrimSpace) text →
+// 400.
+func TestPostTasksIdAnswer_EmptyTextRejected(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q:            fakeQuerier{},
+		transitioner: &fakeTransitioner{},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "   "})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("статус = %d (%s), ожидался 400", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404 (FR A4, I3).
+func TestPostTasksIdAnswer_TaskNotFound(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows},
+		transitioner: &fakeTransitioner{},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "42"})
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_TaskLookupInternalError — неожиданная ошибка при
+// проверке владения задачей → 500.
+func TestPostTasksIdAnswer_TaskLookupInternalError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded},
+		transitioner: &fakeTransitioner{},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_QuestionNotFound — question_id из тела не совпадает
+// ни с одним agent_question этой задачи → 404 (сопоставление по question_id,
+// не «последний вопрос», см. godoc PostTasksIdAnswer).
+func TestPostTasksIdAnswer_QuestionNotFound(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, uuid.New(), uuid.New().String(), "другой вопрос"),
+			},
+		},
+		transitioner: &fakeTransitioner{},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "42"})
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_ListQuestionsInternalError — ошибка
+// ListAgentQuestionEventsByTask → 500.
+func TestPostTasksIdAnswer_ListQuestionsInternalError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult:         db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+			listAgentQuestionEventsByTaskErr: context.DeadlineExceeded,
+		},
+		transitioner: &fakeTransitioner{},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: uuid.New(), Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_NoTransitionerConfigured — transitioner не установлен
+// (nil) → 500.
+func TestPostTasksIdAnswer_NoTransitionerConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	questionID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, uuid.New(), questionID.String(), "вопрос"),
+			},
+		},
+		transitioner: nil,
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: questionID, Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_TransitionError — TransitionWithEvent вернул ошибку
+// (недопустимый переход/сбой БД) → 500.
+func TestPostTasksIdAnswer_TransitionError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	questionID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, uuid.New(), questionID.String(), "вопрос"),
+			},
+		},
+		transitioner: &fakeTransitioner{err: context.DeadlineExceeded},
+		publisher:    &fakePublisher{},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: questionID, Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_NoPublisherConfigured — CommandPublisher не
+// установлен (nil), хотя TransitionWithEvent прошёл успешно → 500.
+func TestPostTasksIdAnswer_NoPublisherConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	questionID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, uuid.New(), questionID.String(), "вопрос"),
+			},
+		},
+		transitioner: &fakeTransitioner{to: task.StatusRunning},
+		publisher:    nil,
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: questionID, Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_PublishError — PublishKeyed вернул ошибку → 500.
+func TestPostTasksIdAnswer_PublishError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	questionID := uuid.New()
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, uuid.New(), questionID.String(), "вопрос"),
+			},
+		},
+		transitioner: &fakeTransitioner{to: task.StatusRunning},
+		publisher:    &fakePublisher{err: context.DeadlineExceeded},
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: questionID, Text: "42"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdAnswer_HappyPath — успешный ответ пользователя (FR F1, F2):
+// 202, TransitionWithEvent вызван с (taskID, TriggerUserAnswered,
+// "user_answer", ref_event_id == id найденной записи agent_question,
+// payload с тем же question_id/text), PublishKeyed вызван ровно один раз с
+// конвертом user_answer.
+func TestPostTasksIdAnswer_HappyPath(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+	questionID := uuid.New()
+	questionEventID := uuid.New()
+	const answerText = "используй Go 1.24"
+
+	transitioner := &fakeTransitioner{to: task.StatusRunning}
+	publisher := &fakePublisher{}
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, questionEventID, questionID.String(), "какую версию Go использовать?"),
+			},
+		},
+		transitioner: transitioner,
+		publisher:    publisher,
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: questionID, Text: answerText})
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("статус = %d (%s), ожидался 202", rec.Code, rec.Body.String())
+	}
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("TransitionWithEvent вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerUserAnswered {
+		t.Fatalf("TransitionWithEvent вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerUserAnswered)
+	}
+	if transitioner.lastEventType != "user_answer" {
+		t.Fatalf("TransitionWithEvent вызван с eventType = %q, ожидался %q", transitioner.lastEventType, "user_answer")
+	}
+	if transitioner.lastRefEventID.Bytes != questionEventID {
+		t.Fatalf("TransitionWithEvent вызван с refEventID = %s, ожидался %s (id найденной agent_question)", uuid.UUID(transitioner.lastRefEventID.Bytes), questionEventID)
+	}
+	var eventPayload bus.UserAnswerPayload
+	if err := json.Unmarshal(transitioner.lastEventPayload, &eventPayload); err != nil {
+		t.Fatalf("unmarshal lastEventPayload: %v", err)
+	}
+	if eventPayload.QuestionID != questionID.String() {
+		t.Errorf("lastEventPayload.QuestionID = %q, ожидался %q", eventPayload.QuestionID, questionID.String())
+	}
+	if eventPayload.Text != answerText {
+		t.Errorf("lastEventPayload.Text = %q, ожидался %q", eventPayload.Text, answerText)
+	}
+
+	if len(publisher.calls) != 1 {
+		t.Fatalf("PublishKeyed вызван %d раз(а), ожидался 1", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	if call.topic != bus.TopicMachineCommands {
+		t.Errorf("topic = %q, ожидался %q", call.topic, bus.TopicMachineCommands)
+	}
+	if call.keyField != bus.PartitionKeyIntegrationID {
+		t.Errorf("keyField = %q, ожидался %q", call.keyField, bus.PartitionKeyIntegrationID)
+	}
+	if call.env.Type != bus.MessageTypeUserAnswer {
+		t.Errorf("env.Type = %q, ожидался %q", call.env.Type, bus.MessageTypeUserAnswer)
+	}
+	if call.env.TaskID == nil || *call.env.TaskID != taskID.String() {
+		t.Errorf("env.TaskID = %v, ожидался %s", call.env.TaskID, taskID)
+	}
+	if call.env.IntegrationID != integrationID.String() {
+		t.Errorf("env.IntegrationID = %q, ожидался %s", call.env.IntegrationID, integrationID)
+	}
+
+	var payload bus.UserAnswerPayload
+	if err := json.Unmarshal(call.env.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.QuestionID != questionID.String() {
+		t.Errorf("payload.QuestionID = %q, ожидался %q", payload.QuestionID, questionID.String())
+	}
+	if payload.Text != answerText {
+		t.Errorf("payload.Text = %q, ожидался %q", payload.Text, answerText)
+	}
+}
+
+// TestPostTasksIdAnswer_MatchesSpecificQuestionAmongMultiple — сопоставление
+// СТРОГО по question_id, а не «последний вопрос задачи» (это требование уже
+// этого тикета 6.1, а не только 6.2 «несколько вопросов сопоставляются
+// корректно», см. godoc PostTasksIdAnswer): среди нескольких agent_question
+// этой задачи выбирается именно та запись, чей question_id совпал с телом
+// запроса, даже если она не самая новая (первая в порядке ListAgentQuestionEventsByTask,
+// который возвращает записи по убыванию seq).
+func TestPostTasksIdAnswer_MatchesSpecificQuestionAmongMultiple(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+
+	// Три вопроса; отвечаем на СРЕДНИЙ (по времени) — не первый в списке
+	// (самый новый) и не последний (самый старый).
+	newestEventID := uuid.New()
+	targetEventID := uuid.New()
+	oldestEventID := uuid.New()
+	targetQuestionID := uuid.New()
+
+	transitioner := &fakeTransitioner{to: task.StatusRunning}
+	publisher := &fakePublisher{}
+	rec := doPostTasksIdAnswer(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+			// ListAgentQuestionEventsByTask возвращает самые новые первыми
+			// (ORDER BY seq DESC, см. queries/tasks.sql) — targetEventID
+			// намеренно НЕ первый в срезе.
+			listAgentQuestionEventsByTaskResult: []db.TaskEvent{
+				agentQuestionEvent(t, newestEventID, uuid.New().String(), "самый новый вопрос"),
+				agentQuestionEvent(t, targetEventID, targetQuestionID.String(), "нужный вопрос"),
+				agentQuestionEvent(t, oldestEventID, uuid.New().String(), "самый старый вопрос"),
+			},
+		},
+		transitioner: transitioner,
+		publisher:    publisher,
+	}, userID, taskID, PostTasksIdAnswerJSONBody{QuestionId: targetQuestionID, Text: "ответ на нужный вопрос"})
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("статус = %d (%s), ожидался 202", rec.Code, rec.Body.String())
+	}
+	if transitioner.lastRefEventID.Bytes != targetEventID {
+		t.Fatalf("ref_event_id = %s, ожидался %s (именно нужный вопрос, не самый новый/старый)",
+			uuid.UUID(transitioner.lastRefEventID.Bytes), targetEventID)
 	}
 }
