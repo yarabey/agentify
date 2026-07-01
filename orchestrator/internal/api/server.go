@@ -133,6 +133,11 @@ type Querier interface {
 	// (question_id) с конкретной записью task_events (тикет 6.1, FR F2, см.
 	// PostTasksIdAnswer в tasks.go).
 	ListAgentQuestionEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]db.TaskEvent, error)
+	// ListCommandApprovalRequestEventsByTask возвращает события command_approval_request
+	// задачи (самые новые первыми) — источник сопоставления решения пользователя
+	// (request_id из тела PostTasksIdApprove) с конкретной записью task_events (тикет
+	// 6.4, FR F3, см. PostTasksIdApprove в tasks.go).
+	ListCommandApprovalRequestEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]db.TaskEvent, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.
