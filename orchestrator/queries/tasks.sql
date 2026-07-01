@@ -41,11 +41,22 @@ RETURNING *;
 -- сделал Transitioner единственной точкой смены tasks.status, поэтому
 -- обработчик POST /tasks (тикет 5.3) не пишет 'queued'/task_events напрямую.
 -- Коллизия (user_id, idempotency_key) — SQLSTATE 23505 (uq_tasks_idempotency);
--- обработчик отвечает 409 (полноценное «вернуть существующую задачу, 200» —
--- отдельный тикет 5.5).
+-- обработчик перехватывает её и обслуживает повтор через
+-- GetTaskByUserAndIdempotencyKey ниже (тикет 5.5, FR E7, §4 «Защита от
+-- двойной отправки»): существующая задача возвращается с 200, дубль не
+-- создаётся.
 INSERT INTO tasks (user_id, integration_id, text_enc, idempotency_key)
 VALUES ($1, $2, $3, $4)
 RETURNING *;
+
+-- name: GetTaskByUserAndIdempotencyKey :one
+-- Находит уже созданную задачу по (user_id, idempotency_key) после того, как
+-- INSERT в CreateTask упал на uq_tasks_idempotency (SQLSTATE 23505) — это и
+-- есть дедуп повторной постановки (тикет 5.5, FR E7): вместо создания дубля
+-- обработчик POST /tasks перечитывает уже существующую строку и возвращает
+-- её с 200, не трогая Transitioner и не публикуя task_assigned повторно (эта
+-- задача уже прошла весь путь при первой, не повторной, постановке).
+SELECT * FROM tasks WHERE user_id = $1 AND idempotency_key = $2;
 
 -- name: GetTaskByIDAndUser :one
 -- Ищет задачу по id, owner-scoped прямо в SQL (FR A4, I3) — чужая/несуществующая

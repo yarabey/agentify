@@ -19,10 +19,11 @@ package api
 // партиционируется по машине, чтобы сохранить порядок команд для неё).
 // GET /tasks* (список/история задачи) — отдельный тикет 8.6, здесь не
 // реализуется (остаётся 501 через Unimplemented). Дедуп постановки по
-// Idempotency-Key (возврат существующей задачи с 200 вместо создания дубля)
-// — отдельный тикет 5.5; здесь при коллизии уникального индекса
-// uq_tasks_idempotency (SQLSTATE 23505) обработчик временно отвечает 409
-// Conflict.
+// Idempotency-Key (тикет 5.5, FR E7, §4 «Защита от двойной отправки»):
+// уникальный индекс uq_tasks_idempotency (user_id, idempotency_key) в БД —
+// источник истины, обработчик лишь реагирует на его коллизию (SQLSTATE
+// 23505), перечитывает уже существующую задачу и возвращает её с 200, не
+// создавая дубль и не повторяя Transition/публикацию task_assigned.
 //
 // Как устроено (тех): INSERT новой задачи (db.CreateTask,
 // orchestrator/queries/tasks.sql) вставляет строку со статусом ПО УМОЛЧАНИЮ
@@ -52,16 +53,22 @@ import (
 )
 
 // PostTasks реализует POST /tasks — постановку задачи в очередь к машине
-// (FR E1, E4, §4 «Постановка задачи из канала»).
+// (FR E1, E4, §4 «Постановка задачи из канала») с дедупом повторной
+// постановки по заголовку Idempotency-Key (тикет 5.5, FR E7, §4 «Защита от
+// двойной отправки»).
 //
 // Алгоритм: провалидировать тело (text обязателен) → проверить владение
 // интеграцией (integration_id из тела, owner-scoped, единый 404) → вставить
-// задачу (db.CreateTask, статус 'created'; коллизия Idempotency-Key —
-// SQLSTATE 23505 — временный 409, полноценный дедуп — тикет 5.5) → перевести
-// в 'queued' через task.Transitioner.Transition (единственная точка смены
-// статуса, тикет 5.2) → опубликовать конверт task_assigned в
-// machine.commands, партиционированный по integration_id (ADR 0001) →
-// вернуть 201 с Task.
+// задачу (db.CreateTask, статус 'created'). Если INSERT упал на коллизии
+// уникального индекса uq_tasks_idempotency (user_id, idempotency_key,
+// SQLSTATE 23505) — это повтор той же постановки: перечитать существующую
+// задачу (GetTaskByUserAndIdempotencyKey) и вернуть её с 200, НЕ вызывая
+// Transitioner и НЕ публикуя task_assigned повторно (задача уже прошла этот
+// путь при первой, не повторной, постановке). Иначе (задача только что
+// создана) — перевести в 'queued' через task.Transitioner.Transition
+// (единственная точка смены статуса, тикет 5.2) → опубликовать конверт
+// task_assigned в machine.commands, партиционированный по integration_id
+// (ADR 0001) → вернуть 201 с Task.
 func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTasksParams) {
 	ctx := r.Context()
 
@@ -111,9 +118,25 @@ func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTa
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
-			// uq_tasks_idempotency: повтор с тем же (user_id, idempotency_key).
-			// Полноценный «вернуть существующую задачу, 200» — тикет 5.5.
-			writeError(w, http.StatusConflict, "idempotency_key_conflict", "задача с этим Idempotency-Key уже существует")
+			// uq_tasks_idempotency: повтор с тем же (user_id, idempotency_key) —
+			// дедуп постановки (тикет 5.5, FR E7). Задача уже создана и прошла
+			// свой путь (queued + task_assigned) при первой постановке —
+			// перечитываем её и возвращаем 200, не дублируя ни строку в tasks,
+			// ни Transition, ни публикацию.
+			existing, getErr := s.queries.GetTaskByUserAndIdempotencyKey(ctx, db.GetTaskByUserAndIdempotencyKeyParams{
+				UserID:         pgtype.UUID{Bytes: userID, Valid: true},
+				IdempotencyKey: &idempotencyKey,
+			})
+			if getErr != nil {
+				// Гипотетическая гонка: INSERT сообщил о конфликте, но строка
+				// почему-то не находится (например, конкурентная транзакция ещё
+				// не закоммитилась). Это не штатный пользовательский случай —
+				// внутренняя ошибка, а не 409/404.
+				s.logError("GetTaskByUserAndIdempotencyKey", getErr)
+				writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+				return
+			}
+			writeJSON(w, http.StatusOK, toTask(existing, task.Status(existing.Status)))
 			return
 		}
 		s.logError("CreateTask", err)

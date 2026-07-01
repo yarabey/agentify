@@ -113,6 +113,11 @@ type Querier interface {
 	// (тикет 5.3, FR E1) — постановку в очередь выполняет отдельно
 	// task.Transitioner (см. PostTasks в tasks.go).
 	CreateTask(ctx context.Context, arg db.CreateTaskParams) (db.Task, error)
+	// GetTaskByUserAndIdempotencyKey ищет задачу по (user_id, idempotency_key)
+	// после коллизии CreateTask на uq_tasks_idempotency (SQLSTATE 23505) —
+	// дедуп повторной постановки (тикет 5.5, FR E7): повтор возвращает уже
+	// созданную задачу с 200 вместо дубля (см. PostTasks в tasks.go).
+	GetTaskByUserAndIdempotencyKey(ctx context.Context, arg db.GetTaskByUserAndIdempotencyKeyParams) (db.Task, error)
 
 	// GetTaskByIDAndUser ищет задачу по id, owner-scoped прямо в SQL (FR A4,
 	// I3) — чужая/несуществующая неотличимы (pgx.ErrNoRows → 404). Используется

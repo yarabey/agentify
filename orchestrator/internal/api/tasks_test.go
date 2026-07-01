@@ -220,25 +220,76 @@ func TestPostTasks_IntegrationLookupInternalError(t *testing.T) {
 }
 
 // TestPostTasks_IdempotencyKeyConflict — коллизия uq_tasks_idempotency
-// (SQLSTATE 23505 при CreateTask) → 409 (временное поведение до дедупа
-// тикета 5.5).
+// (SQLSTATE 23505 при CreateTask, повтор постановки с тем же
+// (user_id, idempotency_key)) → дедуп (тикет 5.5, FR E7): существующая
+// задача перечитывается (GetTaskByUserAndIdempotencyKey) и возвращается с
+// 200 (НЕ 409, НЕ 201), Transition/PublishKeyed НЕ вызываются повторно —
+// задача уже прошла этот путь при первой постановке.
 func TestPostTasks_IdempotencyKeyConflict(t *testing.T) {
+	userID := uuid.New()
+	integrationID := uuid.New()
+	existingTaskID := uuid.New()
+	const existingText = "исходный текст задачи"
+	pgErr := &pgconn.PgError{Code: "23505", ConstraintName: "uq_tasks_idempotency"}
+
+	transitioner := &fakeTransitioner{to: task.StatusQueued}
+	publisher := &fakePublisher{}
+	existing := taskCreatedResult(existingTaskID, integrationID, existingText)
+	existing.Status = string(task.StatusQueued)
+	rec := doPostTasks(t, postTasksServer{
+		q: fakeQuerier{
+			getIntegrationResult:                 db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
+			createTaskErr:                        pgErr,
+			getTaskByUserAndIdempotencyKeyResult: existing,
+		},
+		transitioner: transitioner,
+		publisher:    publisher,
+	}, userID, "dup-key", TaskCreate{IntegrationId: integrationID, Text: "другой текст в повторе — не важно"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	var respTask Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &respTask); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if respTask.Id == nil || *respTask.Id != existingTaskID {
+		t.Fatalf("id = %v, ожидался %s (существующая задача, не новая)", respTask.Id, existingTaskID)
+	}
+	if respTask.Status == nil || *respTask.Status != TaskStatus(task.StatusQueued) {
+		t.Fatalf("status = %v, ожидался %q", respTask.Status, task.StatusQueued)
+	}
+
+	if transitioner.lastTaskID.Valid {
+		t.Fatalf("Transition не должен вызываться при повторной постановке, но вызван с taskID = %s", uuid.UUID(transitioner.lastTaskID.Bytes))
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatalf("PublishKeyed не должен вызываться при повторной постановке, но вызван %d раз(а)", len(publisher.calls))
+	}
+}
+
+// TestPostTasks_IdempotencyKeyConflictRaceInternalError — коллизия
+// uq_tasks_idempotency при CreateTask, но GetTaskByUserAndIdempotencyKey всё
+// равно не находит строку (гипотетическая гонка) → 500, НЕ 409/404: это не
+// штатный пользовательский случай.
+func TestPostTasks_IdempotencyKeyConflictRaceInternalError(t *testing.T) {
 	userID := uuid.New()
 	integrationID := uuid.New()
 	pgErr := &pgconn.PgError{Code: "23505", ConstraintName: "uq_tasks_idempotency"}
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
-			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskErr:        pgErr,
+			getIntegrationResult:              db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
+			createTaskErr:                     pgErr,
+			getTaskByUserAndIdempotencyKeyErr: pgx.ErrNoRows,
 		},
 		transitioner: &fakeTransitioner{to: task.StatusQueued},
 		publisher:    &fakePublisher{},
 	}, userID, "dup-key", TaskCreate{IntegrationId: integrationID, Text: "сделай x"})
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("статус = %d (%s), ожидался 409", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
 	}
-	assertErrorBody(t, rec)
 }
 
 // TestPostTasks_CreateTaskInternalError — прочая (не 23505) ошибка вставки →
