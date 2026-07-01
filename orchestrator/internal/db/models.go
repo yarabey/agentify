@@ -42,6 +42,8 @@ type Integration struct {
 	LastSeenAt pgtype.Timestamptz `json:"last_seen_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	// NULL = активна; иначе — момент мягкого удаления (ADR 0004). Owner-scoped запросы и аутентификация машины (GetIntegrationByUUIDHMAC) фильтруют deleted_at IS NULL — удалённая интеграция считается несуществующей.
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
 }
 
 // Непрозрачные refresh-токены (хэш). Поддержка logout/refresh (FR A3).

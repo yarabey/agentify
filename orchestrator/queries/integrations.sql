@@ -21,25 +21,32 @@ RETURNING *;
 -- Список интеграций владельца — только свои (FR A4, I3, Gherkin §2). Без
 -- секрета (uuid_enc) в результате сознательно НЕ ограничиваем: вызывающая
 -- сторона (Server.GetIntegrations) просто не кладёт его в ответ.
+-- deleted_at IS NULL (ADR 0004, тикет 2.6): мягко удалённая интеграция не
+-- должна появляться в списке владельца — для него она перестала существовать.
 SELECT * FROM integrations
-WHERE user_id = $1
+WHERE user_id = $1 AND deleted_at IS NULL
 ORDER BY created_at;
 
 -- name: GetIntegrationByIDAndUser :one
 -- Интеграция по id, owner-scoped прямо в SQL: чужая интеграция не найдётся
 -- (pgx.ErrNoRows), что отдаёт владельцу единый 404 — не давая атакующему
 -- сигнал о существовании чужого id (тот же принцип, что и в auth).
+-- deleted_at IS NULL (ADR 0004, тикет 2.6): мягко удалённая интеграция
+-- неотличима от несуществующей — единый 404 для GET/PATCH /integrations/{id}
+-- и для POST /tasks (GetIntegrationByIDAndUser переиспользуется в tasks.go).
 SELECT * FROM integrations
-WHERE id = $1 AND user_id = $2;
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL;
 
 -- name: UpdateIntegration :one
 -- Частичное обновление name/ip_hint (PATCH /integrations/{id}, FR B5):
 -- значения для записи считает сервисный слой (берёт текущие там, где поле
 -- не пришло в теле запроса), здесь — безусловная перезапись + updated_at.
 -- owner-scoped WHERE — как и у Get, не находит чужую строку.
+-- deleted_at IS NULL (ADR 0004, тикет 2.6): удалённую интеграцию нельзя
+-- «оживить» повторным PATCH — pgx.ErrNoRows, единый 404.
 UPDATE integrations
 SET name = $3, ip_hint = $4, updated_at = now()
-WHERE id = $1 AND user_id = $2
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
 RETURNING *;
 
 -- name: GetIntegrationByUUIDHMAC :one
@@ -53,8 +60,27 @@ RETURNING *;
 -- см. orchestrator/internal/api/auth.go). Не находит — pgx.ErrNoRows;
 -- сервисный слой схлопывает это с несовпадением ip_hint в единый отказ
 -- WS-аутентификации (close 4401), без утечки причины.
+-- deleted_at IS NULL (ADR 0004, тикет 2.6): критично для безопасности —
+-- мягко удалённая интеграция не должна иметь возможность повторно
+-- аутентифицировать машину предъявлением старого UUID-секрета.
 SELECT * FROM integrations
-WHERE uuid_hmac = $1;
+WHERE uuid_hmac = $1 AND deleted_at IS NULL;
+
+-- name: SoftDeleteIntegration :one
+-- Мягкое удаление интеграции (DELETE /integrations/{id}, тикет 2.6, FR B5,
+-- ADR 0004, docs/adr/0004-integration-soft-delete.md): физический DELETE
+-- невозможен для интеграции, у которой хоть раз была создана задача —
+-- tasks.integration_id объявлен ON DELETE RESTRICT (migrations/00003), а
+-- история задач хранится бессрочно (FR I2). Вместо этого выставляем
+-- deleted_at = now(); owner-scoped WHERE — как у Get/Update. Условие
+-- deleted_at IS NULL делает вызов идемпотентным относительно повторного
+-- удаления уже удалённой строки: повторный вызов не найдёт строку
+-- (pgx.ErrNoRows), обработчик трактует это как 404, а не как повторный
+-- успешный 204.
+UPDATE integrations
+SET deleted_at = now(), updated_at = now()
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+RETURNING id;
 
 -- name: MarkIntegrationOnline :exec
 -- Идемпотентно помечает интеграцию online со свежим last_seen_at (FR B4,

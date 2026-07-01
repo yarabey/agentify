@@ -9,23 +9,26 @@
 // определяющий пользователя по access-токену на защищённых маршрутах
 // (FR A3, D2, Gherkin §1 «Доступ к API по токену», см. middleware.go), CRUD
 // интеграций с выдачей UUID-секрета — GET/POST /integrations,
-// GET/PATCH /integrations/{id} (FR B1, B2, B5, Gherkin §2, см. integrations.go),
-// а также аутентификация машины по UUID на WS-handshake — GET /machine/ws,
+// GET/PATCH/DELETE /integrations/{id} (FR B1, B2, B5, Gherkin §2, см.
+// integrations.go; удаление — мягкое, ADR 0004, тикет 2.6, корректно
+// отменяет активные задачи интеграции через FSM при confirm=true), а также
+// аутентификация машины по UUID на WS-handshake — GET /machine/ws,
 // вкл. вытеснение повторного соединения той же интеграции (FR B3, B6,
 // Gherkin §2, ADR 0002, см. machine_ws.go). Доступ в систему закрытый:
 // аккаунт создаётся лишь при предъявлении активного секретного токена
-// регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи,
-// удаление интеграции) пока отвечают 501 Not Implemented и будут реализованы
-// в своих тикетах, но уже сейчас проходят через auth-middleware наравне с
-// готовыми защищёнными операциями.
+// регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи)
+// пока отвечают 501 Not Implemented и будут реализованы в своих тикетах, но
+// уже сейчас проходят через auth-middleware наравне с готовыми защищёнными
+// операциями.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
 // только готовые операции — GetHealthz, PostAuthRegister,
 // PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go),
-// GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId (см.
-// integrations.go) и GetMachineWs (см. machine_ws.go), которая после
+// GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId/
+// DeleteIntegrationsId (см. integrations.go) и GetMachineWs (см.
+// machine_ws.go), которая после
 // успешного hello разбирает входящие кадры машины и пересылает ack-кадры
 // зарегистрированному AckSink — мосту оркестратора (machine.commands →
 // WS, commit-after-ACK, тикет 3.4, protocol.md §5, см. SetAckSink/MachineConn
@@ -109,6 +112,16 @@ type Querier interface {
 	// user_id: владелец на этом шаге ещё не известен (FR B3, B6, тикет 2.3,
 	// см. machine_ws.go).
 	GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (db.Integration, error)
+	// ListActiveTaskIDsByIntegration возвращает id активных (не терминальных)
+	// задач интеграции — используется DeleteIntegrationsId (тикет 2.6, FR B5)
+	// для решения о 409 (без confirm=true) и для отмены через FSM при
+	// confirm=true (см. integrations.go).
+	ListActiveTaskIDsByIntegration(ctx context.Context, integrationID pgtype.UUID) ([]pgtype.UUID, error)
+	// SoftDeleteIntegration помечает интеграцию удалённой (deleted_at, ADR
+	// 0004, docs/adr/0004-integration-soft-delete.md) — owner-scoped,
+	// идемпотентно относительно повторного вызова (тикет 2.6, FR B5, см.
+	// integrations.go).
+	SoftDeleteIntegration(ctx context.Context, arg db.SoftDeleteIntegrationParams) (pgtype.UUID, error)
 
 	// CreateTask вставляет новую задачу владельца со статусом 'created'
 	// (тикет 5.3, FR E1) — постановку в очередь выполняет отдельно

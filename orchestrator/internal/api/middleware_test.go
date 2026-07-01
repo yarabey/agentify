@@ -198,23 +198,24 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 // 401 без токена и доходит до обработчика (тут — заглушка Unimplemented,
 // 501) с валидным.
 //
-// Маршрут под тестом — DELETE /integrations/{id} (тикет 2.6, сознательно вне
-// скоупа тикета 2.2 — см. integrations.go, DeleteIntegrationsId НЕ
-// переопределён). GET /integrations использовался здесь раньше для той же
-// проверки, но с тикета 2.2 реализован (integrations.go) и отвечает 200, а
-// не 501 — этот тест проверяет общий механизм middleware+Unimplemented на
-// ЛЮБОМ ещё не готовом защищённом маршруте, а не конкретно на /integrations.
+// Маршрут под тестом — GET /tasks (история задач, FR H1, Gherkin §10; ещё
+// не реализован — GetTasks не переопределён ни в одном обработчике пакета,
+// падает в заглушку Unimplemented). DELETE /integrations/{id} использовался
+// здесь раньше для той же проверки, но с тикета 2.6 реализован
+// (integrations.go, DeleteIntegrationsId) и отвечает 204/409/404, а не 501 —
+// этот тест проверяет общий механизм middleware+Unimplemented на ЛЮБОМ ещё
+// не готовом защищённом маршруте, а не конкретно на /integrations/{id}.
 func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 
-	noToken := httptest.NewRequest(http.MethodDelete, "/integrations/"+uuid.New().String(), nil)
+	noToken := httptest.NewRequest(http.MethodGet, "/tasks", nil)
 	noTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(noTokenRec, noToken)
 	if noTokenRec.Code != http.StatusUnauthorized {
 		t.Fatalf("без токена: статус = %d (%s), ожидался 401", noTokenRec.Code, noTokenRec.Body.String())
 	}
 
-	withToken := httptest.NewRequest(http.MethodDelete, "/integrations/"+uuid.New().String(), nil)
+	withToken := httptest.NewRequest(http.MethodGet, "/tasks", nil)
 	withToken.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	withTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(withTokenRec, withToken)
