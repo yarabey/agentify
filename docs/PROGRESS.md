@@ -24,7 +24,7 @@
 | 2.2 | done | merge 60e70be | 2026-06-30 | CRUD + выдача UUID |
 | 2.3 | done | merge da3c0bc | 2026-06-30 | Аутентификация машины по UUID |
 | 2.4 | done | merge b10ac44 | 2026-06-30 | Защита от повторного UUID |
-| 2.5 | todo |  |  | Редактирование не рвёт задачи |
+| 2.5 | in_progress |  |  | Редактирование не рвёт задачи |
 | 2.6 | todo |  |  | Удаление с активными задачами |
 | 3.1 | done | #2 merge 3.1 | 2026-06-30 | ADR топиков Redpanda (+hotfix флака platform-теста) |
 | 3.2 | done | #2 merge 3.2 | 2026-06-30 | Producer/Consumer (franz-go) |
