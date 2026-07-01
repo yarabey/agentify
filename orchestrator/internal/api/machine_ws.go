@@ -79,6 +79,19 @@ package api
 // клиентскому заголовку напрямую небезопасно — он тривиально подделывается.
 // Сознательное ограничение MVP, не баг; ip_hint в любом случае
 // необязательная проверка (см. выше), основной механизм — HMAC от UUID.
+//
+// Совместимость версий (тикет 4.7, FR C5, ADR 0003 "machine-ws protocol
+// version compat"): authenticateMachineHello сравнивает env.ProtocolVersion
+// (поле конверта hello) с bus.ProtocolVersion СРАЗУ после подтверждения, что
+// первый кадр — hello, и ДО похода в БД за интеграцией (GetIntegrationByUUIDHMAC)
+// — проверка дешёвая и не секретно-чувствительна, в отличие от auth. При
+// несовпадении соединение закрывается ОТДЕЛЬНЫМ кодом wsCloseIncompatibleProtocolVersion
+// (4426) с содержательной причиной (got/want) — в отличие от единого
+// "unauthorized" для auth-провалов (см. выше), это НЕ auth-сигнал, и раскрытие
+// причины не даёт атакующему ничего. Проверяется ТОЛЬКО protocol_version;
+// agent_version (bus.HelloPayload.AgentVersion) сознательно НЕ проверяется —
+// только логируется для диагностики (см. ADR 0003 "Альтернативы": semver/
+// MinAgentVersion — вне объёма этого тикета).
 import (
 	"context"
 	"encoding/hex"
@@ -118,6 +131,23 @@ const wsCloseUnauthorized websocket.StatusCode = 4401
 // принципиально другая (не провал аутентификации — обе стороны конфликта
 // предъявили одинаково валидный секрет).
 const wsCloseSuperseded websocket.StatusCode = 4409
+
+// wsCloseIncompatibleProtocolVersion — close-код, которым
+// authenticateMachineHello закрывает соединение, когда protocol_version
+// присланного hello-конверта не совпадает с bus.ProtocolVersion (тикет 4.7,
+// FR C5, ADR 0003 "machine-ws protocol version compat", docs/protocol.md §7:
+// "На hello оркестратор сверяет protocol_version; несовместимые —
+// отклоняет"). Приватный диапазон 4000-4999 (RFC 6455 §7.4.2), как и у
+// wsCloseUnauthorized/wsCloseSuperseded; 4426 — мнемоника к HTTP 426 Upgrade
+// Required (клиенту с несовместимым протоколом нужно "обновиться").
+//
+// В отличие от wsCloseUnauthorized этот код — НЕ сигнал провала
+// аутентификации: проверка protocol_version выполняется ДО похода в БД за
+// интеграцией (см. authenticateMachineHello) и её результат не раскрывает
+// атакующему ничего об UUID/HMAC. Поэтому, в отличие от единого нарочно-
+// обобщённого "unauthorized" (см. godoc файла), здесь уместна и нужна
+// содержательная close-reason (got/want) — см. ADR 0003.
+const wsCloseIncompatibleProtocolVersion websocket.StatusCode = 4426
 
 // machineHelloReadTimeout — сколько GetMachineWs ждёт первый кадр (hello)
 // после успешного WS-апгрейда, прежде чем считать аутентификацию
@@ -398,11 +428,21 @@ func parseAckFrame(data []byte) (string, bool) {
 }
 
 // authenticateMachineHello читает первый WS-кадр и проверяет его как hello
-// (FR B3, B6): UUID находится по HMAC-отпечатку через
-// GetIntegrationByUUIDHMAC, затем (если у найденной интеграции непустой
+// (FR B3, B6): сначала — совместимость protocol_version (тикет 4.7, ADR 0003,
+// см. godoc файла), ДО обращения к БД; затем UUID находится по HMAC-отпечатку
+// через GetIntegrationByUUIDHMAC, затем (если у найденной интеграции непустой
 // ip_hint) сверяется IP TCP-пира. При успехе возвращает (integration_id,
-// true); при отказе по любой причине — (uuid.Nil, false) (см. godoc файла
-// про единый внешний сигнал).
+// true); при отказе по любой причине — (uuid.Nil, false).
+//
+// ВАЖНО: при отказе по несовместимому protocol_version эта функция САМА
+// закрывает conn кодом wsCloseIncompatibleProtocolVersion (содержательная
+// причина, см. ниже) перед возвратом false — в отличие от остальных веток
+// отказа здесь, которые лишь логируют причину и возвращают false, оставляя
+// закрытие соединения кодом wsCloseUnauthorized вызывающему (GetMachineWs, см.
+// godoc файла про единый внешний сигнал auth-провалов). Повторный вызов
+// conn.Close вызывающим для этой ветки безопасен и no-op (coder/websocket
+// идемпотентен: первый Close фиксирует код/reason, последующие возвращают
+// net.ErrClosed, который вызывающий уже игнорирует через `_ = conn.Close(...)`).
 func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn) (uuid.UUID, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), machineHelloReadTimeout)
 	defer cancel()
@@ -420,6 +460,22 @@ func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn)
 	}
 	if env.Type != bus.MessageTypeHello {
 		s.logMachineAuthRejected("первый кадр не hello", "type", env.Type)
+		return uuid.Nil, false
+	}
+
+	// Совместимость версий (тикет 4.7, FR C5, ADR 0003): сверяем
+	// protocol_version ДО похода в БД за интеграцией (GetIntegrationByUUIDHMAC
+	// ниже) — проверка дешёвая (уже распарсенное строковое поле конверта) и не
+	// секретно-чувствительна (в отличие от результатов auth), поэтому и
+	// закрывается ОТДЕЛЬНЫМ содержательным close-кодом/reason, а не единым
+	// wsCloseUnauthorized (см. godoc wsCloseIncompatibleProtocolVersion). Точное
+	// строковое сравнение — semver/диапазонная совместимость не входит в объём
+	// этого тикета (см. ADR 0003, "Альтернативы"): agent_version НЕ проверяется
+	// здесь и нигде далее, только логируется для диагностики (см. ниже).
+	if env.ProtocolVersion != bus.ProtocolVersion {
+		reason := fmt.Sprintf("incompatible protocol_version: got %q, want %q", env.ProtocolVersion, bus.ProtocolVersion)
+		s.logMachineAuthRejected("несовместимый protocol_version", "got", env.ProtocolVersion, "want", bus.ProtocolVersion)
+		_ = conn.Close(wsCloseIncompatibleProtocolVersion, reason)
 		return uuid.Nil, false
 	}
 
@@ -454,6 +510,15 @@ func (s *Server) authenticateMachineHello(r *http.Request, conn *websocket.Conn)
 	if !machineIPHintMatches(integration.IpHint, r) {
 		s.logMachineAuthRejected("ip_hint не совпал", "integration_id", integration.ID.String())
 		return uuid.Nil, false
+	}
+
+	if s.logger != nil {
+		// agent_version логируется ТОЛЬКО для диагностики (тикет 4.7, ADR 0003)
+		// — в отличие от protocol_version выше, это поле НЕ проверяется и не
+		// может стать причиной отказа (нет механизма MinAgentVersion, см. ADR).
+		s.logger.Info("WS-аутентификация машины успешна",
+			slog.String("integration_id", integration.ID.String()),
+			slog.String("agent_version", payload.AgentVersion))
 	}
 
 	return uuid.UUID(integration.ID.Bytes), true
