@@ -54,10 +54,10 @@ package api
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
 // "unauthorized". При успехе соединение остаётся открытым; read-loop
-// (тикеты 3.4/3.6/5.4/6.1) разбирает каждый дальнейший кадр (см.
+// (тикеты 3.4/3.6/5.4/5.8/6.1) разбирает каждый дальнейший кадр (см.
 // handleMachineFrame/parseAckFrame/handleMachineEvent/handleAgentQuestion/
-// handleTaskAccepted) и активно обрабатывает четыре типа: type==ack —
-// пересылается зарегистрированному s.ackSink (мосту оркестратора
+// handleTaskAccepted/handleAgentError) и активно обрабатывает пять типов:
+// type==ack — пересылается зарегистрированному s.ackSink (мосту оркестратора
 // machine.commands → WS, commit-after-ACK, protocol.md §5, см. godoc AckSink
 // в server.go); type==heartbeat — публикуется через зарегистрированный
 // s.eventSink (presence-подсистема, FR B4, protocol.md §6, см. godoc
@@ -68,8 +68,10 @@ package api
 // Redpanda-потребителя, тот же приём, что и у PostTasks/тикет 5.3), см.
 // handleAgentQuestion; type==task_accepted (FR E1, тикет 5.4) — переводит
 // задачу queued→running через taskTransitioner.Transition, см.
-// handleTaskAccepted. Любой другой тип кадра
-// (command_approval_request/... — тикеты 5.x) и любой нераспознанный/битый
+// handleTaskAccepted; type==error (FR E1, тикет 5.8) — переводит задачу
+// running→failed через taskTransitioner.TransitionWithEvent, см.
+// handleAgentError. Любой другой тип кадра
+// (command_approval_request/... — тикеты 5.x/6.x) и любой нераспознанный/битый
 // кадр МОЛЧА игнорируются — ни паники, ни закрытия соединения (нужно и чтобы
 // коннект не выглядел повисшим, и чтобы control-фреймы coder/websocket
 // обрабатывались штатно — см. godoc websocket.Conn "You must always read
@@ -204,11 +206,12 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	// (s.ackSink), heartbeat публикуется presence-подсистеме (s.eventSink, см.
 	// handleMachineEvent), agent_question переводит задачу в waiting_user (см.
 	// handleAgentQuestion), task_accepted переводит задачу в running (см.
-	// handleTaskAccepted); любой иной тип кадра (а также нераспознанный/битый
-	// JSON) МОЛЧА игнорируется — обработка прочих типов
-	// (command_approval_request/... — тикеты 5.x) вне объёма этого тикета, но
-	// получение такого кадра не должно ронять или закрывать соединение (см.
-	// godoc файла).
+	// handleTaskAccepted), error переводит задачу в failed (FR E1, тикет
+	// 5.8, см. handleAgentError); любой иной тип кадра (а также
+	// нераспознанный/битый JSON) МОЛЧА игнорируется — обработка прочих типов
+	// (command_approval_request/... — тикеты 5.x/6.x) вне объёма этого
+	// тикета, но получение такого кадра не должно ронять или закрывать
+	// соединение (см. godoc файла).
 	for {
 		_, data, err := conn.Read(r.Context())
 		if err != nil {
@@ -229,11 +232,14 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 //     см. handleAgentQuestion;
 //   - type==task_accepted — агент принял задачу (FR E1, тикет 5.4), см.
 //     handleTaskAccepted;
+//   - type==error — ошибка агента/машины (FR E1, тикет 5.8), см.
+//     handleAgentError;
 //   - любой другой тип, а также нераспознанный/битый кадр — безопасно
 //     игнорируется, без побочных эффектов (ни паники, ни закрытия
 //     соединения): обработка прочих типов кадров
-//     (command_approval_request/... — тикеты 5.x) не должна
-//     блокироваться/ломаться из-за их временного отсутствия здесь.
+//     (command_approval_request/agent_progress/agent_completed/user_decision/... —
+//     тикеты 5.x/6.x) не должна блокироваться/ломаться из-за их временного
+//     отсутствия здесь.
 func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
 	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -263,6 +269,8 @@ func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, i
 		s.handleAgentQuestion(ctx, conn, integrationID, env)
 	case bus.MessageTypeTaskAccepted:
 		s.handleTaskAccepted(ctx, conn, integrationID, env)
+	case bus.MessageTypeError:
+		s.handleAgentError(ctx, conn, integrationID, env)
 	default:
 		// Прочие типы событий (тикеты 3.5/5.x) — вне объёма, молча игнорируем.
 	}
@@ -375,6 +383,82 @@ func (s *Server) handleAgentQuestion(ctx context.Context, conn *websocket.Conn, 
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_question")
+}
+
+// handleAgentError обрабатывает кадр error (тикет 5.8, FR E1, protocol.md
+// §4 «Агент → оркестратор»): переводит связанную задачу running→failed,
+// атомарно записывая событие error в task_events
+// (task.Transitioner.TransitionWithEvent — единственная точка смены
+// tasks.status, тикет 5.2), и, при успехе, отвечает агенту ack-кадром — тот
+// же at-least-once принцип, что и у handleAgentQuestion: провал любого шага
+// (невалидный payload/task_id, задача не найдена или принадлежит другой
+// интеграции, недопустимый переход FSM, transitioner не настроен) молча
+// пропускает ack — агент должен повторить попытку сам (durable outbox на
+// стороне агента, тикет 3.5), соединение при этом не закрывается и не
+// паникует (см. godoc файла).
+//
+// Обработка СИНХРОННАЯ, без отдельного Redpanda-потребителя — тот же приём,
+// что и у остальных обработчиков кадров машины (handleAgentQuestion,
+// handleTaskAccepted).
+//
+// Задача ищется owner-scoped по integration_id (GetTaskByIDAndIntegration, НЕ
+// по user_id — на этом пути аутентифицирована машина, а не пользователь), что
+// не даёт одной машине завершить чужую задачу подделанным task_id в
+// конверте.
+//
+// eventPayload, записываемый в task_events, — это RAW env.Payload конверта
+// (уже провалидированный как bus.ErrorPayload здесь), а не повторно
+// сериализованная структура — тот же приём, что и в handleAgentQuestion.
+//
+// Валидация payload: Message обязателен (пустое значение — невалидный
+// error-кадр, аналогично QuestionID у agent_question); Code может быть
+// пустым — протокол (protocol.md §4) не делает его обязательным.
+func (s *Server) handleAgentError(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	if env.TaskID == nil || *env.TaskID == "" {
+		s.logError("handleAgentError", errors.New("конверт error без task_id"))
+		return
+	}
+	taskUUID, err := uuid.Parse(*env.TaskID)
+	if err != nil {
+		s.logError("handleAgentError: разобрать task_id", err)
+		return
+	}
+
+	var payload bus.ErrorPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		s.logError("handleAgentError: разобрать payload", err)
+		return
+	}
+	if payload.Message == "" {
+		s.logError("handleAgentError", errors.New("payload error без message"))
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+		ID:            taskID,
+		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.logError("handleAgentError", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
+			return
+		}
+		s.logError("GetTaskByIDAndIntegration", err)
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("handleAgentError", errors.New("transitioner не настроен"))
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerAgentError, "error", pgtype.UUID{}, env.Payload); err != nil {
+		s.logError("TransitionWithEvent(error)", err)
+		return
+	}
+
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "error")
 }
 
 // handleTaskAccepted обрабатывает кадр task_accepted (FR E1, тикет 5.4,
