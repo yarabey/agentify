@@ -989,3 +989,202 @@ func TestHandleFrame_TaskAssigned_NoHandlerConfigured_NoAckNoPanic(t *testing.T)
 		t.Fatal("Run должен был вернуть ошибку отмены ctx, получен nil")
 	}
 }
+
+// fakeCommandDecisionHandler — подменный Config.OnCommandDecision для тестов
+// (тикет 6.5): запоминает все полученные конверты и возвращает
+// настраиваемую ошибку (err), имитируя провал применения решения (нет
+// активной задачи/невалидный payload/неизвестный request_id — см. годок
+// Config.OnCommandDecision). Зеркало fakeTaskAssignedHandler.
+type fakeCommandDecisionHandler struct {
+	err error
+
+	mu       sync.Mutex
+	received []bus.Envelope
+}
+
+func (h *fakeCommandDecisionHandler) handle(_ context.Context, env bus.Envelope) error {
+	h.mu.Lock()
+	h.received = append(h.received, env)
+	h.mu.Unlock()
+	return h.err
+}
+
+func (h *fakeCommandDecisionHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.received)
+}
+
+// commandDecisionEnvelope собирает валидный конверт type==command_decision
+// (protocol.md §4, тикет 6.5) с заданными message_id/task_id/request_id/decision.
+func commandDecisionEnvelope(t *testing.T, messageID, integrationID, taskID, requestID, decision string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.CommandDecisionPayload{RequestID: requestID, Decision: decision})
+	if err != nil {
+		t.Fatalf("marshal CommandDecisionPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   integrationID,
+		Type:            bus.MessageTypeCommandDecision,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// TestHandleFrame_CommandDecision_HappyPath_SendsAck — command_decision с
+// настроенным OnCommandDecision, вернувшим nil, → клиент вызывает колбэк и
+// немедленно отвечает ack с правильным ack_message_id (тикет 6.5, FR F3).
+func TestHandleFrame_CommandDecision_HappyPath_SendsAck(t *testing.T) {
+	srv := newFakeServer(t, false /* держим соединение живым */)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeCommandDecisionHandler{}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnCommandDecision: handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	taskID := uuid.NewString()
+	env := commandDecisionEnvelope(t, messageID, integrationUUID, taskID, "req-1", "reject")
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if !waitForAck(t, srv, messageID, 3*time.Second) {
+		t.Fatal("сервер не получил ack на command_decision, хотя OnCommandDecision вернул nil")
+	}
+	if handler.count() != 1 {
+		t.Fatalf("OnCommandDecision вызван %d раз(а), ожидался 1", handler.count())
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_CommandDecision_HandlerError_NoAck — OnCommandDecision
+// вернул ошибку (решение не удалось применить) → клиент НЕ отправляет ack
+// (агент получит редоставку того же решения от моста, тикет 6.5).
+func TestHandleFrame_CommandDecision_HandlerError_NoAck(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeCommandDecisionHandler{err: errors.New("нет активной задачи для command_decision")}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnCommandDecision: handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := commandDecisionEnvelope(t, messageID, integrationUUID, uuid.NewString(), "req-2", "approve")
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	// handler.count()==1 подтверждает, что колбэк реально был вызван (не
+	// просто гонка "сервер ещё не отправил кадр") — только после этого имеет
+	// смысл проверять отсутствие ack.
+	deadline := time.Now().Add(2 * time.Second)
+	for handler.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if handler.count() != 1 {
+		t.Fatal("OnCommandDecision не был вызван за отведённое время")
+	}
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnCommandDecision вернул ошибку")
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_CommandDecision_NoHandlerConfigured_NoAckNoPanic —
+// OnCommandDecision не настроен (nil, значение по умолчанию Config) →
+// command_decision молча игнорируется: ack не отправляется, клиент не
+// паникует и продолжает работать (тикет 6.5).
+func TestHandleFrame_CommandDecision_NoHandlerConfigured_NoAckNoPanic(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		// OnCommandDecision намеренно не задан.
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := commandDecisionEnvelope(t, messageID, integrationUUID, uuid.NewString(), "req-3", "reject")
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnCommandDecision не настроен")
+	}
+
+	cancel()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run должен был вернуть ошибку отмены ctx, получен nil")
+	}
+}
