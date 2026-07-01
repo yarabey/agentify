@@ -106,7 +106,10 @@ func TestTaskAcceptor_OnTaskAssigned_HappyPath_StartsRunnerAndSendsTaskAccepted(
 	defer func() { newProvider = orig }()
 
 	sender := &fakeEventSender{}
-	acceptor := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
 	acceptor.sender = sender
 
 	env := taskAssignedEnvelope(t, "11111111-1111-1111-1111-111111111111", "сделай что-нибудь")
@@ -145,7 +148,10 @@ func TestTaskAcceptor_OnTaskAssigned_DuplicateTaskID_DoesNotStartSecondRun(t *te
 	defer func() { newProvider = orig }()
 
 	sender := &fakeEventSender{}
-	acceptor := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
 	acceptor.sender = sender
 
 	env := taskAssignedEnvelope(t, "22222222-2222-2222-2222-222222222222", "долгая задача")
@@ -188,11 +194,14 @@ func TestTaskAcceptor_OnTaskAssigned_NoProviderConfigured_ReturnsError(t *testin
 	// Providers/ClaudeCodeAPIKey намеренно не заданы.
 
 	sender := &fakeEventSender{}
-	acceptor := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	acceptor, err := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
 	acceptor.sender = sender
 
 	env := taskAssignedEnvelope(t, "33333333-3333-3333-3333-333333333333", "задача без провайдера")
-	err := acceptor.onTaskAssigned(context.Background(), env)
+	err = acceptor.onTaskAssigned(context.Background(), env)
 	if !errors.Is(err, errNoProvider) {
 		t.Fatalf("onTaskAssigned вернул %v, ожидался errNoProvider", err)
 	}
@@ -206,7 +215,10 @@ func TestTaskAcceptor_OnTaskAssigned_NoProviderConfigured_ReturnsError(t *testin
 // паники и без отправки task_accepted.
 func TestTaskAcceptor_OnTaskAssigned_MissingTaskID_ReturnsError(t *testing.T) {
 	sender := &fakeEventSender{}
-	acceptor := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
 	acceptor.sender = sender
 
 	env := taskAssignedEnvelope(t, "not-used", "текст")
@@ -224,7 +236,10 @@ func TestTaskAcceptor_OnTaskAssigned_MissingTaskID_ReturnsError(t *testing.T) {
 // который не разбирается как bus.TaskAssignedPayload, — ошибка без ack.
 func TestTaskAcceptor_OnTaskAssigned_InvalidPayload_ReturnsError(t *testing.T) {
 	sender := &fakeEventSender{}
-	acceptor := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	acceptor, err := newTaskAcceptor(configuredCfg(), fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
 	acceptor.sender = sender
 
 	env := taskAssignedEnvelope(t, "55555555-5555-5555-5555-555555555555", "неважно")
@@ -235,5 +250,58 @@ func TestTaskAcceptor_OnTaskAssigned_InvalidPayload_ReturnsError(t *testing.T) {
 	}
 	if sender.count() != 0 {
 		t.Fatalf("SendEvent вызван %d раз(а), ожидалось 0", sender.count())
+	}
+}
+
+// TestBuildRunner_PassesConfiguredAllowChecker — тикет 6.3: buildRunner
+// передаёт в claudecode.Config именно тот AllowChecker, что построен
+// newTaskAcceptor из cfg.AllowlistPatterns (AGENT_ALLOWLIST_PATTERNS), а не
+// nil/EmptyAllowChecker.
+func TestBuildRunner_PassesConfiguredAllowChecker(t *testing.T) {
+	var capturedCfg claudecode.Config
+	orig := newProvider
+	newProvider = func(cfg claudecode.Config) (taskRunner, error) {
+		capturedCfg = cfg
+		return &fakeRunner{}, nil
+	}
+	defer func() { newProvider = orig }()
+
+	cfg := configuredCfg()
+	cfg.AllowlistPatterns = []string{"Bash(git *)"}
+
+	acceptor, err := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	if _, err := acceptor.buildRunner("some-task-id"); err != nil {
+		t.Fatalf("buildRunner вернул ошибку: %v", err)
+	}
+
+	if capturedCfg.AllowChecker == nil {
+		t.Fatal("claudecode.Config.AllowChecker == nil, ожидался сконфигурированный PatternAllowChecker")
+	}
+	if !capturedCfg.AllowChecker.Allowed("Bash", "git status") {
+		t.Fatal(`AllowChecker.Allowed("Bash", "git status") = false, ожидался true`)
+	}
+	if capturedCfg.AllowChecker.Allowed("Bash", "rm -rf /") {
+		t.Fatal(`AllowChecker.Allowed("Bash", "rm -rf /") = true, ожидался false`)
+	}
+}
+
+// TestNewTaskAcceptor_InvalidAllowlistPattern_ReturnsError — невалидный
+// паттерн в AGENT_ALLOWLIST_PATTERNS должен фейлить конструктор
+// newTaskAcceptor целиком (см. годок newTaskAcceptor), а не молча
+// игнорироваться.
+func TestNewTaskAcceptor_InvalidAllowlistPattern_ReturnsError(t *testing.T) {
+	cfg := configuredCfg()
+	cfg.AllowlistPatterns = []string{"invalid"}
+
+	acceptor, err := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	if err == nil {
+		t.Fatal("newTaskAcceptor вернул nil при невалидном паттерне allowlist, ожидалась ошибка")
+	}
+	if acceptor != nil {
+		t.Fatal("newTaskAcceptor вернул не-nil acceptor при ошибке")
 	}
 }

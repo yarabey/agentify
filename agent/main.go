@@ -112,6 +112,15 @@ type config struct {
 	// ClaudeCodeAPIKey — креды провайдера Claude Code (тикет 4.5), аналогично
 	// ClaudeAPIKey. Переменная AGENT_CLAUDE_CODE_API_KEY.
 	ClaudeCodeAPIKey string `env:"CLAUDE_CODE_API_KEY"`
+
+	// AllowlistPatterns — список паттернов allowlist инструментов CLI вида
+	// "ToolName(glob)" (тикет 6.3, FR F3, claudecode.PatternAllowChecker),
+	// разделённых ";" (не запятой — glob-шаблон внутри может содержать
+	// запятую). Переменная AGENT_ALLOWLIST_PATTERNS. Пустой список (дефолт) —
+	// ни одна команда не выполняется без согласования пользователя,
+	// санкционировано docs/MANUAL_STEPS.md, строка 33 ("можно начать с
+	// пустого").
+	AllowlistPatterns []string `env:"ALLOWLIST_PATTERNS" envSeparator:";"`
 }
 
 func main() {
@@ -211,7 +220,10 @@ func run() error {
 		// отправки task_accepted нужен уже готовый wsClient: разрыв цикла через
 		// отложенное присвоение поля (acceptor.onTaskAssigned как метод указателя
 		// захватывает *taskAcceptor, а не текущее значение sender).
-		acceptor := newTaskAcceptor(cfg, store, svc.Logger())
+		acceptor, err := newTaskAcceptor(cfg, store, svc.Logger())
+		if err != nil {
+			return err
+		}
 
 		wsClient, err := wsclient.New(wsclient.Config{
 			OrchestratorWSURL: cfg.OrchestratorWSURL,
