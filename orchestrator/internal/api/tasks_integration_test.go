@@ -20,6 +20,13 @@
 //     количество task_events не растёт от повтора;
 //   - разные Idempotency-Key той же интеграции → две разные задачи (дедуп не
 //     блокирует легитимные повторные постановки).
+//
+// Также покрывает состав истории — GET /tasks, GET /tasks/{id},
+// GET /tasks/{id}/events (тикет 8.6, FR H1, Gherkin §10 «Состав записи о
+// задаче»): полный цикл FSM → все поля Task/TaskEvent присутствуют; чужая и
+// несуществующая задача → 404 одинаково для карточки и журнала; фильтрация
+// GetTasks по integration_id/status. Эти тесты не поднимают Redpanda — сами
+// хендлеры GetTasks/GetTasksId/GetTasksIdEvents читают только БД.
 package api_test
 
 import (
@@ -670,4 +677,376 @@ func TestIntegration_PostTasks_DifferentIdempotencyKeysCreateDistinctTasks(t *te
 		t.Fatalf("разные Idempotency-Key дали одну и ту же задачу %s — дедуп не должен блокировать разные постановки", *firstTask.Id)
 	}
 	t.Logf("OK: разные Idempotency-Key → две разные задачи (%s, %s)", *firstTask.Id, *secondTask.Id)
+}
+
+// TestIntegration_GetTasks_FullCycleAllFieldsPresent — приёмка тикета 8.6 (FR
+// H1, Gherkin §10 «Состав записи о задаче»), буквальное требование теста
+// «full cycle → all fields present»: задача проводится через полный цикл FSM
+// (created→queued→running→waiting_user→running→awaiting_confirm→completed) с
+// одним вопросом/ответом и агентским завершением напрямую через Transitioner
+// (в обход HTTP — это только подготовка истории, не предмет проверки), а
+// затем ЧЕРЕЗ РЕАЛЬНЫЕ HTTP-хендлеры GetTasks/GetTasksId/GetTasksIdEvents
+// проверяется, что все поля контракта Task/TaskEvent присутствуют и
+// корректны (Redpanda для этого не нужна — сами хендлеры читают только БД).
+func TestIntegration_GetTasks_FullCycleAllFieldsPresent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-history")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-history")
+
+	idempotencyKey := "history-key-1"
+	const text = "собери отчёт"
+	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integration.ID,
+		TextEnc:        []byte(text),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	taskID := taskRow.ID
+
+	tr := task.NewTransitioner(pool)
+
+	// created → queued → running.
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, terr := tr.Transition(ctx, taskID, trigger); terr != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, terr)
+		}
+	}
+
+	// running → waiting_user: агент задаёт вопрос.
+	questionID := uuid.New()
+	questionPayload, merr := json.Marshal(bus.AgentQuestionPayload{QuestionID: questionID.String(), Text: "продолжать?"})
+	if merr != nil {
+		t.Fatalf("marshal AgentQuestionPayload: %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion, "agent_question", pgtype.UUID{}, questionPayload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(agent_question): %v", terr)
+	}
+	questionEventID := findAgentQuestionEventID(ctx, t, q, taskID, questionID)
+
+	// waiting_user → running: пользователь отвечает.
+	const answerText = "да, продолжай"
+	answerPayload, merr := json.Marshal(bus.UserAnswerPayload{QuestionID: questionID.String(), Text: answerText})
+	if merr != nil {
+		t.Fatalf("marshal UserAnswerPayload: %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerUserAnswered, "user_answer", questionEventID, answerPayload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(user_answer): %v", terr)
+	}
+
+	// running → awaiting_confirm: агент сообщает о завершении.
+	const summaryText = "отчёт собран"
+	completedPayload, merr := json.Marshal(bus.AgentCompletedPayload{Summary: summaryText})
+	if merr != nil {
+		t.Fatalf("marshal AgentCompletedPayload: %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentCompleted, "agent_completed", pgtype.UUID{}, completedPayload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(agent_completed): %v", terr)
+	}
+
+	// awaiting_confirm → completed: пользователь подтверждает.
+	if _, _, terr := tr.Transition(ctx, taskID, task.TriggerUserConfirmed); terr != nil {
+		t.Fatalf("подготовка: Transition(user_confirmed): %v", terr)
+	}
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	router := api.NewRouter(server)
+
+	taskUUID := uuid.UUID(taskID.Bytes)
+	integrationUUID := uuid.UUID(integration.ID.Bytes)
+
+	// --- GET /tasks/{id}: карточка задачи, все поля Task присутствуют. ---
+	recCard := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskUUID.String(), token, nil)
+	if recCard.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id}: статус = %d (%s), ожидался 200", recCard.Code, recCard.Body.String())
+	}
+	var card api.Task
+	if uerr := json.Unmarshal(recCard.Body.Bytes(), &card); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id}: %v", uerr)
+	}
+	if card.Id == nil || *card.Id != taskUUID {
+		t.Fatalf("Task.Id = %v, ожидался %s", card.Id, taskUUID)
+	}
+	if card.IntegrationId == nil || *card.IntegrationId != integrationUUID {
+		t.Fatalf("Task.IntegrationId = %v, ожидался %s", card.IntegrationId, integrationUUID)
+	}
+	if card.Text == nil || *card.Text != text {
+		t.Fatalf("Task.Text = %v, ожидался %q", card.Text, text)
+	}
+	if card.Status == nil || *card.Status != api.Completed {
+		t.Fatalf("Task.Status = %v, ожидался completed", card.Status)
+	}
+	if card.CreatedAt == nil || card.CreatedAt.IsZero() {
+		t.Fatal("Task.CreatedAt пуст")
+	}
+	if card.UpdatedAt == nil || card.UpdatedAt.IsZero() {
+		t.Fatal("Task.UpdatedAt пуст")
+	}
+	if card.UpdatedAt.Before(*card.CreatedAt) {
+		t.Fatalf("Task.UpdatedAt (%v) раньше Task.CreatedAt (%v)", card.UpdatedAt, card.CreatedAt)
+	}
+	t.Logf("OK: GET /tasks/{id} — все поля Task присутствуют и корректны")
+
+	// --- GET /tasks: список содержит эту задачу с теми же полями. ---
+	recList := doIntegrationsRequest(t, router, http.MethodGet, "/tasks", token, nil)
+	if recList.Code != http.StatusOK {
+		t.Fatalf("GET /tasks: статус = %d (%s), ожидался 200", recList.Code, recList.Body.String())
+	}
+	var list []api.Task
+	if uerr := json.Unmarshal(recList.Body.Bytes(), &list); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks: %v", uerr)
+	}
+	var found *api.Task
+	for i := range list {
+		if list[i].Id != nil && *list[i].Id == taskUUID {
+			found = &list[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("задача %s не найдена в GET /tasks (получено %d задач)", taskUUID, len(list))
+	}
+	if found.Status == nil || *found.Status != api.Completed {
+		t.Fatalf("в списке Task.Status = %v, ожидался completed", found.Status)
+	}
+	t.Logf("OK: GET /tasks содержит задачу с корректным статусом")
+
+	// --- GET /tasks/{id}/events: полный журнал, по порядку seq, все поля. ---
+	recEvents := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskUUID.String()+"/events", token, nil)
+	if recEvents.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id}/events: статус = %d (%s), ожидался 200", recEvents.Code, recEvents.Body.String())
+	}
+	var events []api.TaskEvent
+	if uerr := json.Unmarshal(recEvents.Body.Bytes(), &events); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id}/events: %v", uerr)
+	}
+	// Ожидаемая последовательность типов (см. transition.go: transition
+	// пишет доп. событие ПЕРЕД status_change для каждого перехода, которому
+	// оно передано):
+	//   enqueued        → status_change
+	//   task_accepted   → status_change
+	//   agent_question  → agent_question, status_change
+	//   user_answered   → user_answer, status_change
+	//   agent_completed → agent_completed, status_change
+	//   user_confirmed  → status_change
+	wantTypes := []api.TaskEventType{
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeAgentQuestion,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeUserAnswer,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeAgentCompleted,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeStatusChange,
+	}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("количество событий = %d, ожидалось %d: %+v", len(events), len(wantTypes), events)
+	}
+	var lastSeq int
+	var questionEvent, answerEvent, completedEvent *api.TaskEvent
+	for i, e := range events {
+		if e.Id == nil {
+			t.Fatalf("событие #%d: Id пуст", i)
+		}
+		if e.Seq == nil {
+			t.Fatalf("событие #%d: Seq пуст", i)
+		}
+		if *e.Seq <= lastSeq {
+			t.Fatalf("событие #%d: seq = %d, не возрастает относительно предыдущего %d — журнал не по порядку", i, *e.Seq, lastSeq)
+		}
+		lastSeq = *e.Seq
+		if e.Type == nil {
+			t.Fatalf("событие #%d: Type пуст", i)
+		}
+		if *e.Type != wantTypes[i] {
+			t.Fatalf("событие #%d: Type = %q, ожидался %q", i, *e.Type, wantTypes[i])
+		}
+		if e.CreatedAt == nil || e.CreatedAt.IsZero() {
+			t.Fatalf("событие #%d: CreatedAt пуст", i)
+		}
+		if e.Payload == nil {
+			t.Fatalf("событие #%d (%s): Payload пуст, ожидался непустой JSON", i, *e.Type)
+		}
+		switch *e.Type {
+		case api.TaskEventTypeAgentQuestion:
+			questionEvent = &events[i]
+		case api.TaskEventTypeUserAnswer:
+			answerEvent = &events[i]
+		case api.TaskEventTypeAgentCompleted:
+			completedEvent = &events[i]
+		}
+	}
+	if questionEvent == nil || answerEvent == nil || completedEvent == nil {
+		t.Fatal("не найдены все ожидаемые бизнес-события (agent_question/user_answer/agent_completed) в журнале")
+	}
+	if got := (*questionEvent.Payload)["question_id"]; got != questionID.String() {
+		t.Fatalf("payload agent_question.question_id = %v, ожидался %s", got, questionID)
+	}
+	if got := (*answerEvent.Payload)["question_id"]; got != questionID.String() {
+		t.Fatalf("payload user_answer.question_id = %v, ожидался %s", got, questionID)
+	}
+	if got := (*answerEvent.Payload)["text"]; got != answerText {
+		t.Fatalf("payload user_answer.text = %v, ожидался %q", got, answerText)
+	}
+	if got := (*completedEvent.Payload)["summary"]; got != summaryText {
+		t.Fatalf("payload agent_completed.summary = %v, ожидался %q", got, summaryText)
+	}
+	t.Logf("OK: GET /tasks/{id}/events — %d событий по порядку seq, все поля присутствуют, ключевые payload корректны", len(events))
+}
+
+// TestIntegration_GetTasksId_ForeignAndNonexistentNotFound — 404 (не 403, не
+// утечка существования — FR A4, I3, единый ответ «не найдено» для GetTasksId
+// и GetTasksIdEvents, тикет 8.6): чужая задача и заведомо несуществующий id
+// ведут себя одинаково.
+func TestIntegration_GetTasksId_ForeignAndNonexistentNotFound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	alice, _ := createTestUserWithToken(ctx, t, q, "alice-tasks-history-owner")
+	aliceIntegration := createTestIntegration(ctx, t, q, alice.ID, "alice-machine-history-owner")
+	_, bobToken := createTestUserWithToken(ctx, t, q, "bob-tasks-history-other")
+
+	idempotencyKey := "history-owner-key-1"
+	aliceTask, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         alice.ID,
+		IntegrationID:  aliceIntegration.ID,
+		TextEnc:        []byte("задача алисы"),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	router := api.NewRouter(server)
+
+	aliceTaskUUID := uuid.UUID(aliceTask.ID.Bytes)
+	nonexistentUUID := uuid.New()
+
+	cases := []struct {
+		name string
+		id   uuid.UUID
+	}{
+		{"чужая задача", aliceTaskUUID},
+		{"несуществующая задача", nonexistentUUID},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/card", func(t *testing.T) {
+			rec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+tc.id.String(), bobToken, nil)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET /tasks/%s: статус = %d (%s), ожидался 404", tc.id, rec.Code, rec.Body.String())
+			}
+		})
+		t.Run(tc.name+"/events", func(t *testing.T) {
+			rec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+tc.id.String()+"/events", bobToken, nil)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET /tasks/%s/events: статус = %d (%s), ожидался 404", tc.id, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	t.Logf("OK: чужая задача и несуществующий id одинаково дают 404 для GetTasksId/GetTasksIdEvents")
+}
+
+// TestIntegration_GetTasks_FiltersByIntegrationAndStatus — GetTasks
+// фильтрует по integration_id и по status независимо (тикет 8.6, FR H1,
+// контракт GetTasksParams, api/openapi.yaml): две задачи одного пользователя,
+// различающиеся и интеграцией, и статусом.
+func TestIntegration_GetTasks_FiltersByIntegrationAndStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-filters")
+	integrationA := createTestIntegration(ctx, t, q, user.ID, "alice-machine-filters-a")
+	integrationB := createTestIntegration(ctx, t, q, user.ID, "alice-machine-filters-b")
+
+	keyA := "filters-key-a"
+	taskA, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integrationA.ID,
+		TextEnc:        []byte("задача A"),
+		IdempotencyKey: &keyA,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (A): %v", err)
+	}
+	keyB := "filters-key-b"
+	taskB, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integrationB.ID,
+		TextEnc:        []byte("задача B"),
+		IdempotencyKey: &keyB,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (B): %v", err)
+	}
+
+	tr := task.NewTransitioner(pool)
+	if _, _, terr := tr.Transition(ctx, taskB.ID, task.TriggerEnqueued); terr != nil {
+		t.Fatalf("перевести задачу B в queued: %v", terr)
+	}
+	// taskA остаётся в 'created' (без переходов) — статусы гарантированно разные.
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	router := api.NewRouter(server)
+
+	taskAUUID := uuid.UUID(taskA.ID.Bytes)
+	taskBUUID := uuid.UUID(taskB.ID.Bytes)
+	integrationAUUID := uuid.UUID(integrationA.ID.Bytes)
+
+	// Фильтр по integration_id: только задача A.
+	recByIntegration := doIntegrationsRequest(t, router, http.MethodGet, "/tasks?integration_id="+integrationAUUID.String(), token, nil)
+	if recByIntegration.Code != http.StatusOK {
+		t.Fatalf("GET /tasks?integration_id=...: статус = %d (%s), ожидался 200", recByIntegration.Code, recByIntegration.Body.String())
+	}
+	var byIntegration []api.Task
+	if uerr := json.Unmarshal(recByIntegration.Body.Bytes(), &byIntegration); uerr != nil {
+		t.Fatalf("unmarshal: %v", uerr)
+	}
+	if len(byIntegration) != 1 || byIntegration[0].Id == nil || *byIntegration[0].Id != taskAUUID {
+		t.Fatalf("фильтр по integration_id вернул %+v, ожидалась ровно задача A (%s)", byIntegration, taskAUUID)
+	}
+
+	// Фильтр по status: только задача B ('queued').
+	recByStatus := doIntegrationsRequest(t, router, http.MethodGet, "/tasks?status=queued", token, nil)
+	if recByStatus.Code != http.StatusOK {
+		t.Fatalf("GET /tasks?status=queued: статус = %d (%s), ожидался 200", recByStatus.Code, recByStatus.Body.String())
+	}
+	var byStatus []api.Task
+	if uerr := json.Unmarshal(recByStatus.Body.Bytes(), &byStatus); uerr != nil {
+		t.Fatalf("unmarshal: %v", uerr)
+	}
+	if len(byStatus) != 1 || byStatus[0].Id == nil || *byStatus[0].Id != taskBUUID {
+		t.Fatalf("фильтр по status=queued вернул %+v, ожидалась ровно задача B (%s)", byStatus, taskBUUID)
+	}
+
+	// Без фильтров: обе задачи.
+	recAll := doIntegrationsRequest(t, router, http.MethodGet, "/tasks", token, nil)
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("GET /tasks: статус = %d (%s), ожидался 200", recAll.Code, recAll.Body.String())
+	}
+	var all []api.Task
+	if uerr := json.Unmarshal(recAll.Body.Bytes(), &all); uerr != nil {
+		t.Fatalf("unmarshal: %v", uerr)
+	}
+	if len(all) != 2 {
+		t.Fatalf("GET /tasks без фильтров вернул %d задач, ожидалось 2", len(all))
+	}
+	t.Logf("OK: GetTasks фильтрует по integration_id и по status независимо")
 }

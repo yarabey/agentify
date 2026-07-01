@@ -10,7 +10,9 @@ package api
 // подтверждает завершение») и отклонение результата на доработку (тикет 8.3,
 // FR E2, PostTasksIdReject, Gherkin §7 «Пользователь отклоняет результат») и
 // отмена задачи, доходящая до машины (тикет 8.4, FR E6, PostTasksIdCancel,
-// Gherkin §8 «Отмена доходит до машины»).
+// Gherkin §8 «Отмена доходит до машины»), и состав истории — список/карточка
+// задачи и журнал её событий (тикет 8.6, FR H1, GetTasks/GetTasksId/
+// GetTasksIdEvents, Gherkin §10 «Состав записи о задаче»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -24,8 +26,9 @@ package api
 // по integration_id (ADR 0001, PartitionKeyIntegrationID — НЕ task_id, вопреки
 // неточной формулировке текста тикета: machine.commands ВСЕГДА
 // партиционируется по машине, чтобы сохранить порядок команд для неё).
-// GET /tasks* (список/история задачи) — отдельный тикет 8.6, здесь не
-// реализуется (остаётся 501 через Unimplemented). Дедуп постановки по
+// GET /tasks, GET /tasks/{id}, GET /tasks/{id}/events (список/карточка/
+// журнал событий задачи, owner-scoped, тикет 8.6, FR H1) реализованы ниже,
+// см. GetTasks/GetTasksId/GetTasksIdEvents. Дедуп постановки по
 // Idempotency-Key (тикет 5.5, FR E7, §4 «Защита от двойной отправки»):
 // уникальный индекс uq_tasks_idempotency (user_id, idempotency_key) в БД —
 // источник истины, обработчик лишь реагирует на его коллизию (SQLSTATE
@@ -759,6 +762,137 @@ func (s *Server) PostTasksIdCancel(w http.ResponseWriter, r *http.Request, id Id
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// GetTasks реализует GET /tasks — список задач владельца с опциональными
+// фильтрами по интеграции и статусу (тикет 8.6, FR H1, Gherkin §10 «Состав
+// записи о задаче»).
+//
+// Бизнес: только свои задачи (owner-scoped, FR A4, I3, тот же принцип, что и
+// GetIntegrations в integrations.go) — ListTasksByUser (queries/tasks.sql)
+// фильтрует по user_id прямо в SQL. integration_id/status (params) — опциональные
+// query-фильтры контракта (GetTasksParams); если оба не заданы — возвращается
+// вся история задач владельца, самые новые первыми (ORDER BY created_at DESC,
+// см. годок ListTasksByUser). Указание чужой integration_id не даёт увидеть
+// чужие задачи и не является ошибкой — просто пустой список (AND user_id = $1
+// в запросе уже исключает такие строки).
+func (s *Server) GetTasks(w http.ResponseWriter, r *http.Request, params GetTasksParams) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	arg := db.ListTasksByUserParams{
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	}
+	if params.IntegrationId != nil {
+		arg.IntegrationID = pgtype.UUID{Bytes: *params.IntegrationId, Valid: true}
+	}
+	if params.Status != nil {
+		status := string(*params.Status)
+		arg.Status = &status
+	}
+
+	rows, err := s.queries.ListTasksByUser(ctx, arg)
+	if err != nil {
+		s.logError("ListTasksByUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	result := make([]Task, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, toTaskRow(row))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetTasksId реализует GET /tasks/{id} — карточка одной задачи (тикет 8.6,
+// FR H1, Gherkin §10 «Состав записи о задаче»): целевая интеграция, текст,
+// статус, таймстемпы создания/обновления — все поля, которые Gherkin §10
+// требует видеть по конкретной задаче.
+//
+// Владение задачей — owner-scoped прямо в SQL (GetTaskByIDAndUser, FR A4,
+// I3), тот же паттерн 404, что и в PostTasksIdAnswer/PostTasksIdConfirm:
+// чужая/несуществующая задача неотличимы, единый 404.
+func (s *Server) GetTasksId(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     pgtype.UUID{Bytes: id, Valid: true},
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toTaskRow(row))
+}
+
+// GetTasksIdEvents реализует GET /tasks/{id}/events — журнал событий задачи
+// (тикет 8.6, FR H1, Gherkin §10 «Состав записи о задаче»): вопросы агента,
+// ответы пользователя с привязкой к запросу (payload содержит question_id/
+// request_id, на который отвечает событие — см. bus.AgentQuestionPayload,
+// bus.UserAnswerPayload, bus.CommandApprovalRequestPayload,
+// bus.CommandDecisionPayload в internal/bus/messages.go), согласования,
+// смены статуса.
+//
+// Владение задачей проверяется СНАЧАЛА, тем же owner-scoped запросом
+// (GetTaskByIDAndUser), что и в GetTasksId — единый 404 для чужой/
+// несуществующей задачи, — и только затем читается журнал
+// (ListTaskEventsByTask, полная история по seq по возрастанию, см. годок
+// запроса в queries/tasks.sql).
+func (s *Server) GetTasksIdEvents(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: id, Valid: true}
+
+	if _, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	rows, err := s.queries.ListTaskEventsByTask(ctx, taskID)
+	if err != nil {
+		s.logError("ListTaskEventsByTask", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	result := make([]TaskEvent, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, toTaskEvent(row))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 // toTask конвертирует строку БД (уже после Transition) в контрактный Task.
 // status берём из аргумента to (результат Transition), а не row.Status —
 // row получена ДО вызова Transition и содержит ещё 'created'. updated_at
@@ -782,4 +916,56 @@ func toTask(row db.Task, status task.Status) Task {
 		CreatedAt:     &createdAt,
 		UpdatedAt:     &updatedAt,
 	}
+}
+
+// toTaskRow конвертирует строку БД в контрактный Task для read-only путей
+// (GetTasks, GetTasksId, тикет 8.6, FR H1) — в отличие от toTask (используется
+// ТОЛЬКО в write-путях сразу после Transition, где status/updated_at ещё не
+// отражены в уже прочитанной row), здесь Transition в рамках этого запроса не
+// происходил: row уже содержит актуальные status и updated_at, оба берутся
+// прямо из неё.
+func toTaskRow(row db.Task) Task {
+	id := uuid.UUID(row.ID.Bytes)
+	integrationID := uuid.UUID(row.IntegrationID.Bytes)
+	text := string(row.TextEnc)
+	status := TaskStatus(row.Status)
+	createdAt := row.CreatedAt.Time
+	updatedAt := row.UpdatedAt.Time
+
+	return Task{
+		Id:            &id,
+		IntegrationId: &integrationID,
+		Text:          &text,
+		Status:        &status,
+		CreatedAt:     &createdAt,
+		UpdatedAt:     &updatedAt,
+	}
+}
+
+// toTaskEvent конвертирует строку журнала событий в контрактный TaskEvent
+// (тикет 8.6, FR H1, §10 «Состав записи о задаче»). PayloadEnc сейчас хранит
+// открытый JSON (TODO(11.1) — шифрование at-rest, вне объёма); если
+// Unmarshal вдруг не удался (данные должны быть валидным JSON, т.к. пишутся
+// только через json.Marshal в этом же кодовом пути — падение здесь означало
+// бы порчу данных, не штатный случай), Payload остаётся nil, но остальные
+// поля события (id, seq, type, created_at) всё равно возвращаются — история
+// бессрочна (FR I2) и не должна терять записи целиком из-за одного плохого
+// payload.
+func toTaskEvent(row db.TaskEvent) TaskEvent {
+	id := uuid.UUID(row.ID.Bytes)
+	seq := int(row.Seq)
+	eventType := TaskEventType(row.Type)
+	createdAt := row.CreatedAt.Time
+
+	result := TaskEvent{
+		Id:        &id,
+		Seq:       &seq,
+		Type:      &eventType,
+		CreatedAt: &createdAt,
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(row.PayloadEnc, &payload); err == nil {
+		result.Payload = &payload
+	}
+	return result
 }

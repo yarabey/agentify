@@ -173,3 +173,47 @@ JOIN (
 ) latest ON latest.task_id = tasks.id AND latest.rn = 1
 WHERE tasks.status = 'waiting_user'
   AND latest.created_at < $1::timestamptz;
+
+-- name: ListTasksByUser :many
+-- Список задач владельца — GET /tasks (тикет 8.6, FR H1, Gherkin §10 «Состав
+-- записи о задаче»), owner-scoped прямо в SQL (FR A4, I3), тот же приём, что
+-- у ListIntegrationsByUser (queries/integrations.sql) и GetTaskByIDAndUser
+-- выше: список видит только СВОИ задачи.
+--
+-- integration_id/status — опциональные фильтры контракта (GetTasksParams,
+-- api/openapi.yaml). sqlc.narg(...) — ПЕРВОЕ использование этого паттерна в
+-- проекте (до этого тикета опциональные поля обслуживались на стороне Go, см.
+-- PatchIntegrationsId в integrations.go): годится именно здесь, потому что
+-- это read-only SELECT с чисто SQL-условием «параметр не задан ИЛИ равен
+-- колонке», а не частичный UPDATE с разными наборами полей для записи.
+-- IS NULL проверяет именно то, передан ли фильтр вызывающей стороной (Go
+-- передаёт валидный uuid.UUID/строку статуса только когда соответствующий
+-- параметр запроса не nil, иначе — невалидный/нулевой narg), а не бизнес-
+-- значение самой задачи.
+--
+-- Если integration_id указывает на интеграцию другого пользователя —
+-- отдельной проверки владения интеграцией не требуется: AND user_id = $1 уже
+-- гарантирует 0 строк (чужая задача этому пользователю в принципе не
+-- принадлежит, а своей задачи с чужим integration_id быть не может по
+-- построению CreateTask).
+--
+-- ORDER BY created_at DESC — новые сверху, разумный дефолт для списка
+-- (Gherkin/FR не специфицируют порядок явно).
+SELECT * FROM tasks
+WHERE user_id = $1
+  AND (sqlc.narg('integration_id')::uuid IS NULL OR integration_id = sqlc.narg('integration_id'))
+  AND (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status'))
+ORDER BY created_at DESC;
+
+-- name: ListTaskEventsByTask :many
+-- Полный хронологический журнал событий задачи — GET /tasks/{id}/events
+-- (тикет 8.6, FR H1, Gherkin §10 «Состав записи о задаче»): владение задачей
+-- проверяется ОТДЕЛЬНО вызывающей стороной через GetTaskByIDAndUser ДО этого
+-- запроса (owner-scoped, FR A4, I3), здесь достаточно task_id.
+--
+-- ORDER BY seq ASC (а не DESC, как у ListAgentQuestionEventsByTask/
+-- ListCommandApprovalRequestEventsByTask выше) — те запросы ищут «последнюю
+-- подходящую запись» для сопоставления question_id/request_id, а этот отдаёт
+-- ПОЛНУЮ историю для чтения по порядку событий (первое — раньше), что и
+-- ожидает клиент от «журнала».
+SELECT * FROM task_events WHERE task_id = $1 ORDER BY seq ASC;

@@ -198,24 +198,26 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 // 401 без токена и доходит до обработчика (тут — заглушка Unimplemented,
 // 501) с валидным.
 //
-// Маршрут под тестом — GET /tasks (история задач, FR H1, Gherkin §10; ещё
-// не реализован — GetTasks не переопределён ни в одном обработчике пакета,
-// падает в заглушку Unimplemented). DELETE /integrations/{id} использовался
-// здесь раньше для той же проверки, но с тикета 2.6 реализован
-// (integrations.go, DeleteIntegrationsId) и отвечает 204/409/404, а не 501 —
-// этот тест проверяет общий механизм middleware+Unimplemented на ЛЮБОМ ещё
-// не готовом защищённом маршруте, а не конкретно на /integrations/{id}.
+// Маршрут под тестом — POST /channels/telegram/link-code (привязка
+// Telegram, FR D3; ещё не реализован — PostChannelsTelegramLinkCode не
+// переопределён ни в одном обработчике пакета, падает в заглушку
+// Unimplemented). Раньше здесь использовался DELETE /integrations/{id}
+// (реализован с тикета 2.6), затем GET /tasks (реализован тикетом 8.6,
+// GetTasks в tasks.go, отвечает 200) — оба стали негодны для этой проверки
+// по мере реализации; этот тест проверяет общий механизм
+// middleware+Unimplemented на ЛЮБОМ ещё не готовом защищённом маршруте, а не
+// конкретно на каком-то одном пути.
 func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 
-	noToken := httptest.NewRequest(http.MethodGet, "/tasks", nil)
+	noToken := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
 	noTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(noTokenRec, noToken)
 	if noTokenRec.Code != http.StatusUnauthorized {
 		t.Fatalf("без токена: статус = %d (%s), ожидался 401", noTokenRec.Code, noTokenRec.Body.String())
 	}
 
-	withToken := httptest.NewRequest(http.MethodGet, "/tasks", nil)
+	withToken := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
 	withToken.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	withTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(withTokenRec, withToken)

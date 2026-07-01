@@ -408,6 +408,115 @@ func (q *Queries) ListStaleTasksWithRecoveredMachine(ctx context.Context, lastSe
 	return items, nil
 }
 
+const listTaskEventsByTask = `-- name: ListTaskEventsByTask :many
+SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_events WHERE task_id = $1 ORDER BY seq ASC
+`
+
+// Полный хронологический журнал событий задачи — GET /tasks/{id}/events
+// (тикет 8.6, FR H1, Gherkin §10 «Состав записи о задаче»): владение задачей
+// проверяется ОТДЕЛЬНО вызывающей стороной через GetTaskByIDAndUser ДО этого
+// запроса (owner-scoped, FR A4, I3), здесь достаточно task_id.
+//
+// ORDER BY seq ASC (а не DESC, как у ListAgentQuestionEventsByTask/
+// ListCommandApprovalRequestEventsByTask выше) — те запросы ищут «последнюю
+// подходящую запись» для сопоставления question_id/request_id, а этот отдаёт
+// ПОЛНУЮ историю для чтения по порядку событий (первое — раньше), что и
+// ожидает клиент от «журнала».
+func (q *Queries) ListTaskEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]TaskEvent, error) {
+	rows, err := q.db.Query(ctx, listTaskEventsByTask, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TaskEvent{}
+	for rows.Next() {
+		var i TaskEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.Type,
+			&i.RefEventID,
+			&i.PayloadEnc,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTasksByUser = `-- name: ListTasksByUser :many
+SELECT id, user_id, integration_id, text_enc, status, idempotency_key, created_at, updated_at FROM tasks
+WHERE user_id = $1
+  AND ($2::uuid IS NULL OR integration_id = $2)
+  AND ($3::text IS NULL OR status = $3)
+ORDER BY created_at DESC
+`
+
+type ListTasksByUserParams struct {
+	UserID        pgtype.UUID `json:"user_id"`
+	IntegrationID pgtype.UUID `json:"integration_id"`
+	Status        *string     `json:"status"`
+}
+
+// Список задач владельца — GET /tasks (тикет 8.6, FR H1, Gherkin §10 «Состав
+// записи о задаче»), owner-scoped прямо в SQL (FR A4, I3), тот же приём, что
+// у ListIntegrationsByUser (queries/integrations.sql) и GetTaskByIDAndUser
+// выше: список видит только СВОИ задачи.
+//
+// integration_id/status — опциональные фильтры контракта (GetTasksParams,
+// api/openapi.yaml). sqlc.narg(...) — ПЕРВОЕ использование этого паттерна в
+// проекте (до этого тикета опциональные поля обслуживались на стороне Go, см.
+// PatchIntegrationsId в integrations.go): годится именно здесь, потому что
+// это read-only SELECT с чисто SQL-условием «параметр не задан ИЛИ равен
+// колонке», а не частичный UPDATE с разными наборами полей для записи.
+// IS NULL проверяет именно то, передан ли фильтр вызывающей стороной (Go
+// передаёт валидный uuid.UUID/строку статуса только когда соответствующий
+// параметр запроса не nil, иначе — невалидный/нулевой narg), а не бизнес-
+// значение самой задачи.
+//
+// Если integration_id указывает на интеграцию другого пользователя —
+// отдельной проверки владения интеграцией не требуется: AND user_id = $1 уже
+// гарантирует 0 строк (чужая задача этому пользователю в принципе не
+// принадлежит, а своей задачи с чужим integration_id быть не может по
+// построению CreateTask).
+//
+// ORDER BY created_at DESC — новые сверху, разумный дефолт для списка
+// (Gherkin/FR не специфицируют порядок явно).
+func (q *Queries) ListTasksByUser(ctx context.Context, arg ListTasksByUserParams) ([]Task, error) {
+	rows, err := q.db.Query(ctx, listTasksByUser, arg.UserID, arg.IntegrationID, arg.Status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Task{}
+	for rows.Next() {
+		var i Task
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.IntegrationID,
+			&i.TextEnc,
+			&i.Status,
+			&i.IdempotencyKey,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWaitingUserTasksWithStaleQuestion = `-- name: ListWaitingUserTasksWithStaleQuestion :many
 SELECT tasks.id AS task_id, tasks.user_id AS user_id, latest.id AS question_event_id, latest.created_at AS question_created_at
 FROM tasks

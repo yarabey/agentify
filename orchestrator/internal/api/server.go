@@ -152,6 +152,15 @@ type Querier interface {
 	// (request_id из тела PostTasksIdApprove) с конкретной записью task_events (тикет
 	// 6.4, FR F3, см. PostTasksIdApprove в tasks.go).
 	ListCommandApprovalRequestEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]db.TaskEvent, error)
+	// ListTasksByUser возвращает задачи владельца, owner-scoped прямо в SQL
+	// (FR A4, I3), с опциональными фильтрами integration_id/status (тикет 8.6,
+	// FR H1, Gherkin §10 «Состав записи о задаче», см. GetTasks в tasks.go).
+	ListTasksByUser(ctx context.Context, arg db.ListTasksByUserParams) ([]db.Task, error)
+	// ListTaskEventsByTask возвращает полный хронологический журнал событий
+	// задачи (по seq по возрастанию) — источник для GET /tasks/{id}/events
+	// (тикет 8.6, FR H1, Gherkin §10, см. GetTasksIdEvents в tasks.go).
+	// Владение задачей проверяется отдельно, до вызова этого метода.
+	ListTaskEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]db.TaskEvent, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.

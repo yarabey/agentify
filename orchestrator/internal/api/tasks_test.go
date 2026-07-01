@@ -1918,3 +1918,404 @@ func TestPostTasksIdCancel_HappyPath(t *testing.T) {
 		t.Errorf("env.IntegrationID = %q, ожидался %s", call.env.IntegrationID, integrationID)
 	}
 }
+
+// doGetTasks прогоняет GET /tasks (опционально с query-параметрами
+// integration_id/status) через роутер, собранный поверх переданного
+// fakeQuerier/Querier (тикет 8.6, FR H1).
+func doGetTasks(t *testing.T, q Querier, userID uuid.UUID, query string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(q)
+	router := NewRouter(s)
+
+	url := "/tasks"
+	if query != "" {
+		url += "?" + query
+	}
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestGetTasks_RequiresBearerToken — без Authorization-заголовка auth-
+// middleware отвечает 401, не доходя до GetTasks (тикет 1.4).
+func TestGetTasks_RequiresBearerToken(t *testing.T) {
+	router := NewRouter(newTestServer(fakeQuerier{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasks_ListInternalError — ListTasksByUser вернул неожиданную ошибку
+// → 500.
+func TestGetTasks_ListInternalError(t *testing.T) {
+	rec := doGetTasks(t, fakeQuerier{listTasksByUserErr: context.DeadlineExceeded}, uuid.New(), "")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasks_HappyPath_NoFilters — без query-фильтров возвращается весь
+// список задач владельца (FR H1, Gherkin §10 «Состав записи о задаче»): все
+// поля Task присутствуют в ответе.
+func TestGetTasks_HappyPath_NoFilters(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+	createdAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	updatedAt := time.Now().UTC().Truncate(time.Second)
+
+	rec := doGetTasks(t, fakeQuerier{
+		listTasksByUserResult: []db.Task{
+			{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+				TextEnc:       []byte("сделай что-нибудь"),
+				Status:        string(task.StatusRunning),
+				CreatedAt:     pgtype.Timestamptz{Time: createdAt, Valid: true},
+				UpdatedAt:     pgtype.Timestamptz{Time: updatedAt, Valid: true},
+			},
+		},
+	}, userID, "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	var tasks []Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &tasks); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, ожидался 1", len(tasks))
+	}
+	got := tasks[0]
+	if got.Id == nil || *got.Id != taskID {
+		t.Errorf("id = %v, ожидался %s", got.Id, taskID)
+	}
+	if got.IntegrationId == nil || *got.IntegrationId != integrationID {
+		t.Errorf("integration_id = %v, ожидался %s", got.IntegrationId, integrationID)
+	}
+	if got.Text == nil || *got.Text != "сделай что-нибудь" {
+		t.Errorf("text = %v, ожидался %q", got.Text, "сделай что-нибудь")
+	}
+	if got.Status == nil || *got.Status != TaskStatus(task.StatusRunning) {
+		t.Errorf("status = %v, ожидался %q", got.Status, task.StatusRunning)
+	}
+	if got.CreatedAt == nil || !got.CreatedAt.Equal(createdAt) {
+		t.Errorf("created_at = %v, ожидался %v", got.CreatedAt, createdAt)
+	}
+	if got.UpdatedAt == nil || !got.UpdatedAt.Equal(updatedAt) {
+		t.Errorf("updated_at = %v, ожидался %v", got.UpdatedAt, updatedAt)
+	}
+}
+
+// TestGetTasks_FiltersPassedToQuery — query-параметры integration_id/status
+// конвертируются в db.ListTasksByUserParams в форме, которую реально
+// генерирует sqlc (IntegrationID — pgtype.UUID со ставкой Valid, Status —
+// *string), а не выдуманной сигнатуре.
+func TestGetTasks_FiltersPassedToQuery(t *testing.T) {
+	userID := uuid.New()
+	integrationID := uuid.New()
+
+	q := &capturingListTasksQuerier{fakeQuerier: fakeQuerier{}}
+	rec := doGetTasks(t, q, userID, "integration_id="+integrationID.String()+"&status=running")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+	if q.lastArg.UserID.Bytes != userID {
+		t.Errorf("UserID = %s, ожидался %s", uuid.UUID(q.lastArg.UserID.Bytes), userID)
+	}
+	if !q.lastArg.IntegrationID.Valid || q.lastArg.IntegrationID.Bytes != integrationID {
+		t.Errorf("IntegrationID = %+v, ожидался валидный %s", q.lastArg.IntegrationID, integrationID)
+	}
+	if q.lastArg.Status == nil || *q.lastArg.Status != "running" {
+		t.Errorf("Status = %v, ожидался \"running\"", q.lastArg.Status)
+	}
+}
+
+// capturingListTasksQuerier оборачивает fakeQuerier и запоминает последний
+// аргумент ListTasksByUser — нужен TestGetTasks_FiltersPassedToQuery, чтобы
+// проверить именно то, что обработчик передал в запрос (fakeQuerier сам по
+// себе аргументы не сохраняет).
+type capturingListTasksQuerier struct {
+	fakeQuerier
+	lastArg db.ListTasksByUserParams
+}
+
+func (c *capturingListTasksQuerier) ListTasksByUser(ctx context.Context, arg db.ListTasksByUserParams) ([]db.Task, error) {
+	c.lastArg = arg
+	return c.fakeQuerier.ListTasksByUser(ctx, arg)
+}
+
+// doGetTasksId прогоняет GET /tasks/{id} через роутер (тикет 8.6, FR H1).
+func doGetTasksId(t *testing.T, q Querier, userID, taskID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(q)
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks/"+taskID.String(), nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestGetTasksId_RequiresBearerToken — без Authorization-заголовка auth-
+// middleware отвечает 401, не доходя до GetTasksId (тикет 1.4).
+func TestGetTasksId_RequiresBearerToken(t *testing.T) {
+	router := NewRouter(newTestServer(fakeQuerier{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks/"+uuid.New().String(), nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksId_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404 (FR A4, I3).
+func TestGetTasksId_TaskNotFound(t *testing.T) {
+	rec := doGetTasksId(t, fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows}, uuid.New(), uuid.New())
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksId_TaskLookupInternalError — неожиданная ошибка при проверке
+// владения задачей → 500.
+func TestGetTasksId_TaskLookupInternalError(t *testing.T) {
+	rec := doGetTasksId(t, fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded}, uuid.New(), uuid.New())
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksId_HappyPath — карточка задачи содержит все поля (FR H1,
+// Gherkin §10 «Состав записи о задаче»), включая status/updated_at ИЗ
+// row (в отличие от toTask, используемого write-путями) — read-путь не
+// подменяет их приближением "сейчас".
+func TestGetTasksId_HappyPath(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+	createdAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	updatedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+
+	rec := doGetTasksId(t, fakeQuerier{
+		getTaskByIDAndUserResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			TextEnc:       []byte("текст задачи"),
+			Status:        string(task.StatusAwaitingConfirm),
+			CreatedAt:     pgtype.Timestamptz{Time: createdAt, Valid: true},
+			UpdatedAt:     pgtype.Timestamptz{Time: updatedAt, Valid: true},
+		},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	var got Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if got.Id == nil || *got.Id != taskID {
+		t.Errorf("id = %v, ожидался %s", got.Id, taskID)
+	}
+	if got.IntegrationId == nil || *got.IntegrationId != integrationID {
+		t.Errorf("integration_id = %v, ожидался %s", got.IntegrationId, integrationID)
+	}
+	if got.Text == nil || *got.Text != "текст задачи" {
+		t.Errorf("text = %v, ожидался %q", got.Text, "текст задачи")
+	}
+	if got.Status == nil || *got.Status != TaskStatus(task.StatusAwaitingConfirm) {
+		t.Errorf("status = %v, ожидался %q", got.Status, task.StatusAwaitingConfirm)
+	}
+	if got.CreatedAt == nil || !got.CreatedAt.Equal(createdAt) {
+		t.Errorf("created_at = %v, ожидался %v", got.CreatedAt, createdAt)
+	}
+	if got.UpdatedAt == nil || !got.UpdatedAt.Equal(updatedAt) {
+		t.Errorf("updated_at = %v, ожидался %v (НЕ момент запроса — read-путь, не toTask)", got.UpdatedAt, updatedAt)
+	}
+}
+
+// doGetTasksIdEvents прогоняет GET /tasks/{id}/events через роутер (тикет
+// 8.6, FR H1).
+func doGetTasksIdEvents(t *testing.T, q Querier, userID, taskID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(q)
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks/"+taskID.String()+"/events", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestGetTasksIdEvents_RequiresBearerToken — без Authorization-заголовка
+// auth-middleware отвечает 401, не доходя до GetTasksIdEvents (тикет 1.4).
+func TestGetTasksIdEvents_RequiresBearerToken(t *testing.T) {
+	router := NewRouter(newTestServer(fakeQuerier{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks/"+uuid.New().String()+"/events", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksIdEvents_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404, журнал не запрашивается (FR A4,
+// I3).
+func TestGetTasksIdEvents_TaskNotFound(t *testing.T) {
+	rec := doGetTasksIdEvents(t, fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows}, uuid.New(), uuid.New())
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksIdEvents_TaskLookupInternalError — неожиданная ошибка при
+// проверке владения задачей → 500, журнал не запрашивается.
+func TestGetTasksIdEvents_TaskLookupInternalError(t *testing.T) {
+	rec := doGetTasksIdEvents(t, fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded}, uuid.New(), uuid.New())
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksIdEvents_ListEventsInternalError — владение подтверждено, но
+// ListTaskEventsByTask вернул неожиданную ошибку → 500.
+func TestGetTasksIdEvents_ListEventsInternalError(t *testing.T) {
+	taskID := uuid.New()
+	rec := doGetTasksIdEvents(t, fakeQuerier{
+		getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+		listTaskEventsByTaskErr:  context.DeadlineExceeded,
+	}, uuid.New(), taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetTasksIdEvents_HappyPath — журнал событий возвращается в правильном
+// порядке (по seq), payload виден в ответе (тикет 8.6, FR H1, Gherkin §10).
+func TestGetTasksIdEvents_HappyPath(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	eventID1, eventID2 := uuid.New(), uuid.New()
+	createdAt1 := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	createdAt2 := time.Now().UTC().Truncate(time.Second)
+
+	rec := doGetTasksIdEvents(t, fakeQuerier{
+		getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+		listTaskEventsByTaskResult: []db.TaskEvent{
+			{
+				ID:         pgtype.UUID{Bytes: eventID1, Valid: true},
+				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
+				Seq:        1,
+				Type:       "status_change",
+				PayloadEnc: []byte(`{"from":"created","to":"queued"}`),
+				CreatedAt:  pgtype.Timestamptz{Time: createdAt1, Valid: true},
+			},
+			{
+				ID:         pgtype.UUID{Bytes: eventID2, Valid: true},
+				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
+				Seq:        2,
+				Type:       "agent_question",
+				PayloadEnc: []byte(`{"question_id":"` + eventID2.String() + `","text":"?"}`),
+				CreatedAt:  pgtype.Timestamptz{Time: createdAt2, Valid: true},
+			},
+		},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	var events []TaskEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &events); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, ожидалось 2", len(events))
+	}
+	if events[0].Seq == nil || *events[0].Seq != 1 {
+		t.Errorf("events[0].Seq = %v, ожидался 1", events[0].Seq)
+	}
+	if events[1].Seq == nil || *events[1].Seq != 2 {
+		t.Errorf("events[1].Seq = %v, ожидался 2", events[1].Seq)
+	}
+	if events[0].Type == nil || *events[0].Type != TaskEventType("status_change") {
+		t.Errorf("events[0].Type = %v, ожидался status_change", events[0].Type)
+	}
+	if events[1].Payload == nil {
+		t.Fatalf("events[1].Payload = nil, ожидался непустой payload с question_id")
+	}
+	if qid, ok := (*events[1].Payload)["question_id"]; !ok || qid != eventID2.String() {
+		t.Errorf("events[1].Payload[question_id] = %v, ожидался %s", qid, eventID2)
+	}
+}
+
+// TestGetTasksIdEvents_BadPayloadDoesNotDropEvent — событие с невалидным
+// (не-JSON) payload_enc не роняет весь запрос и не выпадает из ответа
+// целиком (см. годок toTaskEvent) — Payload у него просто nil, остальные
+// поля (id/seq/type/created_at) присутствуют.
+func TestGetTasksIdEvents_BadPayloadDoesNotDropEvent(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	eventID := uuid.New()
+
+	rec := doGetTasksIdEvents(t, fakeQuerier{
+		getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+		listTaskEventsByTaskResult: []db.TaskEvent{
+			{
+				ID:         pgtype.UUID{Bytes: eventID, Valid: true},
+				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
+				Seq:        1,
+				Type:       "status_change",
+				PayloadEnc: []byte("не json"),
+				CreatedAt:  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+			},
+		},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	var events []TaskEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &events); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, ожидался 1", len(events))
+	}
+	if events[0].Payload != nil {
+		t.Errorf("Payload = %v, ожидался nil (невалидный JSON payload_enc)", events[0].Payload)
+	}
+	if events[0].Id == nil || *events[0].Id != eventID {
+		t.Errorf("Id = %v, ожидался %s (остальные поля события не должны теряться)", events[0].Id, eventID)
+	}
+}

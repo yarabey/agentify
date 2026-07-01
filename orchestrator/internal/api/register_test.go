@@ -80,6 +80,12 @@ type fakeQuerier struct {
 	listCommandApprovalRequestEventsByTaskResult []db.TaskEvent
 	listCommandApprovalRequestEventsByTaskErr    error
 
+	listTasksByUserResult []db.Task
+	listTasksByUserErr    error
+
+	listTaskEventsByTaskResult []db.TaskEvent
+	listTaskEventsByTaskErr    error
+
 	listActiveTaskIDsByIntegrationResult []pgtype.UUID
 	listActiveTaskIDsByIntegrationErr    error
 
@@ -215,6 +221,20 @@ func (f fakeQuerier) ListCommandApprovalRequestEventsByTask(context.Context, pgt
 		return nil, f.listCommandApprovalRequestEventsByTaskErr
 	}
 	return f.listCommandApprovalRequestEventsByTaskResult, nil
+}
+
+func (f fakeQuerier) ListTasksByUser(context.Context, db.ListTasksByUserParams) ([]db.Task, error) {
+	if f.listTasksByUserErr != nil {
+		return nil, f.listTasksByUserErr
+	}
+	return f.listTasksByUserResult, nil
+}
+
+func (f fakeQuerier) ListTaskEventsByTask(context.Context, pgtype.UUID) ([]db.TaskEvent, error) {
+	if f.listTaskEventsByTaskErr != nil {
+		return nil, f.listTaskEventsByTaskErr
+	}
+	return f.listTaskEventsByTaskResult, nil
 }
 
 func (f fakeQuerier) ListActiveTaskIDsByIntegration(context.Context, pgtype.UUID) ([]pgtype.UUID, error) {
