@@ -250,6 +250,75 @@ func (q *Queries) ListAgentQuestionEventsByTask(ctx context.Context, taskID pgty
 	return items, nil
 }
 
+const listRunningTasksWithStaleMachine = `-- name: ListRunningTasksWithStaleMachine :many
+SELECT tasks.id FROM tasks
+JOIN integrations ON integrations.id = tasks.integration_id
+WHERE tasks.status IN ('running', 'waiting_user')
+  AND (integrations.last_seen_at IS NULL OR integrations.last_seen_at < $1)
+`
+
+// «Зависание» машины (тикет 5.7, FR E5, protocol.md §6: STALE_THRESHOLD):
+// находит активные (running/waiting_user) задачи, чья интеграция не подавала
+// heartbeat дольше порога — cutoff считает вызывающая сторона
+// (task.StaleWorker), здесь только сравнение с last_seen_at. last_seen_at
+// IS NULL тоже считается «зависла» — защитный случай: MarkIntegrationOnline
+// (queries/integrations.sql) всегда пишет last_seen_at ОДНОВРЕМЕННО с
+// status='online', так что NULL означает «от этой машины вообще никогда не
+// было heartbeat», а активная задача у такой интеграции быть не должна.
+// Результат передаётся task.Transitioner.Transition(..., TriggerTimeout).
+func (q *Queries) ListRunningTasksWithStaleMachine(ctx context.Context, lastSeenAt pgtype.Timestamptz) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listRunningTasksWithStaleMachine, lastSeenAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStaleTasksWithRecoveredMachine = `-- name: ListStaleTasksWithRecoveredMachine :many
+SELECT tasks.id FROM tasks
+JOIN integrations ON integrations.id = tasks.integration_id
+WHERE tasks.status = 'stale'
+  AND integrations.last_seen_at IS NOT NULL
+  AND integrations.last_seen_at >= $1
+`
+
+// Возврат «зависшей» машины (тикет 5.7, FR E5, protocol.md §6): находит
+// задачи в статусе stale, чья интеграция снова свежо подавала heartbeat
+// (last_seen_at не старше cutoff) — задача должна продолжиться, stale →
+// running. Результат передаётся
+// task.Transitioner.Transition(..., TriggerMachineRecovered).
+func (q *Queries) ListStaleTasksWithRecoveredMachine(ctx context.Context, lastSeenAt pgtype.Timestamptz) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listStaleTasksWithRecoveredMachine, lastSeenAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateTaskStatus = `-- name: UpdateTaskStatus :exec
 UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1
 `
