@@ -1507,3 +1507,201 @@ func TestPostTasksIdConfirm_HappyPath(t *testing.T) {
 		t.Fatalf("status = %v, ожидался %q", respTask.Status, task.StatusCompleted)
 	}
 }
+
+// doPostTasksIdReject прогоняет POST /tasks/{id}/reject через роутер. body ==
+// nil означает запрос вообще без тела (requestBody не required в контракте,
+// api/openapi.yaml) — обычный случай "отклонение без комментария".
+func doPostTasksIdReject(t *testing.T, cfg postTasksServer, userID, taskID uuid.UUID, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(cfg.q)
+	s.SetTransitioner(cfg.transitioner)
+	s.SetCommandPublisher(cfg.publisher)
+	router := NewRouter(s)
+
+	var req *http.Request
+	if body != nil {
+		req = httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/reject", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req = httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/reject", nil)
+	}
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPostTasksIdReject_RequiresBearerToken — без Authorization-заголовка
+// auth-middleware отвечает 401, не доходя до PostTasksIdReject (тикет 1.4).
+func TestPostTasksIdReject_RequiresBearerToken(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	s.SetTransitioner(&fakeTransitioner{})
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+uuid.New().String()+"/reject", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdReject_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404 (FR A4, I3).
+func TestPostTasksIdReject_TaskNotFound(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID, nil)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdReject_TaskLookupInternalError — неожиданная ошибка при
+// проверке владения задачей → 500.
+func TestPostTasksIdReject_TaskLookupInternalError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID, nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdReject_NoTransitionerConfigured — transitioner не установлен
+// (nil) → 500.
+func TestPostTasksIdReject_NoTransitionerConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: nil,
+	}, userID, taskID, nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdReject_TransitionError — Transition вернул ошибку. Это
+// покрывает в т.ч. приёмку «reject запрещён из статусов, отличных от
+// awaiting_confirm»: сама проверка недопустимости перехода — на уровне
+// task.NextStatus (уже протестирована в fsm_test.go тикета 5.2); здесь
+// проверяется только то, что HTTP-обработчик корректно транслирует ошибку
+// Transition в 500 — тот же паттерн, что и
+// TestPostTasksIdConfirm_TransitionError/TestPostTasksIdApprove_TransitionError,
+// отдельной ветки/статуса для недопустимого перехода в проекте не заведено.
+func TestPostTasksIdReject_TransitionError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{err: context.DeadlineExceeded},
+	}, userID, taskID, nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdReject_HappyPath_NoComment — успешное отклонение результата
+// без тела запроса (FR E2, Gherkin §7 «Пользователь отклоняет результат»):
+// Transition вызван с (taskID, task.TriggerCompletionRejected), 200, тело
+// ответа содержит status="running".
+func TestPostTasksIdReject_HappyPath_NoComment(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+
+	transitioner := &fakeTransitioner{to: task.StatusRunning}
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+		},
+		transitioner: transitioner,
+	}, userID, taskID, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("Transition вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerCompletionRejected {
+		t.Fatalf("Transition вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerCompletionRejected)
+	}
+
+	var respTask Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &respTask); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if respTask.Status == nil || *respTask.Status != TaskStatus(task.StatusRunning) {
+		t.Fatalf("status = %v, ожидался %q", respTask.Status, task.StatusRunning)
+	}
+}
+
+// TestPostTasksIdReject_HappyPath_WithComment — то же самое, но с телом
+// {"comment": "..."}: комментарий принимается и не ломает обработку, даже
+// если он не персистится (тикет 8.3 — вне объёма хранение комментария, см.
+// комментарий над PostTasksIdReject).
+func TestPostTasksIdReject_HappyPath_WithComment(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+
+	transitioner := &fakeTransitioner{to: task.StatusRunning}
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+		},
+		transitioner: transitioner,
+	}, userID, taskID, []byte(`{"comment":"нужно доделать логирование"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	if transitioner.lastTrigger != task.TriggerCompletionRejected {
+		t.Fatalf("Transition вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerCompletionRejected)
+	}
+
+	var respTask Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &respTask); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if respTask.Status == nil || *respTask.Status != TaskStatus(task.StatusRunning) {
+		t.Fatalf("status = %v, ожидался %q", respTask.Status, task.StatusRunning)
+	}
+}
+
+// TestPostTasksIdReject_InvalidJSONBody — заведомо битый JSON в теле → 400,
+// не доходя до Transition.
+func TestPostTasksIdReject_InvalidJSONBody(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdReject(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID, []byte(`{"comment":`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("статус = %d (%s), ожидался 400", rec.Code, rec.Body.String())
+	}
+}

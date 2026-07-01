@@ -5,9 +5,10 @@ package api
 // вопрос агента (тикет 6.1, FR F1, F2, PostTasksIdAnswer, Gherkin §5 «Агент
 // задаёт вопрос и получает ответ»), согласование команды вне allowlist
 // (тикет 6.4, FR F3, PostTasksIdApprove, Gherkin §5 «Команда вне allowlist
-// требует согласования») и подтверждение пользователем завершения задачи
+// требует согласования»), подтверждение пользователем завершения задачи
 // (тикет 8.2, FR E2, PostTasksIdConfirm, Gherkin §7 «Пользователь
-// подтверждает завершение»).
+// подтверждает завершение») и отклонение результата на доработку (тикет 8.3,
+// FR E2, PostTasksIdReject, Gherkin §7 «Пользователь отклоняет результат»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -42,6 +43,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -567,6 +569,72 @@ func (s *Server) PostTasksIdConfirm(w http.ResponseWriter, r *http.Request, id I
 	_, to, err := transitioner.Transition(ctx, taskID, task.TriggerUserConfirmed)
 	if err != nil {
 		s.logError("Transition(user_confirmed)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toTask(row, to))
+}
+
+// PostTasksIdReject реализует POST /tasks/{id}/reject — пользователь отклоняет
+// результат работы агента и просит доработку (тикет 8.3, FR E2, Gherkin §7
+// «Пользователь отклоняет результат»): Дано задача в статусе "ожидает
+// подтверждения", Когда я отклоняю результат и прошу доработку, Тогда задача
+// возвращается в статус "выполняется". Как и PostTasksIdConfirm (тикет 8.2),
+// это действие НЕ уведомляет агента (нет CommandPublisher) — awaiting_confirm
+// это состояние, в котором агент уже неактивен и ждёт внешнего решения
+// пользователя.
+//
+// Тело запроса необязательно целиком (api/openapi.yaml: requestBody без
+// required), опциональное поле comment принимается и валидируется как JSON,
+// но не персистится — в текущей схеме task_events (миграция 00003, не
+// редактируется) нет подходящего типа события для комментария об отклонении;
+// это вне объёма тикета 8.3 (приёмка — только переход reject → running).
+func (s *Server) PostTasksIdReject(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	var req PostTasksIdRejectJSONBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_body", "тело запроса не является валидным JSON")
+		return
+	}
+
+	taskUUID := uuid.UUID(id)
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+
+	// Владение задачей — owner-scoped прямо в SQL (FR A4, I3), как и владение
+	// задачей в PostTasksIdConfirm/PostTasksIdApprove/PostTasksIdAnswer: чужая/
+	// несуществующая задача неотличимы, единый 404.
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("PostTasksIdReject", errors.New("transitioner не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	_, to, err := transitioner.Transition(ctx, taskID, task.TriggerCompletionRejected)
+	if err != nil {
+		s.logError("Transition(completion_rejected)", err)
 		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
 		return
 	}
