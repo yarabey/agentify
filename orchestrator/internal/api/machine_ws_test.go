@@ -23,6 +23,14 @@
 //     heartbeat-конверта;
 //   - ошибка EventSink.HandleEvent → ack агенту НЕ отправляется;
 //   - EventSink не зарегистрирован (nil) → кадр молча игнорируется, без паники.
+//
+// А также приёмочное требование тикета 4.7 (FR C5, ADR 0003 "machine-ws
+// protocol version compat") — authenticateMachineHello:
+//   - hello с несовместимым protocol_version → соединение закрывается кодом
+//     wsCloseIncompatibleProtocolVersion (4426) с содержательной причиной
+//     (got/want), authenticateMachineHello возвращает (uuid.Nil, false);
+//   - hello с совместимым protocol_version и валидным UUID/HMAC продолжает
+//     работать как раньше (регрессия — без завязки на ADR 0003).
 package api
 
 import (
@@ -560,5 +568,129 @@ func TestHandleMachineFrame_AgentQuestion_InvalidPayload_DoesNotPanic(t *testing
 				t.Fatalf("%s: клиент получил ack, хотя payload/конверт невалиден", name)
 			}
 		})
+	}
+}
+
+// helloEnvelope собирает конверт type==hello (protocol.md §2/§4,
+// bus.HelloPayload) с заданными protocol_version и uuid-секретом — для
+// тестов authenticateMachineHello (тикеты 2.3/4.7).
+func helloEnvelope(t *testing.T, protocolVersion, uuidSecret string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.HelloPayload{UUID: uuidSecret, AgentVersion: "1.2.3"})
+	if err != nil {
+		t.Fatalf("marshal HelloPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   uuidSecret,
+		Type:            bus.MessageTypeHello,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: protocolVersion,
+		Payload:         payload,
+	}
+}
+
+// writeClientFrame пишет data от лица клиента (агента) в clientConn — общий
+// хелпер для тестов authenticateMachineHello, чтобы не дублировать таймаут
+// записи в каждом тесте.
+func writeClientFrame(t *testing.T, clientConn *websocket.Conn, data []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := clientConn.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Fatalf("clientConn.Write: %v", err)
+	}
+}
+
+// TestAuthenticateMachineHello_IncompatibleProtocolVersionRejected —
+// приёмка тикета 4.7 (FR C5, ADR 0003): hello с protocol_version, не
+// совпадающим с bus.ProtocolVersion, отклоняется ДО похода в БД —
+// authenticateMachineHello возвращает (uuid.Nil, false), а соединение само
+// закрывается кодом wsCloseIncompatibleProtocolVersion (4426) с понятной
+// причиной, называющей и присланное, и ожидаемое значение версии.
+func TestAuthenticateMachineHello_IncompatibleProtocolVersionRejected(t *testing.T) {
+	// fakeQuerier без getIntegrationByUUIDHMACResult/Err: если бы проверка
+	// protocol_version не сработала ДО похода в БД (см. ADR 0003 п.3), тест
+	// упал бы на нулевом db.Integration{}, а не на ожидаемом close 4426 —
+	// так тест заодно фиксирует и порядок проверок.
+	s := newTestServer(fakeQuerier{})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	const badVersion = "999"
+	secret := uuid.New().String()
+	writeClientFrame(t, clientConn, marshalEnvelope(t, helloEnvelope(t, badVersion, secret)))
+
+	// Читаем на клиенте КОНКУРЕНТНО с authenticateMachineHello (а не после
+	// её возврата): conn.Close на сервере выполняет полный close-handshake
+	// и ждёт ответного close-кадра от пира до 5с (coder/websocket
+	// close.go); если клиент не читает в этот момент, он не может
+	// ответить, и Close на сервере тратит все 5с впустую. Конкурентное
+	// чтение даёт клиенту немедленно среагировать на close-кадр, как и в
+	// реальности (read-loop агента читает постоянно).
+	type readResult struct {
+		err error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, err := clientConn.Read(readCtx)
+		resultCh <- readResult{err: err}
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/machine/ws", nil)
+	integrationID, ok := s.authenticateMachineHello(req, serverConn)
+	if ok {
+		t.Fatalf("authenticateMachineHello: ok=true (integrationID=%s), ожидался отказ по несовместимому protocol_version", integrationID)
+	}
+	if integrationID != uuid.Nil {
+		t.Fatalf("authenticateMachineHello: integrationID=%s, ожидался uuid.Nil при отказе", integrationID)
+	}
+
+	res := <-resultCh
+	err := res.err
+	if err == nil {
+		t.Fatal("clientConn.Read: ожидалось закрытие соединения, а не кадр данных")
+	}
+	var closeErr websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("ошибка чтения клиента — не websocket.CloseError: %v", err)
+	}
+	if closeErr.Code != wsCloseIncompatibleProtocolVersion {
+		t.Fatalf("close code = %d, ожидался %d (wsCloseIncompatibleProtocolVersion)", closeErr.Code, wsCloseIncompatibleProtocolVersion)
+	}
+	if !strings.Contains(closeErr.Reason, badVersion) || !strings.Contains(closeErr.Reason, bus.ProtocolVersion) {
+		t.Fatalf("close reason = %q, ожидалось понятное упоминание присланной (%q) и ожидаемой (%q) версии", closeErr.Reason, badVersion, bus.ProtocolVersion)
+	}
+}
+
+// TestAuthenticateMachineHello_CompatibleProtocolVersionAndValidAuthSucceeds —
+// регрессия: hello с СОВПАДАЮЩИМ protocol_version и валидным (найденным по
+// HMAC) UUID продолжает аутентифицироваться как и до тикета 4.7— введённая
+// проверка версии не должна ломать штатный путь (FR B3/B6, тикет 2.3).
+func TestAuthenticateMachineHello_CompatibleProtocolVersionAndValidAuthSucceeds(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	q := fakeQuerier{
+		getIntegrationByUUIDHMACResult: db.Integration{
+			ID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	secret := uuid.New().String()
+	writeClientFrame(t, clientConn, marshalEnvelope(t, helloEnvelope(t, bus.ProtocolVersion, secret)))
+
+	req := httptest.NewRequest(http.MethodGet, "/machine/ws", nil)
+	integrationID, ok := s.authenticateMachineHello(req, serverConn)
+	if !ok {
+		t.Fatal("authenticateMachineHello: ok=false, ожидался успех для совместимого protocol_version и валидного UUID/HMAC (регрессия тикета 4.7)")
+	}
+	if integrationID != dbIntegrationID {
+		t.Fatalf("authenticateMachineHello: integrationID=%s, ожидался %s", integrationID, dbIntegrationID)
 	}
 }
