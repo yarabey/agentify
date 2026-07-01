@@ -35,6 +35,21 @@
 // через GET /tasks, GET /tasks/{id} и GET /tasks/{id}/events — ни карточка,
 // ни журнал не урезаются и не скрываются по возрасту (авто-удаления в
 // кодовой базе нет и не предполагается).
+//
+// Также покрывает семантику правки текста запроса (тикет 8.9, FR H3): в
+// проекте НЕТ эндпоинта для редактирования text уже созданной задачи (ни
+// PATCH/PUT /tasks/{id}, ни UPDATE tasks ... SET text_enc = ... в
+// queries/tasks.sql — там UPDATE tasks трогает только status/updated_at, см.
+// UpdateTaskStatus) — text_enc пишется единственный раз, в CreateTask (INSERT).
+// Семантика FR H3 «правка не перезапускает уже выполненную задачу, повтор —
+// отдельное действие» тем самым обеспечена конструктивно: единственный способ
+// «исправить» уже отправленный текст — это создать НОВУЮ задачу отдельным
+// POST /tasks со своим Idempotency-Key (тикет 5.5 гарантирует независимость
+// таких задач). TestIntegration_PostTasks_ResubmitDoesNotRestartCompletedTask
+// закрепляет это регрессионно: задача доводится до completed, затем
+// «правка» моделируется как повторная постановка (второй POST /tasks с
+// исправленным текстом) — оригинальная завершённая задача остаётся
+// completed, её text/updated_at и число task_events не меняются.
 package api_test
 
 import (
@@ -1233,4 +1248,192 @@ func TestIntegration_GetTasks_OldTaskStillAccessible(t *testing.T) {
 		}
 	}
 	t.Logf("OK: GET /tasks/{id}/events — все %d событий давней задачи по-прежнему доступны, авто-удаления не произошло", len(events))
+}
+
+// TestIntegration_PostTasks_ResubmitDoesNotRestartCompletedTask — приёмка
+// тикета 8.9 (FR H3, Gherkin — «Семантика правки текста запроса в истории
+// определена явно: правка не перезапускает уже выполненную задачу; повтор —
+// отдельное действие»).
+//
+// В проекте нет эндпоинта для редактирования text уже существующей задачи
+// (api/openapi.yaml: у /tasks/{id} есть только GET; queries/tasks.sql: UPDATE
+// tasks меняет только status/updated_at — UpdateTaskStatus, text_enc пишется
+// один раз, в CreateTask). Поэтому единственный способ, которым пользователь
+// может «исправить» уже отправленный текст, — отправить его снова отдельным
+// POST /tasks со своим Idempotency-Key. Этот тест доводит первую задачу до
+// completed (полный цикл через Transitioner, как в
+// TestIntegration_GetTasks_FullCycleAllFieldsPresent, без вопроса/ответа —
+// не предмет этого теста), затем через РЕАЛЬНЫЙ HTTP POST /tasks создаёт
+// вторую задачу с «исправленным» текстом и другим Idempotency-Key, и
+// проверяет: (1) это действительно НОВАЯ независимая задача (свой id,
+// status=queued, свой text); (2) оригинальная задача НЕ перезапустилась —
+// её status остаётся completed (не queued/running), text и updated_at не
+// изменились, число task_events не выросло — правка/повтор не пишет новую
+// историю и не трогает существующую задачу.
+func TestIntegration_PostTasks_ResubmitDoesNotRestartCompletedTask(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	seed, doneRedpanda := startRedpandaForTasks(ctx, t)
+	defer doneRedpanda()
+	seeds := []string{seed}
+	waitRedpandaReadyForTasks(ctx, t, seeds)
+	if err := bus.EnsureMVPTopics(ctx, seeds); err != nil {
+		t.Fatalf("провижининг топиков: %v", err)
+	}
+
+	producer, err := bus.NewProducer(seeds)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	defer producer.Close()
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-resubmit")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-resubmit")
+	integrationUUID := uuid.UUID(integration.ID.Bytes)
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	tr := task.NewTransitioner(pool)
+	server.SetTransitioner(tr)
+	server.SetCommandPublisher(producer)
+	router := api.NewRouter(server)
+
+	// --- Оригинальная задача: POST /tasks → queued. ---
+	const originalText = "собери отчёт по продажам за март"
+	origRec := doPostTasksRequest(t, router, token, "orig-key", api.TaskCreate{
+		IntegrationId: integrationUUID,
+		Text:          originalText,
+	})
+	if origRec.Code != http.StatusCreated {
+		t.Fatalf("исходный POST /tasks: статус = %d (%s), ожидался 201", origRec.Code, origRec.Body.String())
+	}
+	var origCreated api.Task
+	if uerr := json.Unmarshal(origRec.Body.Bytes(), &origCreated); uerr != nil {
+		t.Fatalf("unmarshal тела исходного ответа: %v", uerr)
+	}
+	if origCreated.Id == nil {
+		t.Fatal("id исходной задачи пуст")
+	}
+	taskID := *origCreated.Id
+	taskUUID := pgtype.UUID{Bytes: taskID, Valid: true}
+
+	// Довести оригинальную задачу до completed: queued→running→awaiting_confirm→completed
+	// (задача уже queued после POST — TriggerEnqueued уже применён обработчиком).
+	if _, _, terr := tr.Transition(ctx, taskUUID, task.TriggerTaskAccepted); terr != nil {
+		t.Fatalf("подготовка (task_accepted): %v", terr)
+	}
+	const summaryText = "отчёт готов"
+	completedPayload, merr := json.Marshal(bus.AgentCompletedPayload{Summary: summaryText})
+	if merr != nil {
+		t.Fatalf("marshal AgentCompletedPayload: %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskUUID, task.TriggerAgentCompleted, "agent_completed", pgtype.UUID{}, completedPayload); terr != nil {
+		t.Fatalf("подготовка (agent_completed): %v", terr)
+	}
+	if _, _, terr := tr.Transition(ctx, taskUUID, task.TriggerUserConfirmed); terr != nil {
+		t.Fatalf("подготовка (user_confirmed): %v", terr)
+	}
+
+	// --- Снимок «до правки»: карточка и число событий оригинальной задачи. ---
+	beforeCardRec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskID.String(), token, nil)
+	if beforeCardRec.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id} (до правки): статус = %d (%s), ожидался 200", beforeCardRec.Code, beforeCardRec.Body.String())
+	}
+	var beforeCard api.Task
+	if uerr := json.Unmarshal(beforeCardRec.Body.Bytes(), &beforeCard); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id} (до правки): %v", uerr)
+	}
+	if beforeCard.Status == nil || *beforeCard.Status != api.Completed {
+		t.Fatalf("подготовка: Task.Status = %v, ожидался completed до имитации правки", beforeCard.Status)
+	}
+	if beforeCard.Text == nil || *beforeCard.Text != originalText {
+		t.Fatalf("подготовка: Task.Text = %v, ожидался %q", beforeCard.Text, originalText)
+	}
+	if beforeCard.UpdatedAt == nil {
+		t.Fatal("подготовка: Task.UpdatedAt пуст")
+	}
+	beforeUpdatedAt := *beforeCard.UpdatedAt
+	eventsBeforeResubmit := countTaskEvents(ctx, t, pool, taskID)
+
+	// --- «Правка» текста запроса: пользователь на самом деле создаёт НОВУЮ
+	// задачу с исправленным текстом, отдельным POST /tasks со своим
+	// Idempotency-Key — это и есть «повтор — отдельное действие» (FR H3). ---
+	const correctedText = "собери отчёт по продажам за март (уточнение: только по региону Москва)"
+	resubmitRec := doPostTasksRequest(t, router, token, "corrected-key", api.TaskCreate{
+		IntegrationId: integrationUUID,
+		Text:          correctedText,
+	})
+	if resubmitRec.Code != http.StatusCreated {
+		t.Fatalf("«правка» (повторный POST /tasks): статус = %d (%s), ожидался 201", resubmitRec.Code, resubmitRec.Body.String())
+	}
+	var resubmitCreated api.Task
+	if uerr := json.Unmarshal(resubmitRec.Body.Bytes(), &resubmitCreated); uerr != nil {
+		t.Fatalf("unmarshal тела «правки»: %v", uerr)
+	}
+	if resubmitCreated.Id == nil {
+		t.Fatal("id «правки» пуст")
+	}
+	secondTaskID := *resubmitCreated.Id
+	if secondTaskID == taskID {
+		t.Fatalf("«правка» вернула тот же id %s, что и оригинальная задача — ожидалась НОВАЯ независимая задача", taskID)
+	}
+
+	// --- Проверка: оригинальная задача НЕ перезапустилась и не изменилась. ---
+	afterCardRec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskID.String(), token, nil)
+	if afterCardRec.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id} (после «правки»): статус = %d (%s), ожидался 200", afterCardRec.Code, afterCardRec.Body.String())
+	}
+	var afterCard api.Task
+	if uerr := json.Unmarshal(afterCardRec.Body.Bytes(), &afterCard); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id} (после «правки»): %v", uerr)
+	}
+	if afterCard.Status == nil || *afterCard.Status != api.Completed {
+		t.Fatalf("Task.Status оригинальной задачи после «правки» = %v, ожидался completed (правка не должна перезапускать выполненную задачу)", afterCard.Status)
+	}
+	if afterCard.Text == nil || *afterCard.Text != originalText {
+		t.Fatalf("Task.Text оригинальной задачи после «правки» = %v, ожидался неизменный исходный текст %q (не текст правки)", afterCard.Text, originalText)
+	}
+	if afterCard.UpdatedAt == nil || !afterCard.UpdatedAt.Equal(beforeUpdatedAt) {
+		t.Fatalf("Task.UpdatedAt оригинальной задачи изменился: было %v, стало %v — «правка» не должна трогать существующую задачу", beforeUpdatedAt, afterCard.UpdatedAt)
+	}
+
+	eventsAfterResubmit := countTaskEvents(ctx, t, pool, taskID)
+	if eventsAfterResubmit != eventsBeforeResubmit {
+		t.Fatalf("число task_events оригинальной задачи после «правки» = %d, было %d — повтор не должен писать новую историю в уже существующую задачу", eventsAfterResubmit, eventsBeforeResubmit)
+	}
+
+	afterEventsRec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskID.String()+"/events", token, nil)
+	if afterEventsRec.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id}/events (после «правки»): статус = %d (%s), ожидался 200", afterEventsRec.Code, afterEventsRec.Body.String())
+	}
+	var afterEvents []api.TaskEvent
+	if uerr := json.Unmarshal(afterEventsRec.Body.Bytes(), &afterEvents); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id}/events (после «правки»): %v", uerr)
+	}
+	if len(afterEvents) != eventsBeforeResubmit {
+		t.Fatalf("GET /tasks/{id}/events оригинальной задачи вернул %d событий, ожидалось без изменений (%d)", len(afterEvents), eventsBeforeResubmit)
+	}
+
+	// --- Проверка: новая задача действительно независима (свой текст, свой
+	// статус queued — она никак не связана с журналом оригинальной). ---
+	secondCardRec := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+secondTaskID.String(), token, nil)
+	if secondCardRec.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id} (новая задача): статус = %d (%s), ожидался 200", secondCardRec.Code, secondCardRec.Body.String())
+	}
+	var secondCard api.Task
+	if uerr := json.Unmarshal(secondCardRec.Body.Bytes(), &secondCard); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id} (новая задача): %v", uerr)
+	}
+	if secondCard.Status == nil || *secondCard.Status != api.TaskStatus("queued") {
+		t.Fatalf("Task.Status новой задачи = %v, ожидался queued", secondCard.Status)
+	}
+	if secondCard.Text == nil || *secondCard.Text != correctedText {
+		t.Fatalf("Task.Text новой задачи = %v, ожидался %q", secondCard.Text, correctedText)
+	}
+
+	t.Logf("OK: «правка» текста запроса = отдельный POST /tasks (новая задача %s), оригинальная завершённая задача %s не перезапустилась (status=completed, text и updated_at не изменились, %d событий без изменений)", secondTaskID, taskID, eventsBeforeResubmit)
 }

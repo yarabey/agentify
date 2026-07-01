@@ -128,15 +128,19 @@ type Task struct {
 	IntegrationId *openapi_types.UUID `json:"integration_id,omitempty"`
 
 	// Status Статусы FSM, см. docs/Жизненный цикл задачи.md
-	Status    *TaskStatus `json:"status,omitempty"`
-	Text      *string     `json:"text,omitempty"`
-	UpdatedAt *time.Time  `json:"updated_at,omitempty"`
+	Status *TaskStatus `json:"status,omitempty"`
+
+	// Text Текст запроса на момент создания задачи; неизменяем (FR H3).
+	Text      *string    `json:"text,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // TaskCreate defines model for TaskCreate.
 type TaskCreate struct {
 	IntegrationId openapi_types.UUID `json:"integration_id"`
-	Text          string             `json:"text"`
+
+	// Text Текст запроса. Неизменяем после создания задачи (FR H3) — API для редактирования текста существующей задачи нет. Чтобы «исправить» уже отправленный запрос, нужно создать новую задачу отдельным POST /tasks (свой Idempotency-Key) — это отдельное действие («повтор»), не затрагивающее статус/журнал уже существующей задачи.
+	Text string `json:"text"`
 }
 
 // TaskEvent Элемент журнала задачи (FR H1, аудит F4)

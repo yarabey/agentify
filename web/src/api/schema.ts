@@ -980,6 +980,7 @@ export interface components {
         TaskCreate: {
             /** Format: uuid */
             integration_id: string;
+            /** @description Текст запроса. Неизменяем после создания задачи (FR H3) — API для редактирования текста существующей задачи нет. Чтобы «исправить» уже отправленный запрос, нужно создать новую задачу отдельным POST /tasks (свой Idempotency-Key) — это отдельное действие («повтор»), не затрагивающее статус/журнал уже существующей задачи. */
             text: string;
         };
         Task: {
@@ -987,6 +988,7 @@ export interface components {
             id?: string;
             /** Format: uuid */
             integration_id?: string;
+            /** @description Текст запроса на момент создания задачи; неизменяем (FR H3). */
             text?: string;
             status?: components["schemas"]["TaskStatus"];
             /** Format: date-time */
