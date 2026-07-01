@@ -20,10 +20,19 @@
 #     `go test -tags=integration ./...`; сейчас файлов с тегом `integration` нет,
 #     поэтому джоба зелёная (no-op), но каркас готов к появлению тестов. Подробнее —
 #     deploy/README.md, раздел «CI».
+#   * Джоба `agent-release-build` (тикет 4.1) — CI-гейт «CI собирает все
+#     таргеты» из приёмки тикета: НЕ публикует релиз (это делает отдельный
+#     workflow release-agent.yml по git-тегу `v*`), а на каждый PR/push
+#     прогоняет `goreleaser build --snapshot --clean` по .goreleaser.yaml и
+#     явно проверяет, что в dist/ появились ровно 4 бинарника агента (по
+#     одному на darwin/amd64, darwin/arm64, linux/amd64, linux/arm64) — чтобы
+#     поломка кросс-компиляции не проходила незамеченной. GoReleaser
+#     фиксирован на v2.5.1 (совпадает с Makefile GORELEASER_VERSION и
+#     release-agent.yml).
 #
 # Required-статусы для branch protection (настраивается вручную, MANUAL_STEPS —
 # в коде protection не задаётся): lint, build, test, generate-check, docs-check,
-# bdd, web, integration. См. README.md раздел «CI».
+# bdd, web, integration, agent-release-build. См. README.md раздел «CI».
 #
 # Секреты в YAML значениями НЕ храним (AGENTS.md §8) — этому workflow секреты не
 # нужны; при необходимости они приходят через GitHub Secrets/Environments (тикет 0.5).
@@ -56,6 +65,9 @@ env:
   # Версия golangci-lint фиксирована (совпадает с Makefile GOLANGCI_LINT_VERSION
   # и системным /usr/local/bin/golangci-lint локально).
   GOLANGCI_LINT_VERSION: "v2.5.0"
+  # Версия GoReleaser фиксирована (совпадает с Makefile GORELEASER_VERSION и
+  # .github/workflows/release-agent.yml) — используется джобой agent-release-build.
+  GORELEASER_VERSION: "v2.5.1"
 
 jobs:
   # --- Маршрутизация по путям (path-фильтры) ---------------------------------
@@ -85,6 +97,7 @@ jobs:
               - 'sqlc.yaml'
               - 'orchestrator/migrations/**'
               - 'deploy/scripts/**'
+              - '.goreleaser.yaml'
               - '.github/workflows/ci.yml'
             web:
               - 'web/**'
@@ -227,6 +240,60 @@ jobs:
         run: docker version
       - name: go test -tags=integration ./...
         run: go test -tags=integration ./...
+
+  # --- Релиз агента: CI собирает все таргеты (приёмка тикета 4.1) ------------
+  # Проверяет, что кросс-сборка агента через GoReleaser (.goreleaser.yaml)
+  # реально работает на каждый PR/push — БЕЗ публикации (публикация — отдельный
+  # workflow release-agent.yml по git-тегу `v*`). `--snapshot` не требует
+  # реального тега (детерминированная версия из snapshot.version_template).
+  agent-release-build:
+    name: agent-release-build
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install goreleaser ${{ env.GORELEASER_VERSION }}
+        run: go install github.com/goreleaser/goreleaser/v2@${{ env.GORELEASER_VERSION }}
+      - name: goreleaser check (валидация .goreleaser.yaml)
+        run: goreleaser check
+      - name: goreleaser build --snapshot --clean
+        run: goreleaser build --snapshot --clean
+      # Явная проверка «собирает все таргеты» (приёмка тикета 4.1, дословно из
+      # MVP_TICKETS.md): ровно 4 бинарника agentify-agent — по одному на
+      # darwin/amd64, darwin/arm64, linux/amd64, linux/arm64. Не полагаемся
+      # только на success-код `goreleaser build`: если один таргет молча
+      # выпадет из матрицы (например, из-за правки .goreleaser.yaml), success
+      # code всё равно будет нулевым — считаем бинарники поимённо.
+      - name: Проверить, что собраны все 4 таргета
+        run: |
+          set -euo pipefail
+          expected="dist/agentify-agent_darwin_amd64_v1/agentify-agent
+          dist/agentify-agent_darwin_arm64_v8.0/agentify-agent
+          dist/agentify-agent_linux_amd64_v1/agentify-agent
+          dist/agentify-agent_linux_arm64_v8.0/agentify-agent"
+          missing=0
+          while IFS= read -r bin; do
+            if [ ! -f "${bin}" ]; then
+              echo "FAIL: не найден бинарник ${bin}" >&2
+              missing=1
+            else
+              echo "OK: ${bin}"
+            fi
+          done <<< "${expected}"
+          count="$(find dist -type f -name 'agentify-agent' | wc -l)"
+          if [ "${count}" -ne 4 ]; then
+            echo "FAIL: ожидалось 4 бинарника agentify-agent в dist/, найдено ${count}" >&2
+            missing=1
+          fi
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "agent-release-build: все 4 таргета собраны (darwin/linux × amd64/arm64)"
 
   # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
   # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим
