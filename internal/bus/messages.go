@@ -116,6 +116,14 @@ type UserAnswerPayload struct {
 	Text       string `json:"text"`
 }
 
+// ErrorPayload — payload сообщения type == MessageTypeError (тикет 5.8,
+// FR E1, protocol.md §4): ошибка агента или машины, переводящая задачу в
+// failed.
+type ErrorPayload struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 // CommandApprovalRequestPayload — payload сообщения type ==
 // MessageTypeCommandApprovalRequest (тикет 4.5/6.1, FR F3): провайдер
 // (agent/internal/provider/claudecode) перехватил запрос CLI на выполнение
