@@ -21,6 +21,14 @@
 //
 // Access-токены выпускаются напрямую через auth.IssueAccessToken (как в
 // admin_integration_test.go) — без прохождения через /auth/login.
+//
+// Отдельно (TestIntegration_Integrations_PatchDuringRunningTaskDoesNotBreakTask,
+// тикет 2.5, FR B5, Gherkin §2 «Редактирование не рвёт активные задачи»)
+// покрываем пересечение PATCH с активной задачей: createTestIntegration/
+// getTaskRowStatus переиспользованы из tasks_integration_test.go (тот же
+// пакет api_test, оба файла компилируются вместе), доводим задачу до
+// running через task.Transitioner — тем же приёмом, что и
+// TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding.
 package api_test
 
 import (
@@ -32,9 +40,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/yarabey/agentify/internal/auth"
 	"github.com/yarabey/agentify/orchestrator/internal/api"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
 // createTestUserWithToken создаёт пользователя и выпускает ему access-токен —
@@ -327,4 +338,106 @@ func TestIntegration_Integrations_PatchUpdatesNameKeepsUUID(t *testing.T) {
 		t.Fatalf("uuid после PATCH (%v) изменился относительно исходного (%v)", fetched.Uuid, created.Uuid)
 	}
 	t.Logf("OK: PATCH меняет name (видно при последующем GET), uuid не меняется")
+}
+
+// TestIntegration_Integrations_PatchDuringRunningTaskDoesNotBreakTask —
+// приёмка тикета 2.5 (FR B5, Gherkin §2 «Редактирование не рвёт активные
+// задачи»): реальный HTTP PATCH /integrations/{id} во время running-задачи
+// этой интеграции не меняет tasks.status, не добавляет лишних task_events, и
+// FSM задачи по-прежнему способна штатно перейти дальше (running→
+// waiting_user) ПОСЛЕ patch'а — это и есть эмпирическое доказательство «не
+// рвёт», а не просто «поле не тронуто». Дополняет
+// TestIntegration_Integrations_PatchUpdatesNameKeepsUUID (тот проверяет
+// name/uuid без участия задач вообще).
+func TestIntegration_Integrations_PatchDuringRunningTaskDoesNotBreakTask(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-patch-running-task")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-running")
+
+	// Предусловие: задача доведена до running (created→queued→running), тем
+	// же приёмом, что и TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding
+	// (tasks_integration_test.go).
+	idempotencyKey := "patch-during-running-key-1"
+	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integration.ID,
+		TextEnc:        []byte("длинная задача, идущая во время редактирования интеграции"),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	taskID := taskRow.ID
+
+	tr := task.NewTransitioner(pool)
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, terr := tr.Transition(ctx, taskID, trigger); terr != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, terr)
+		}
+	}
+	if status := getTaskRowStatus(ctx, t, pool, taskID); status != string(task.StatusRunning) {
+		t.Fatalf("подготовка: tasks.status = %s, ожидался running", status)
+	}
+
+	var eventsBefore int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id = $1`, taskID).Scan(&eventsBefore); err != nil {
+		t.Fatalf("SELECT count(task_events) до PATCH: %v", err)
+	}
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	// Реальный HTTP PATCH меняет ОБА поля (name И ip_hint) одновременно —
+	// тикет прямо перечисляет оба поля.
+	newName := "renamed-during-running"
+	newIPHint := "203.0.113.7"
+	integrationID := uuid.UUID(integration.ID.Bytes)
+	patchRec := doIntegrationsRequest(t, router, http.MethodPatch, "/integrations/"+integrationID.String(), token, api.IntegrationUpdate{
+		Name:   &newName,
+		IpHint: &newIPHint,
+	})
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("PATCH: статус = %d (%s), ожидался 200", patchRec.Code, patchRec.Body.String())
+	}
+	var patched api.Integration
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("unmarshal patch: %v", err)
+	}
+	if patched.Name == nil || *patched.Name != newName {
+		t.Fatalf("PATCH ответ name = %v, ожидалось %q", patched.Name, newName)
+	}
+	if patched.IpHint == nil || *patched.IpHint != newIPHint {
+		t.Fatalf("PATCH ответ ip_hint = %v, ожидалось %q", patched.IpHint, newIPHint)
+	}
+
+	// tasks.status всё ещё running — PATCH интеграции не тронул задачу.
+	if status := getTaskRowStatus(ctx, t, pool, taskID); status != string(task.StatusRunning) {
+		t.Fatalf("tasks.status после PATCH = %s, ожидался running (PATCH не должен трогать задачи)", status)
+	}
+
+	// task_events не выросли — PATCH не породил никаких лишних записей.
+	var eventsAfter int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id = $1`, taskID).Scan(&eventsAfter); err != nil {
+		t.Fatalf("SELECT count(task_events) после PATCH: %v", err)
+	}
+	if eventsAfter != eventsBefore {
+		t.Fatalf("task_events выросли с %d до %d после PATCH интеграции — PATCH не должен писать события задачи", eventsBefore, eventsAfter)
+	}
+
+	// Эмпирическое доказательство «не рвёт»: FSM задачи по-прежнему штатно
+	// продолжается ПОСЛЕ PATCH (running→waiting_user через тот же реальный
+	// Transitioner, что использует продакшн-код).
+	if _, _, terr := tr.Transition(ctx, taskID, task.TriggerAgentQuestion); terr != nil {
+		t.Fatalf("Transition(agent_question) после PATCH интеграции: %v (задача не должна быть сломана правкой интеграции)", terr)
+	}
+	if status := getTaskRowStatus(ctx, t, pool, taskID); status != string(task.StatusWaitingUser) {
+		t.Fatalf("tasks.status после Transition = %s, ожидался waiting_user", status)
+	}
+
+	t.Logf("OK: PATCH интеграции во время running-задачи меняет name+ip_hint (200), не трогает tasks.status/task_events, задача продолжает штатно переходить по FSM")
 }
