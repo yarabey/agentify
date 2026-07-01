@@ -150,6 +150,16 @@ func (f *fakeServer) handleEventFrame(ctx context.Context, conn *websocket.Conn,
 	_ = conn.Write(ctx, websocket.MessageText, ackData)
 }
 
+// lastConn возвращает последнее принятое ServeHTTP соединение — нужен
+// тестам task_assigned (тикет 5.4), которым нужно писать команду СЕРВЕРОМ в
+// уже установленное соединение (в отличие от событий, которые сервер только
+// читает).
+func (f *fakeServer) lastConn() *websocket.Conn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.conns[len(f.conns)-1]
+}
+
 func (f *fakeServer) helloCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -730,5 +740,252 @@ func TestSendEventSurvivesOrchestratorRestart(t *testing.T) {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("client.Run не завершился после отмены ctx (завис)")
+	}
+}
+
+// fakeTaskAssignedHandler — подменный Config.OnTaskAssigned для тестов
+// (тикет 5.4): запоминает все полученные конверты и возвращает
+// настраиваемую ошибку (err), имитируя провал "не удалось даже начать
+// задачу" (нет провайдера/невалидный payload — см. годок
+// Config.OnTaskAssigned).
+type fakeTaskAssignedHandler struct {
+	err error
+
+	mu       sync.Mutex
+	received []bus.Envelope
+}
+
+func (h *fakeTaskAssignedHandler) handle(_ context.Context, env bus.Envelope) error {
+	h.mu.Lock()
+	h.received = append(h.received, env)
+	h.mu.Unlock()
+	return h.err
+}
+
+func (h *fakeTaskAssignedHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.received)
+}
+
+// taskAssignedEnvelope собирает валидный конверт type==task_assigned
+// (protocol.md §4, тикет 5.4) с заданным message_id/task_id.
+func taskAssignedEnvelope(t *testing.T, messageID, integrationID, taskID string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.TaskAssignedPayload{Text: "сделай что-нибудь полезное"})
+	if err != nil {
+		t.Fatalf("marshal TaskAssignedPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   integrationID,
+		Type:            bus.MessageTypeTaskAssigned,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// writeServerFrame пишет data от лица сервера (оркестратора) в conn — общий
+// хелпер для тестов task_assigned, зеркало writeClientFrame в
+// orchestrator/internal/api/machine_ws_test.go.
+func writeServerFrame(t *testing.T, conn *websocket.Conn, data []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Fatalf("writeServerFrame: %v", err)
+	}
+}
+
+// findAckFor ищет среди накопленных fake-сервером кадров (см.
+// fakeServer.eventsSnapshot — сервер складывает туда ЛЮБОЙ кадр,
+// полученный от клиента после hello, включая ack) конверт type==ack с
+// заданным ack_message_id.
+func findAckFor(envs []bus.Envelope, wantAckMessageID string) bool {
+	for _, env := range envs {
+		if env.Type != bus.MessageTypeAck {
+			continue
+		}
+		var payload bus.AckPayload
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.AckMessageID == wantAckMessageID {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForAck ждёт, пока среди кадров, полученных fake-сервером от клиента,
+// не появится ack с заданным ack_message_id (тот же приём опроса, что и
+// waitForHellos/waitForEvents).
+func waitForAck(t *testing.T, srv *fakeServer, wantAckMessageID string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if findAckFor(srv.eventsSnapshot(), wantAckMessageID) {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
+// TestHandleFrame_TaskAssigned_HappyPath_SendsAck — task_assigned с
+// настроенным OnTaskAssigned, вернувшим nil, → клиент вызывает колбэк и
+// немедленно отвечает ack с правильным ack_message_id (тикет 5.4, FR E1).
+func TestHandleFrame_TaskAssigned_HappyPath_SendsAck(t *testing.T) {
+	srv := newFakeServer(t, false /* держим соединение живым */)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeTaskAssignedHandler{}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnTaskAssigned:    handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	taskID := uuid.NewString()
+	env := taskAssignedEnvelope(t, messageID, integrationUUID, taskID)
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if !waitForAck(t, srv, messageID, 3*time.Second) {
+		t.Fatal("сервер не получил ack на task_assigned, хотя OnTaskAssigned вернул nil")
+	}
+	if handler.count() != 1 {
+		t.Fatalf("OnTaskAssigned вызван %d раз(а), ожидался 1", handler.count())
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_TaskAssigned_HandlerError_NoAck — OnTaskAssigned вернул
+// ошибку (задачу не удалось даже начать) → клиент НЕ отправляет ack (агент
+// получит редоставку той же команды от моста, тикет 5.4).
+func TestHandleFrame_TaskAssigned_HandlerError_NoAck(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	handler := &fakeTaskAssignedHandler{err: errors.New("нет доступного провайдера для задачи")}
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		OnTaskAssigned:    handler.handle,
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := taskAssignedEnvelope(t, messageID, integrationUUID, uuid.NewString())
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	// handler.count()==1 подтверждает, что колбэк реально был вызван (не
+	// просто гонка "сервер ещё не отправил кадр") — только после этого имеет
+	// смысл проверять отсутствие ack.
+	deadline := time.Now().Add(2 * time.Second)
+	for handler.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if handler.count() != 1 {
+		t.Fatal("OnTaskAssigned не был вызван за отведённое время")
+	}
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnTaskAssigned вернул ошибку")
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestHandleFrame_TaskAssigned_NoHandlerConfigured_NoAckNoPanic —
+// OnTaskAssigned не настроен (nil, значение по умолчанию Config) →
+// task_assigned молча игнорируется: ack не отправляется, клиент не
+// паникует и продолжает работать (обратная совместимость с тикетом 3.5,
+// тикет 5.4).
+func TestHandleFrame_TaskAssigned_NoHandlerConfigured_NoAckNoPanic(t *testing.T) {
+	srv := newFakeServer(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude-code"},
+		// OnTaskAssigned намеренно не задан.
+	}
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	messageID := bus.NewMessageID()
+	env := taskAssignedEnvelope(t, messageID, integrationUUID, uuid.NewString())
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	writeServerFrame(t, srv.lastConn(), data)
+
+	if waitForAck(t, srv, messageID, 300*time.Millisecond) {
+		t.Fatal("сервер получил ack, хотя OnTaskAssigned не настроен")
+	}
+
+	cancel()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run должен был вернуть ошибку отмены ctx, получен nil")
 	}
 }

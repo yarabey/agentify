@@ -25,14 +25,19 @@
 // СЕССИЯ соединения (см. connSession) — пара конкурентных циклов,
 // живущих и завершающихся вместе на время жизни ОДНОГО соединения через
 // errgroup с общим ctx:
-//   - read-loop читает входящие кадры; распознаёт только type==ack
+//   - read-loop читает входящие кадры; распознаёт type==ack
 //     (bus.MessageTypeAck/bus.AckPayload, зеркало parseAckFrame/
 //     handleMachineFrame из machine_ws.go) и сигнализирует send-loop'у
 //     через ack-per-message канал (тот же паттерн "pending map[string]chan
 //     struct{}", что orchestrator/internal/bridge.Bridge, только зеркально:
-//     здесь агент ждёт ack оркестратора на СВОЁ исходящее событие). Любой
-//     иной/нераспознанный кадр молча игнорируется (обработка команд —
-//     EPIC 5.x, вне объёма).
+//     здесь агент ждёт ack оркестратора на СВОЁ исходящее событие), а также
+//     type==task_assigned (FR E1, тикет 5.4) — вызывает
+//     Config.OnTaskAssigned и, при успехе, немедленно отвечает ack-кадром
+//     (writeAck); бизнес-логика запуска задачи (выбор провайдера, durable
+//     постановка task_accepted в outbox) целиком живёт в вызывающем коде
+//     (agent/main.go), wsclient её не знает. Любой иной/нераспознанный кадр
+//     молча игнорируется (обработка user_answer/command_decision/
+//     cancel/ping — EPIC 5.x, вне объёма).
 //   - send-loop читает outbox.Pending() и последовательно шлёт каждое
 //     событие, ждёт ack именно на его message_id (или разрыва
 //     сессии/отмены ctx — БЕЗ отдельного внутреннего таймера "нет ack →
@@ -102,6 +107,14 @@ const helloWriteTimeout = 10 * time.Second
 // следующем коннекте").
 const eventWriteTimeout = 10 * time.Second
 
+// ackWriteTimeout — крайний срок отправки ack-кадра в ответ на успешно
+// обработанный task_assigned (тикет 5.4, зеркало machineEventAckWriteTimeout
+// в orchestrator/internal/api/machine_ws.go). Отдельная константа от
+// helloWriteTimeout/eventWriteTimeout — те ограничивают исходящий
+// hello/событие, эта — исходящий ack на входящую команду; значение то же
+// (10s), но семантически это другая операция на другом направлении обмена.
+const ackWriteTimeout = 10 * time.Second
+
 // Config — параметры подключения агента к оркестратору (docs/protocol.md
 // §1, §4 "hello").
 type Config struct {
@@ -127,6 +140,24 @@ type Config struct {
 	// claude-code, ...; EPIC 4.5), переносится в hello
 	// (bus.HelloPayload.Providers).
 	Providers []string
+
+	// OnTaskAssigned — колбэк входящей команды task_assigned (тикет 5.4, FR
+	// E1). Вызывается синхронно из read-loop сессии СРАЗУ по получении
+	// кадра — реализация ОБЯЗАНА вернуться быстро (не блокировать на
+	// выполнении самой задачи; долгую работу — в отдельной горутине) и
+	// передать всю бизнес-логику (выбор провайдера, запуск, постановку
+	// task_accepted в outbox) наружу, в agent/main.go — wsclient остаётся
+	// чисто транспортным пакетом (см. годок пакета). Возвращает ошибку
+	// ТОЛЬКО если задачу не удалось даже НАЧАТЬ (невалидный payload, нет
+	// сконфигурированного провайдера) — в этом случае wsclient НЕ шлёт ack
+	// (агент повторит попытку через redelivery моста, тот же at-least-once
+	// принцип, что и везде в протоколе); ошибки уже ЗАПУЩЕННОГО выполнения
+	// задачи (сбой самого провайдера) сюда не относятся — они вне объёма
+	// этого тикета (тикет 5.8). Пусто (nil) → task_assigned молча
+	// игнорируется, как и любой нераспознанный кадр (обратная совместимость
+	// с тикетом 3.5), но логируется предупреждением (см. handleFrame) —
+	// отличимо от штатного игнорирования прочих типов.
+	OnTaskAssigned func(ctx context.Context, env bus.Envelope) error
 }
 
 // validate проверяет обязательные поля Config (см. godoc New).
@@ -429,29 +460,110 @@ type connSession struct {
 }
 
 // readLoop читает входящие кадры до ошибки/закрытия соединения. Распознаёт
-// только type==ack (см. handleFrame/parseAckFrame) — любой иной или
-// нераспознанный кадр молча игнорируется (обработка команд
-// task_assigned/user_answer/... — вне объёма тикета 3.5, EPIC 5.x; тот же
-// принцип, что handleMachineFrame в orchestrator/internal/api/machine_ws.go).
+// type==ack и type==task_assigned (см. handleFrame) — любой иной или
+// нераспознанный кадр молча игнорируется (обработка
+// user_answer/command_decision/cancel/ping — вне объёма тикета 5.4, EPIC
+// 5.x; тот же принцип, что handleMachineFrame в
+// orchestrator/internal/api/machine_ws.go).
 func (s *connSession) readLoop(ctx context.Context) error {
 	for {
 		_, data, err := s.conn.Read(ctx)
 		if err != nil {
 			return err
 		}
-		s.handleFrame(data)
+		s.handleFrame(ctx, data)
 	}
 }
 
-// handleFrame разбирает один входящий кадр; при успешном разборе как
-// ack-конверта (protocol.md §4/§5) сигнализирует ожидающему sendAndAwaitAck
-// (см. registerPending/handleAck). Любой иной случай — no-op.
-func (s *connSession) handleFrame(data []byte) {
-	ackMessageID, ok := parseAckFrame(data)
-	if !ok {
+// handleFrame разбирает один входящий кадр:
+//   - type==ack (protocol.md §4/§5) сигнализирует ожидающему
+//     sendAndAwaitAck (см. registerPending/handleAck);
+//   - type==task_assigned (FR E1, тикет 5.4) вызывает
+//     Config.OnTaskAssigned; при её отсутствии (nil) или ошибке (задачу не
+//     удалось даже начать) ack НЕ отправляется — агент получит редоставку
+//     той же команды от моста оркестратора (at-least-once, тот же принцип,
+//     что и у остальных путей протокола); при успехе — немедленно отправляет
+//     ack-кадр (writeAck).
+//   - любой другой/нераспознанный кадр — no-op (см. godoc readLoop).
+func (s *connSession) handleFrame(ctx context.Context, data []byte) {
+	if ackMessageID, ok := parseAckFrame(data); ok {
+		s.handleAck(ackMessageID)
 		return
 	}
-	s.handleAck(ackMessageID)
+
+	var env bus.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return
+	}
+	if env.Type != bus.MessageTypeTaskAssigned {
+		return
+	}
+
+	if s.c.cfg.OnTaskAssigned == nil {
+		// Хэндлер не сконфигурирован (агент без wiring провайдера в
+		// main.go, либо намеренно) — штатно игнорируем, как и любой
+		// нераспознанный кадр (см. godoc Config.OnTaskAssigned), но
+		// логируем предупреждением, чтобы это было отличимо от штатного
+		// игнорирования прочих типов. Содержимое задачи (env.Payload) в лог
+		// НЕ попадает — та же дисциплина, что и в отношении кредов/секретов.
+		s.c.logger.Warn("task_assigned получен, но OnTaskAssigned не настроен — кадр проигнорирован",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+		)
+		return
+	}
+
+	if err := s.c.cfg.OnTaskAssigned(ctx, env); err != nil {
+		s.c.logger.Warn("OnTaskAssigned вернул ошибку — ack не отправлен, ожидаем redelivery",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	if err := s.writeAck(ctx, env.MessageID); err != nil {
+		s.c.logger.Warn("запись ack-кадра task_assigned в WS",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// writeAck строит и отправляет ack-конверт (protocol.md §4/§5,
+// bus.AckPayload) в ответ на успешно обработанный входящий кадр-команду
+// (сейчас — только task_assigned, тикет 5.4) — зеркало writeMachineAck из
+// orchestrator/internal/api/machine_ws.go, только с IntegrationID,
+// заполненным секретом интеграции (c.cfg.IntegrationUUID), а не DB id: у
+// агента, в отличие от оркестратора, нет доступа к DB id своей интеграции —
+// он и не нужен, оркестратор всё равно не доверяет присланному в конверте
+// значению (см. handleMachineEvent на серверной стороне).
+func (s *connSession) writeAck(ctx context.Context, ackMessageID string) error {
+	ack := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   s.c.cfg.IntegrationUUID,
+		Type:            bus.MessageTypeAck,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+	}
+	payload, err := json.Marshal(bus.AckPayload{AckMessageID: ackMessageID})
+	if err != nil {
+		return fmt.Errorf("wsclient: маршалинг AckPayload: %w", err)
+	}
+	ack.Payload = payload
+
+	data, err := ack.Marshal()
+	if err != nil {
+		return fmt.Errorf("wsclient: маршалинг ack-конверта: %w", err)
+	}
+
+	writeCtx, cancel := context.WithTimeout(ctx, ackWriteTimeout)
+	defer cancel()
+	if err := s.conn.Write(writeCtx, websocket.MessageText, data); err != nil {
+		return fmt.Errorf("wsclient: запись ack-кадра: %w", err)
+	}
+	return nil
 }
 
 // parseAckFrame пытается разобрать сырой WS-кадр как конверт type==ack
