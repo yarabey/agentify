@@ -38,6 +38,21 @@
 // (см. годок OnTaskAssigned); собственно выполнение (runTask) идёт в фоновой
 // горутине на переданном ctx (тот же ctx, что и у сессии wsclient — отмена
 // при остановке агента долетает и до подпроцесса, см. claudecode.Provider.Run).
+//
+// Тикет 6.5 (deps: 6.4, FR F3, Gherkin §5 «Отклонение команды») дополняет
+// taskAcceptor реализацией wsclient.Config.OnCommandDecision
+// (onCommandDecision): чтобы решение пользователя (approve/reject),
+// пришедшее по WS как конверт command_decision, могло дойти до КОНКРЕТНОГО
+// активного провайдера ИМЕННО той задачи, которой оно адресовано, active
+// хранит не просто факт "задача активна" (map[string]struct{}), а сам
+// активный taskRunner задачи (map[string]taskRunner) — onCommandDecision
+// находит его по task_id из конверта и вызывает его Approve(requestID,
+// decision). При decision=="reject" провайдер (agent/internal/provider/
+// claudecode, тикет 4.5, Provider.Approve) пишет control_response{behavior:
+// "deny"} в stdin подпроцесса CLI — именно это и есть «команда не
+// выполняется, агент действует с учётом отказа»: CLI получает отказ и
+// продолжает задачу без выполнения ИМЕННО этой команды, а не прерывает всю
+// задачу целиком.
 package main
 
 import (
@@ -54,15 +69,23 @@ import (
 )
 
 // taskRunner — узкий интерфейс исполнения одной задачи провайдером: только
-// то, что нужно taskAcceptor (Run). *claudecode.Provider удовлетворяет ему
-// структурно, без адаптера (тот же приём сужения интерфейса, что и
-// eventSender/Outbox/Querier в других частях проекта) — это позволяет
-// TestTaskAcceptor_* подменить провайдера фейком через newProvider, не
-// запуская реальный подпроцесс `claude`.
+// то, что нужно taskAcceptor (Run, Approve). *claudecode.Provider
+// удовлетворяет ему структурно, без адаптера (тот же приём сужения
+// интерфейса, что и eventSender/Outbox/Querier в других частях проекта) —
+// это позволяет TestTaskAcceptor_* подменить провайдера фейком через
+// newProvider, не запуская реальный подпроцесс `claude`.
 type taskRunner interface {
 	// Run выполняет задачу с текстом text и возвращает управление по
 	// завершении (успешном или нет) либо по отмене ctx.
 	Run(ctx context.Context, text string) error
+
+	// Approve применяет решение пользователя (decision: "approve"/"reject")
+	// по ранее запрошенному согласованию команды (requestID) — тикет 6.5, FR
+	// F3. Вызывается из onCommandDecision. См. claudecode.Provider.Approve
+	// (тикет 4.5) — реализация уже полностью готова там, здесь только её
+	// вызов для правильного активного экземпляра провайдера конкретной
+	// задачи.
+	Approve(requestID, decision string) error
 }
 
 // newProvider — фабрика taskRunner, используемая onTaskAssigned. Отдельная
@@ -109,11 +132,16 @@ type taskAcceptor struct {
 	// строка 33).
 	allowChecker claudecode.AllowChecker
 
-	// mu защищает active — доступ конкурентный: onTaskAssigned вызывается
-	// синхронно из read-loop wsclient, а runTask (в отдельной горутине)
-	// удаляет task_id по завершении.
+	// mu защищает active — доступ конкурентный: onTaskAssigned/onCommandDecision
+	// вызываются синхронно из read-loop wsclient, а runTask (в отдельной
+	// горутине) удаляет task_id по завершении.
+	//
+	// active хранит task_id → сам активный taskRunner задачи (а не просто
+	// факт "задача активна", как было до тикета 6.5) — так onCommandDecision
+	// может найти ИМЕННО тот экземпляр провайдера, которому адресовано
+	// решение пользователя, и вызвать его Approve (см. годок файла).
 	mu     sync.Mutex
-	active map[string]struct{}
+	active map[string]taskRunner
 }
 
 // newTaskAcceptor собирает taskAcceptor с пустым множеством активных задач.
@@ -133,7 +161,7 @@ func newTaskAcceptor(cfg config, publisher claudecode.Publisher, logger *slog.Lo
 		publisher:    publisher,
 		logger:       logger,
 		allowChecker: allowChecker,
-		active:       make(map[string]struct{}),
+		active:       make(map[string]taskRunner),
 	}, nil
 }
 
@@ -176,13 +204,60 @@ func (a *taskAcceptor) onTaskAssigned(ctx context.Context, env bus.Envelope) err
 	}
 
 	a.mu.Lock()
-	a.active[taskID] = struct{}{}
+	a.active[taskID] = runner
 	a.mu.Unlock()
 
 	go a.runTask(ctx, runner, taskID, payload.Text)
 
 	a.sendTaskAccepted(ctx, env.TaskID)
 	return nil
+}
+
+// onCommandDecision — реализация wsclient.Config.OnCommandDecision (тикет
+// 6.5, FR F3, Gherkin §5 «Отклонение команды»): доводит решение пользователя
+// (approve/reject) по ранее запрошенному согласованию команды вне allowlist
+// (тикет 6.4) до КОНКРЕТНОГО активного провайдера задачи, которой оно
+// адресовано, и вызывает его Approve. Бизнес-обоснование: без этого звена
+// решение пользователя, дошедшее по WS от оркестратора, никак не попадало бы
+// в подпроцесс CLI — Provider.Approve (тикет 4.5) уже реализован и полностью
+// покрыт тестами, но до этого тикета его было некому вызвать.
+//
+// Возвращает ошибку (см. годок Config.OnCommandDecision — в этом случае
+// wsclient НЕ отправляет ack, ожидая редоставку того же решения):
+//   - env.TaskID отсутствует/пуст — невалидный конверт;
+//   - env.Payload не разбирается как bus.CommandDecisionPayload — невалидный
+//     payload;
+//   - payload.RequestID пуст — невалидный конверт;
+//   - для task_id нет активного runner'а в a.active (задача уже завершилась,
+//     либо решение адресовано неизвестной задаче) — нет НИ паники, ни
+//     попытки применить решение "в никуда";
+//   - runner.Approve вернул ошибку (claudecode.ErrUnknownRequest —
+//     неизвестный/уже применённый request_id, claudecode.ErrInvalidDecision —
+//     decision, отличный от "approve"/"reject") — пробрасывается как есть,
+//     это штатные at-least-once ситуации, специальной обработки здесь не
+//     требуют.
+func (a *taskAcceptor) onCommandDecision(_ context.Context, env bus.Envelope) error {
+	if env.TaskID == nil || *env.TaskID == "" {
+		return errors.New("agent: command_decision без task_id")
+	}
+	taskID := *env.TaskID
+
+	var payload bus.CommandDecisionPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return fmt.Errorf("agent: разобрать payload command_decision: %w", err)
+	}
+	if payload.RequestID == "" {
+		return errors.New("agent: command_decision без request_id")
+	}
+
+	a.mu.Lock()
+	runner, ok := a.active[taskID]
+	a.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("agent: нет активной задачи %s для command_decision", taskID)
+	}
+
+	return runner.Approve(payload.RequestID, payload.Decision)
 }
 
 // hasClaudeCodeConfigured — единственная поддерживаемая в MVP проверка
