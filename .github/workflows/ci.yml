@@ -29,10 +29,21 @@
 #     поломка кросс-компиляции не проходила незамеченной. GoReleaser
 #     фиксирован на v2.5.1 (совпадает с Makefile GORELEASER_VERSION и
 #     release-agent.yml).
+#   * Джоба `agent-install-test` (тикет 4.2, deps: 4.1) — CI-гейт приёмки
+#     тикета «прогон в чистых Docker-образах ubuntu»: собирает реальные
+#     релизные архивы (`goreleaser release --snapshot --clean
+#     --skip=publish,announce,sign,validate`, в отличие от agent-release-build
+#     нужен именно `release`, а не `build`, чтобы получить tar.gz+checksums.txt),
+#     синтезирует правдоподобный тег версии из имени собранного архива и
+#     гоняет install/test-install.sh целиком (скачивание+sha256+установка
+#     бинаря+установка Node.js+самопроверка --version) внутри одноразового
+#     `docker run ubuntu:24.04` — чистая ОС без предустановленного Node,
+#     реально проверяющая ветку установки Node.js «с нуля».
 #
 # Required-статусы для branch protection (настраивается вручную, MANUAL_STEPS —
 # в коде protection не задаётся): lint, build, test, generate-check, docs-check,
-# bdd, web, integration, agent-release-build. См. README.md раздел «CI».
+# bdd, web, integration, agent-release-build, agent-install-test. См. README.md
+# раздел «CI».
 #
 # Секреты в YAML значениями НЕ храним (AGENTS.md §8) — этому workflow секреты не
 # нужны; при необходимости они приходят через GitHub Secrets/Environments (тикет 0.5).
@@ -97,6 +108,7 @@ jobs:
               - 'sqlc.yaml'
               - 'orchestrator/migrations/**'
               - 'deploy/scripts/**'
+              - 'install/**'
               - '.goreleaser.yaml'
               - '.github/workflows/ci.yml'
             web:
@@ -294,6 +306,60 @@ jobs:
             exit 1
           fi
           echo "agent-release-build: все 4 таргета собраны (darwin/linux × amd64/arm64)"
+
+  # --- Установка агента одной командой: install.sh в чистом Ubuntu -----------
+  # CI-гейт приёмки тикета 4.2 (deps: 4.1) «Тесты: прогон в чистых
+  # Docker-образах ubuntu». В отличие от agent-release-build (goreleaser
+  # build) здесь нужен полный `release` (без публикации), чтобы получить
+  # реальные tar.gz + checksums.txt — то, что реально качает install.sh.
+  # Реального git-тега на этом коммите нет, поэтому тег для фейкового релиза
+  # синтезируется здесь же (обязанность CI, не install.sh/test-install.sh) из
+  # версии, которую GoReleaser проставил в имя snapshot-архива. Node.js в
+  # контейнер НЕ предустанавливается — так тест реально проверяет ветку
+  # установки Node внутри install.sh.
+  agent-install-test:
+    name: agent-install-test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install goreleaser ${{ env.GORELEASER_VERSION }}
+        run: go install github.com/goreleaser/goreleaser/v2@${{ env.GORELEASER_VERSION }}
+      - name: goreleaser release --snapshot --clean --skip=publish,announce,sign,validate
+        run: goreleaser release --snapshot --clean --skip=publish,announce,sign,validate
+      - name: Вычислить тег для фейкового релиза из имени собранного архива
+        id: tag
+        run: |
+          set -euo pipefail
+          archive="$(basename dist/agentify-agent_*_linux_amd64.tar.gz)"
+          version="$(echo "${archive}" | sed -E 's/agentify-agent_(.+)_linux_amd64\.tar\.gz/\1/')"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+      # install.sh в реальности всегда запускается через `curl ... | bash`
+      # (пользователь уже доказал наличие curl самим способом запуска
+      # скрипта) — чистый ubuntu:24.04 не содержит даже curl, поэтому здесь
+      # явно предустанавливаем ровно тот минимум, который в реальном сценарии
+      # уже гарантирован способом доставки install.sh. Тестировать «системы
+      # совсем без curl» — нереалистичный edge case для curl-pipe-bash
+      # инсталлятора, сознательно не проверяем.
+      - name: install.sh целиком в одноразовом ubuntu:24.04 (docker run)
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo:ro" -w /work -e TAG="${TAG}" ubuntu:24.04 bash -c '
+            set -euo pipefail
+            cp -r /repo/install /repo/dist /work/
+            apt-get update -qq
+            apt-get install -y -qq curl ca-certificates tar python3
+            ./install/test-install.sh "${TAG}" dist
+          '
+      - name: agent-install-test итог
+        run: 'echo "agent-install-test: install.sh отработал в чистом ubuntu:24.04, Node установлен, agentify-agent --version прошёл самопроверку"'
 
   # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
   # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим
