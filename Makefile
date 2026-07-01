@@ -26,7 +26,7 @@ SQLC         ?= $(GOBIN)/sqlc
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke
+.PHONY: help tools tools-generate tools-generate-go generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke
 
 # Compose-файл локального стека (тикет 0.3).
 COMPOSE_FILE ?= deploy/docker-compose.yml
@@ -44,6 +44,15 @@ tools: ## Установить инструментарий (sqlc, goose, oapi-c
 	go install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 	npm --prefix web ci
 	@echo "tools installed into $(GOBIN) и web/node_modules (openapi-typescript)"
+
+tools-generate-go: ## Установить только Go-инструменты кодогенерации (sqlc, oapi-codegen) — без npm (см. tools-generate).
+	go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
+	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
+	@echo "tools-generate-go: sqlc+oapi-codegen installed into $(GOBIN)"
+
+tools-generate: tools-generate-go ## Установить только инструменты кодогенерации (sqlc, oapi-codegen) + npm-зависимости web — используется generate-check в CI (без golangci-lint/goose/goreleaser, они там не нужны).
+	npm --prefix web ci
+	@echo "tools-generate: sqlc+oapi-codegen installed into $(GOBIN) и web/node_modules (openapi-typescript)"
 
 generate: generate-go generate-ts generate-sql ## Кодогенерация из openapi.yaml (oapi-codegen, openapi-typescript) и схемы БД (sqlc).
 	@echo "generate: done (go types+server, ts schema, sqlc models)"
