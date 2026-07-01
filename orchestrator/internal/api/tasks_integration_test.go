@@ -27,6 +27,14 @@
 // несуществующая задача → 404 одинаково для карточки и журнала; фильтрация
 // GetTasks по integration_id/status. Эти тесты не поднимают Redpanda — сами
 // хендлеры GetTasks/GetTasksId/GetTasksIdEvents читают только БД.
+//
+// Дополнительно покрывает бессрочное хранение (тикет 8.7, FR I2, Gherkin §10
+// «Бессрочное хранение»): задача, заведомо завершённая давно (created_at/
+// updated_at и все task_events.created_at принудительно перенесены в 2023
+// год напрямую в БД, в обход бизнес-логики), остаётся полностью доступна
+// через GET /tasks, GET /tasks/{id} и GET /tasks/{id}/events — ни карточка,
+// ни журнал не урезаются и не скрываются по возрасту (авто-удаления в
+// кодовой базе нет и не предполагается).
 package api_test
 
 import (
@@ -109,6 +117,25 @@ func createTestIntegration(ctx context.Context, t *testing.T, q *db.Queries, use
 		t.Fatalf("CreateIntegration (%s): %v", name, err)
 	}
 	return integration
+}
+
+// backdateTaskAndEvents — прямой UPDATE tasks.created_at/updated_at и
+// task_events.created_at, минуя бизнес-логику (эмуляция «задача завершена
+// давно» для теста бессрочного хранения, тикет 8.7, FR I2) — тот же приём,
+// что setIntegrationLastSeenAt в stale_worker_integration_test.go (пакет
+// task_test), только для задач/событий вместо last_seen_at интеграции.
+func backdateTaskAndEvents(ctx context.Context, t *testing.T, pool *pgxpool.Pool, taskID pgtype.UUID, at time.Time) {
+	t.Helper()
+	tag, err := pool.Exec(ctx, `UPDATE tasks SET created_at = $1, updated_at = $1 WHERE id = $2`, at, taskID)
+	if err != nil {
+		t.Fatalf("backdate tasks: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("backdate tasks затронул %d строк, ожидалась 1", tag.RowsAffected())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE task_events SET created_at = $1 WHERE task_id = $2`, at, taskID); err != nil {
+		t.Fatalf("backdate task_events: %v", err)
+	}
 }
 
 // doPostTasksRequest шлёт POST /tasks через httptest поверх router с
@@ -1049,4 +1076,161 @@ func TestIntegration_GetTasks_FiltersByIntegrationAndStatus(t *testing.T) {
 		t.Fatalf("GET /tasks без фильтров вернул %d задач, ожидалось 2", len(all))
 	}
 	t.Logf("OK: GetTasks фильтрует по integration_id и по status независимо")
+}
+
+// TestIntegration_GetTasks_OldTaskStillAccessible — приёмка тикета 8.7
+// (FR I2, Gherkin §10 «Бессрочное хранение»): «Дано задача завершена давно /
+// Когда я открываю историю / Тогда старая задача по-прежнему доступна / И
+// авто-удаления не происходит». Авто-удаления/purge/retention/TTL для
+// tasks/task_events в кодовой базе нет (ни в orchestrator/queries/tasks.sql,
+// ни в воркерах internal/task, ни в миграциях, ни в deploy/*) — этот тест
+// фиксирует свойство «доступ не ограничен возрастом» регрессионно: задача
+// доводится до completed обычным Transitioner (как в
+// TestIntegration_GetTasks_FullCycleAllFieldsPresent, без вопроса/ответа —
+// здесь предмет проверки только возраст, не состав полей), затем её
+// created_at/updated_at и created_at всех task_events принудительно
+// переносятся в прошлое напрямую в БД (backdateTaskAndEvents, в обход
+// бизнес-логики — эмуляция «задача завершена давно»). После этого через
+// РЕАЛЬНЫЕ HTTP-хендлеры GetTasks/GetTasksId/GetTasksIdEvents проверяется,
+// что задача и её полный журнал остаются полностью доступны — ни карточка,
+// ни список, ни события не урезаны и не скрыты по возрасту.
+func TestIntegration_GetTasks_OldTaskStillAccessible(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, doneDB := setupDB(ctx, t)
+	defer doneDB()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-tasks-old")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-old")
+
+	idempotencyKey := "old-task-key-1"
+	const text = "древняя задача"
+	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         user.ID,
+		IntegrationID:  integration.ID,
+		TextEnc:        []byte(text),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	taskID := taskRow.ID
+
+	tr := task.NewTransitioner(pool)
+
+	// Полный цикл до completed: created→queued→running→awaiting_confirm→completed.
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, terr := tr.Transition(ctx, taskID, trigger); terr != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, terr)
+		}
+	}
+	const summaryText = "готово давно"
+	completedPayload, merr := json.Marshal(bus.AgentCompletedPayload{Summary: summaryText})
+	if merr != nil {
+		t.Fatalf("marshal AgentCompletedPayload: %v", merr)
+	}
+	if _, _, terr := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentCompleted, "agent_completed", pgtype.UUID{}, completedPayload); terr != nil {
+		t.Fatalf("подготовка: TransitionWithEvent(agent_completed): %v", terr)
+	}
+	if _, _, terr := tr.Transition(ctx, taskID, task.TriggerUserConfirmed); terr != nil {
+		t.Fatalf("подготовка: Transition(user_confirmed): %v", terr)
+	}
+
+	// Заведомо давняя дата — нулевые наносекунды, чтобы избежать проблем с
+	// точностью postgres timestamptz при точном сравнении после round-trip
+	// через JSON.
+	oldTime := time.Date(2023, time.January, 15, 10, 0, 0, 0, time.UTC)
+	backdateTaskAndEvents(ctx, t, pool, taskID, oldTime)
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	router := api.NewRouter(server)
+
+	taskUUID := uuid.UUID(taskID.Bytes)
+
+	// --- GET /tasks/{id}: старая задача по-прежнему доступна как есть. ---
+	recCard := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskUUID.String(), token, nil)
+	if recCard.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id}: статус = %d (%s), ожидался 200", recCard.Code, recCard.Body.String())
+	}
+	var card api.Task
+	if uerr := json.Unmarshal(recCard.Body.Bytes(), &card); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id}: %v", uerr)
+	}
+	if card.Id == nil || *card.Id != taskUUID {
+		t.Fatalf("Task.Id = %v, ожидался %s", card.Id, taskUUID)
+	}
+	if card.Status == nil || *card.Status != api.Completed {
+		t.Fatalf("Task.Status = %v, ожидался completed", card.Status)
+	}
+	if card.CreatedAt == nil || !card.CreatedAt.UTC().Equal(oldTime) {
+		t.Fatalf("Task.CreatedAt = %v, ожидался %v (задача не должна выглядеть свежее, чем backdate)", card.CreatedAt, oldTime)
+	}
+	if card.UpdatedAt == nil || !card.UpdatedAt.UTC().Equal(oldTime) {
+		t.Fatalf("Task.UpdatedAt = %v, ожидался %v", card.UpdatedAt, oldTime)
+	}
+	if age := time.Since(*card.CreatedAt); age < 365*24*time.Hour {
+		t.Fatalf("time.Since(Task.CreatedAt) = %v, ожидалось явно «давно» (> года)", age)
+	}
+	t.Logf("OK: GET /tasks/{id} — задача, завершённая давно (%v), по-прежнему полностью доступна", oldTime)
+
+	// --- GET /tasks: список НЕ скрывает и НЕ пропускает старую задачу. ---
+	recList := doIntegrationsRequest(t, router, http.MethodGet, "/tasks", token, nil)
+	if recList.Code != http.StatusOK {
+		t.Fatalf("GET /tasks: статус = %d (%s), ожидался 200", recList.Code, recList.Body.String())
+	}
+	var list []api.Task
+	if uerr := json.Unmarshal(recList.Body.Bytes(), &list); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks: %v", uerr)
+	}
+	var found *api.Task
+	for i := range list {
+		if list[i].Id != nil && *list[i].Id == taskUUID {
+			found = &list[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("старая задача %s не найдена в GET /tasks (получено %d задач) — авто-удаление/сокрытие по возрасту недопустимо", taskUUID, len(list))
+	}
+	if found.CreatedAt == nil || !found.CreatedAt.UTC().Equal(oldTime) {
+		t.Fatalf("в списке Task.CreatedAt = %v, ожидался %v", found.CreatedAt, oldTime)
+	}
+	t.Logf("OK: GET /tasks по-прежнему включает старую задачу")
+
+	// --- GET /tasks/{id}/events: журнал не усечён и не скрыт по возрасту. ---
+	recEvents := doIntegrationsRequest(t, router, http.MethodGet, "/tasks/"+taskUUID.String()+"/events", token, nil)
+	if recEvents.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/{id}/events: статус = %d (%s), ожидался 200", recEvents.Code, recEvents.Body.String())
+	}
+	var events []api.TaskEvent
+	if uerr := json.Unmarshal(recEvents.Body.Bytes(), &events); uerr != nil {
+		t.Fatalf("unmarshal GET /tasks/{id}/events: %v", uerr)
+	}
+	// Ожидаемая последовательность типов (см. transition.go, тот же принцип,
+	// что в TestIntegration_GetTasks_FullCycleAllFieldsPresent):
+	//   enqueued        → status_change
+	//   task_accepted   → status_change
+	//   agent_completed → agent_completed, status_change
+	//   user_confirmed  → status_change
+	wantTypes := []api.TaskEventType{
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeAgentCompleted,
+		api.TaskEventTypeStatusChange,
+		api.TaskEventTypeStatusChange,
+	}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("количество событий = %d, ожидалось %d (журнал не должен быть усечён по возрасту): %+v", len(events), len(wantTypes), events)
+	}
+	for i, e := range events {
+		if e.Type == nil || *e.Type != wantTypes[i] {
+			t.Fatalf("событие #%d: Type = %v, ожидался %q", i, e.Type, wantTypes[i])
+		}
+		if e.CreatedAt == nil || !e.CreatedAt.UTC().Equal(oldTime) {
+			t.Fatalf("событие #%d (%s): CreatedAt = %v, ожидался %v — журнал не должен скрывать давние события", i, *e.Type, e.CreatedAt, oldTime)
+		}
+	}
+	t.Logf("OK: GET /tasks/{id}/events — все %d событий давней задачи по-прежнему доступны, авто-удаления не произошло", len(events))
 }
