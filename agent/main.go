@@ -204,15 +204,26 @@ func run() error {
 		}
 		defer func() { _ = store.Close() }()
 
+		// acceptor реализует приём задачи (тикет 5.4, FR E1, agent/task_runner.go):
+		// wsclient.Config.OnTaskAssigned ниже. acceptor.sender заполняется ПОСЛЕ
+		// конструирования wsClient (см. присвоение ниже) — конструктору
+		// wsclient.New нужен уже готовый OnTaskAssigned, а самому acceptor'у для
+		// отправки task_accepted нужен уже готовый wsClient: разрыв цикла через
+		// отложенное присвоение поля (acceptor.onTaskAssigned как метод указателя
+		// захватывает *taskAcceptor, а не текущее значение sender).
+		acceptor := newTaskAcceptor(cfg, store, svc.Logger())
+
 		wsClient, err := wsclient.New(wsclient.Config{
 			OrchestratorWSURL: cfg.OrchestratorWSURL,
 			IntegrationUUID:   cfg.IntegrationUUID,
 			AgentVersion:      version,
 			Providers:         cfg.Providers,
+			OnTaskAssigned:    acceptor.onTaskAssigned,
 		}, store, wsclient.WithLogger(svc.Logger()))
 		if err != nil {
 			return fmt.Errorf("agent: AGENT_ORCHESTRATOR_WS_URL задан, но конфиг WS-клиента невалиден — задайте корректный AGENT_INTEGRATION_UUID (UUID, выданный при создании интеграции, см. docs/MANUAL_STEPS.md и POST /integrations, тикет 2.2): %w", err)
 		}
+		acceptor.sender = wsClient
 
 		g.Go(func() error {
 			return wsClient.Run(gctx)
