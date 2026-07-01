@@ -362,14 +362,14 @@ func (q *Queries) ListStaleTasksWithRecoveredMachine(ctx context.Context, lastSe
 const listWaitingUserTasksWithStaleQuestion = `-- name: ListWaitingUserTasksWithStaleQuestion :many
 SELECT tasks.id AS task_id, tasks.user_id AS user_id, latest.id AS question_event_id, latest.created_at AS question_created_at
 FROM tasks
-JOIN LATERAL (
-    SELECT id, created_at FROM task_events
-    WHERE task_events.task_id = tasks.id AND task_events.type = 'agent_question'
-    ORDER BY seq DESC
-    LIMIT 1
-) latest ON true
+JOIN (
+    SELECT id, task_id, created_at,
+           ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY seq DESC) AS rn
+    FROM task_events
+    WHERE type = 'agent_question'
+) latest ON latest.task_id = tasks.id AND latest.rn = 1
 WHERE tasks.status = 'waiting_user'
-  AND latest.created_at < $1
+  AND latest.created_at < $1::timestamptz
 `
 
 type ListWaitingUserTasksWithStaleQuestionRow struct {
@@ -382,14 +382,16 @@ type ListWaitingUserTasksWithStaleQuestionRow struct {
 // «Таймаут ответа» (тикет 6.7, FR F5): находит задачи в waiting_user, чей
 // САМЫЙ ПОСЛЕДНИЙ (по seq) agent_question устарел дольше порога — cutoff
 // считает вызывающая сторона (task.AnswerTimeoutWorker), здесь только
-// сравнение с created_at найденной записи. JOIN LATERAL, а не просто
-// MAX(created_at) по task_events, потому что вызывающей стороне нужен именно
-// id КОНКРЕТНОЙ записи task_events (question_event_id) — для дедупликации
-// повторных напоминаний по одному и тому же вопросу между тиками воркера, а
-// не только временная метка последнего вопроса. Результат передаётся в
-// notify.Notification (напоминание пользователю) и, при настроенном
-// поведении auto_cancel, в task.Transitioner.Transition(...,
-// TriggerCancelRequested).
+// сравнение с created_at найденной записи. Оконная функция ROW_NUMBER() (а не
+// JOIN LATERAL — sqlc v1.27.0 без live-database анализа не разрешает голый
+// параметр $1 при сравнении с колонкой derived table/LATERAL без явного
+// приведения типа) и не просто MAX(created_at) по task_events, потому что
+// вызывающей стороне нужен именно id КОНКРЕТНОЙ записи task_events
+// (question_event_id) — для дедупликации повторных напоминаний по одному и
+// тому же вопросу между тиками воркера, а не только временная метка
+// последнего вопроса. Результат передаётся в notify.Notification
+// (напоминание пользователю) и, при настроенном поведении auto_cancel, в
+// task.Transitioner.Transition(..., TriggerCancelRequested).
 func (q *Queries) ListWaitingUserTasksWithStaleQuestion(ctx context.Context, dollar_1 pgtype.Timestamptz) ([]ListWaitingUserTasksWithStaleQuestionRow, error) {
 	rows, err := q.db.Query(ctx, listWaitingUserTasksWithStaleQuestion, dollar_1)
 	if err != nil {
