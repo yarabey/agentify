@@ -30,7 +30,7 @@
 | 3.2 | done | #2 merge 3.2 | 2026-06-30 | Producer/Consumer (franz-go) |
 | 3.3 | done | merge de60a7a | 2026-06-30 | WS-транспорт агент↔оркестратор |
 | 3.4 | done | 244cc5e | 2026-06-30 | Мост оркестратора |
-| 3.5 | in_progress |  |  | Локальный outbox агента (bbolt) |
+| 3.5 | done | 96bdcbe | 2026-07-01 | Локальный outbox агента (bbolt) |
 | 3.6 | todo |  |  | Heartbeat и статус машины |
 | 4.1 | todo |  |  | Релиз бинаря агента |
 | 4.2 | todo |  |  | install.sh (одна команда) |
