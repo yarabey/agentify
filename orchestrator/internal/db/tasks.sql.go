@@ -54,6 +54,65 @@ func (q *Queries) CreateTask(ctx context.Context, arg CreateTaskParams) (Task, e
 	return i, err
 }
 
+const getTaskByIDAndIntegration = `-- name: GetTaskByIDAndIntegration :one
+SELECT id, user_id, integration_id, text_enc, status, idempotency_key, created_at, updated_at FROM tasks WHERE id = $1 AND integration_id = $2
+`
+
+type GetTaskByIDAndIntegrationParams struct {
+	ID            pgtype.UUID `json:"id"`
+	IntegrationID pgtype.UUID `json:"integration_id"`
+}
+
+// Ищет задачу по id, scoped по integration_id, а не по user_id (FR A4, I3,
+// аналогия с GetTaskByIDAndUser выше) — используется на WS-пути (handleAgentQuestion,
+// machine_ws.go, тикет 6.1), где аутентифицирована МАШИНА (integration_id), а не
+// пользователь: проверяет, что вопрос агента адресован задаче именно ЭТОЙ
+// интеграции, не давая одной машине инжектировать событие в чужую задачу.
+func (q *Queries) GetTaskByIDAndIntegration(ctx context.Context, arg GetTaskByIDAndIntegrationParams) (Task, error) {
+	row := q.db.QueryRow(ctx, getTaskByIDAndIntegration, arg.ID, arg.IntegrationID)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.IntegrationID,
+		&i.TextEnc,
+		&i.Status,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getTaskByIDAndUser = `-- name: GetTaskByIDAndUser :one
+SELECT id, user_id, integration_id, text_enc, status, idempotency_key, created_at, updated_at FROM tasks WHERE id = $1 AND user_id = $2
+`
+
+type GetTaskByIDAndUserParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Ищет задачу по id, owner-scoped прямо в SQL (FR A4, I3) — чужая/несуществующая
+// задача неотличимы, единый 404 (тот же приём, что GetIntegrationByIDAndUser,
+// тикет 2.2). Используется PostTasksIdAnswer (тикет 6.1) для проверки владения
+// задачей перед применением ответа пользователя.
+func (q *Queries) GetTaskByIDAndUser(ctx context.Context, arg GetTaskByIDAndUserParams) (Task, error) {
+	row := q.db.QueryRow(ctx, getTaskByIDAndUser, arg.ID, arg.UserID)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.IntegrationID,
+		&i.TextEnc,
+		&i.Status,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTaskStatusForUpdate = `-- name: GetTaskStatusForUpdate :one
 
 SELECT status FROM tasks WHERE id = $1 FOR UPDATE
@@ -117,6 +176,45 @@ func (q *Queries) InsertNextTaskEvent(ctx context.Context, arg InsertNextTaskEve
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const listAgentQuestionEventsByTask = `-- name: ListAgentQuestionEventsByTask :many
+SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER BY seq DESC
+`
+
+// Возвращает все события agent_question задачи, самые новые первыми — источник
+// для сопоставления ответа пользователя (question_id из тела запроса) с
+// конкретной записью task_events (её id становится ref_event_id ответа, тикет
+// 6.1, FR F2). Сопоставление по question_id внутри payload_enc выполняется НА
+// СТОРОНЕ GO (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
+// payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
+// как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+func (q *Queries) ListAgentQuestionEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]TaskEvent, error) {
+	rows, err := q.db.Query(ctx, listAgentQuestionEventsByTask, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TaskEvent{}
+	for rows.Next() {
+		var i TaskEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.Type,
+			&i.RefEventID,
+			&i.PayloadEnc,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateTaskStatus = `-- name: UpdateTaskStatus :exec

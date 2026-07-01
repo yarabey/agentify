@@ -209,6 +209,39 @@ func listTaskEvents(ctx context.Context, t *testing.T, pool *pgxpool.Pool, taskI
 	return events
 }
 
+// eventFullRow — снимок одной строки task_events включая id/ref_event_id —
+// нужен TestIntegration_TransitionWithEvent_* (тикет 6.1) для проверки
+// сопоставления agent_question/user_answer по id/ref_event_id, которого
+// eventRow (seq/type) не даёт.
+type eventFullRow struct {
+	id         pgtype.UUID
+	seq        int64
+	evtType    string
+	refEventID pgtype.UUID
+}
+
+func listTaskEventsFull(ctx context.Context, t *testing.T, pool *pgxpool.Pool, taskID pgtype.UUID) []eventFullRow {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT id, seq, type, ref_event_id FROM task_events WHERE task_id = $1 ORDER BY seq`, taskID)
+	if err != nil {
+		t.Fatalf("прочитать task_events: %v", err)
+	}
+	defer rows.Close()
+
+	var events []eventFullRow
+	for rows.Next() {
+		var e eventFullRow
+		if serr := rows.Scan(&e.id, &e.seq, &e.evtType, &e.refEventID); serr != nil {
+			t.Fatalf("сканировать task_events: %v", serr)
+		}
+		events = append(events, e)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		t.Fatalf("итерация task_events: %v", rerr)
+	}
+	return events
+}
+
 // TestIntegration_Transition_ValidChain — приёмка 5.2: цепочка валидных
 // переходов created→queued→running→waiting_user→running→awaiting_confirm→
 // completed. На каждом шаге проверяем и возвращённые (from,to), и реальное
@@ -326,6 +359,150 @@ func TestIntegration_Transition_InvalidRollsBack(t *testing.T) {
 	after := getTaskRow(ctx, t, pool, taskID)
 	if after.status != string(task.StatusCompleted) {
 		t.Fatalf("после недопустимого перехода tasks.status изменился: было completed, стало %s", after.status)
+	}
+	eventsAfter := listTaskEvents(ctx, t, pool, taskID)
+	if len(eventsAfter) != len(eventsBefore) {
+		t.Fatalf("после недопустимого перехода количество task_events изменилось: было %d, стало %d",
+			len(eventsBefore), len(eventsAfter))
+	}
+}
+
+// TestIntegration_TransitionWithEvent_HappyPath — приёмка тикета 6.1: агент
+// задал вопрос (running→waiting_user) и пользователь ответил
+// (waiting_user→running), каждый переход атомарно пишет ДВЕ записи
+// task_events — бизнес-событие (agent_question/user_answer) и status_change,
+// со строго возрастающим seq, причём событие-ответ (user_answer) несёт
+// ref_event_id, указывающий РОВНО на строку task_events исходного вопроса
+// (не «последний вопрос», см. бриф тикета — сопоставление по question_id/id
+// события, задел под 6.2 «несколько вопросов»).
+func TestIntegration_TransitionWithEvent_HappyPath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	q := db.New(pool)
+	taskID := seedTask(ctx, t, pool, q, "qna-owner")
+
+	tr := task.NewTransitioner(pool)
+
+	// Довести задачу до running обычным Transition (без доп. события).
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, err := tr.Transition(ctx, taskID, trigger); err != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, err)
+		}
+	}
+
+	// Агент задаёт вопрос: running → waiting_user, ref_event_id вопроса NULL.
+	questionPayload := []byte(`{"question_id":"q-1","text":"продолжать?"}`)
+	from, to, err := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion,
+		"agent_question", pgtype.UUID{}, questionPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(agent_question): %v", err)
+	}
+	if from != task.StatusRunning || to != task.StatusWaitingUser {
+		t.Fatalf("agent_question: from=%s to=%s, хотим running→waiting_user", from, to)
+	}
+
+	events := listTaskEventsFull(ctx, t, pool, taskID)
+	// seq 1=enqueued(status_change) 2=task_accepted(status_change)
+	// 3=agent_question 4=status_change(→waiting_user)
+	if len(events) != 4 {
+		t.Fatalf("после agent_question ожидалось 4 события, получено %d", len(events))
+	}
+	questionEvent := events[2]
+	if questionEvent.seq != 3 || questionEvent.evtType != "agent_question" {
+		t.Fatalf("событие 3 = (seq=%d, type=%s), хотим (3, agent_question)", questionEvent.seq, questionEvent.evtType)
+	}
+	if questionEvent.refEventID.Valid {
+		t.Fatalf("ref_event_id вопроса должен быть NULL, получено %v", questionEvent.refEventID)
+	}
+	statusChangeAfterQuestion := events[3]
+	if statusChangeAfterQuestion.seq != 4 || statusChangeAfterQuestion.evtType != "status_change" {
+		t.Fatalf("событие 4 = (seq=%d, type=%s), хотим (4, status_change)", statusChangeAfterQuestion.seq, statusChangeAfterQuestion.evtType)
+	}
+
+	row := getTaskRow(ctx, t, pool, taskID)
+	if row.status != string(task.StatusWaitingUser) {
+		t.Fatalf("tasks.status в БД = %s, хотим waiting_user", row.status)
+	}
+
+	// Пользователь отвечает: waiting_user → running, ref_event_id указывает
+	// ИМЕННО на event.id вопроса (questionEvent.id), а не на что-то другое.
+	answerPayload := []byte(`{"question_id":"q-1","text":"да"}`)
+	from, to, err = tr.TransitionWithEvent(ctx, taskID, task.TriggerUserAnswered,
+		"user_answer", questionEvent.id, answerPayload)
+	if err != nil {
+		t.Fatalf("TransitionWithEvent(user_answer): %v", err)
+	}
+	if from != task.StatusWaitingUser || to != task.StatusRunning {
+		t.Fatalf("user_answer: from=%s to=%s, хотим waiting_user→running", from, to)
+	}
+
+	events = listTaskEventsFull(ctx, t, pool, taskID)
+	if len(events) != 6 {
+		t.Fatalf("после user_answer ожидалось 6 событий, получено %d", len(events))
+	}
+	answerEvent := events[4]
+	if answerEvent.seq != 5 || answerEvent.evtType != "user_answer" {
+		t.Fatalf("событие 5 = (seq=%d, type=%s), хотим (5, user_answer)", answerEvent.seq, answerEvent.evtType)
+	}
+	if answerEvent.refEventID != questionEvent.id {
+		t.Fatalf("ref_event_id ответа = %v, хотим id вопроса %v", answerEvent.refEventID, questionEvent.id)
+	}
+	statusChangeAfterAnswer := events[5]
+	if statusChangeAfterAnswer.seq != 6 || statusChangeAfterAnswer.evtType != "status_change" {
+		t.Fatalf("событие 6 = (seq=%d, type=%s), хотим (6, status_change)", statusChangeAfterAnswer.seq, statusChangeAfterAnswer.evtType)
+	}
+
+	row = getTaskRow(ctx, t, pool, taskID)
+	if row.status != string(task.StatusRunning) {
+		t.Fatalf("tasks.status в БД = %s, хотим running", row.status)
+	}
+}
+
+// TestIntegration_TransitionWithEvent_InvalidRollsBack — недопустимый переход
+// (NextStatus вернул ошибку) откатывает транзакцию целиком: НИ бизнес-событие
+// (agent_question), НИ status_change не должны быть записаны, а tasks.status
+// не должен измениться (тикет 6.1, тот же принцип, что и
+// TestIntegration_Transition_InvalidRollsBack для обычного Transition).
+func TestIntegration_TransitionWithEvent_InvalidRollsBack(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	q := db.New(pool)
+	taskID := seedTask(ctx, t, pool, q, "qna-invalid-owner")
+
+	tr := task.NewTransitioner(pool)
+
+	before := getTaskRow(ctx, t, pool, taskID)
+	if before.status != string(task.StatusCreated) {
+		t.Fatalf("подготовка: статус = %s, хотим created", before.status)
+	}
+	eventsBefore := listTaskEvents(ctx, t, pool, taskID)
+
+	// created + agent_question не является допустимым ребром FSM (см.
+	// orchestrator/internal/task/fsm.go transitions).
+	payload := []byte(`{"question_id":"q-1","text":"продолжать?"}`)
+	from, to, err := tr.TransitionWithEvent(ctx, taskID, task.TriggerAgentQuestion,
+		"agent_question", pgtype.UUID{}, payload)
+	if err == nil {
+		t.Fatalf("TransitionWithEvent(created, agent_question) должен вернуть ошибку, получено to=%s", to)
+	}
+	if from != task.StatusCreated {
+		t.Fatalf("from при ошибке = %s, хотим created", from)
+	}
+	if to != "" {
+		t.Fatalf("to при ошибке должен быть пустым, получено %s", to)
+	}
+
+	after := getTaskRow(ctx, t, pool, taskID)
+	if after.status != string(task.StatusCreated) {
+		t.Fatalf("после недопустимого перехода tasks.status изменился: было created, стало %s", after.status)
 	}
 	eventsAfter := listTaskEvents(ctx, t, pool, taskID)
 	if len(eventsAfter) != len(eventsBefore) {
