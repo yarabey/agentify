@@ -22,6 +22,19 @@
 //     мост коммитит offset РОВНО за эту запись — свежий консьюмер той же
 //     группы не видит её повторно.
 //
+// Также покрывает приёмку тикета 5.6 «Оффлайн-постановка» (FR E4, §9 «Задача
+// поставлена при оффлайн-машине»):
+//   - TestIntegration_Bridge_OfflineThenOnline_DeliversWithoutLoss: команда
+//     публикуется в machine.commands, когда машины НЕТ в ConnRegistry вообще
+//     (полностью офлайн, а не просто "не отвечает ack") — мост крутится в
+//     offline-ретрае (deliver, bridge.go) и не коммитит offset; когда машина
+//     "выходит онлайн" (в реестр добавляется WS-соединение), мост её
+//     подхватывает и доставляет ровно ту же команду (совпадающий message_id);
+//     после ack — offset коммитится один раз, повторной доставки нет. Это тот
+//     же offline-путь deliver, что и NoAck_RedeliversAndDoesNotCommit выше, но
+//     там машина ONLINE с самого начала (просто не шлёт ack) — здесь же её нет
+//     в реестре вообще до момента "подключения", что и есть сценарий 5.6.
+//
 // Использует общие тестовые помощники из bridge_test.go (тот файл БЕЗ тега
 // integration, поэтому компилируется и здесь): newWSPair, fakeConnRegistry,
 // testCommandEnvelope.
@@ -329,4 +342,142 @@ func TestIntegration_Bridge_Ack_CommitsOnce_NoRedelivery(t *testing.T) {
 		}
 	}
 	t.Logf("OK: offset закоммичен после ack — свежий консьюмер группы %s не видит message_id=%s повторно", group, messageID)
+}
+
+// TestIntegration_Bridge_OfflineThenOnline_DeliversWithoutLoss — приёмочный
+// сценарий тикета 5.6 «Оффлайн-постановка» (FR E4, §9 «Задача поставлена при
+// оффлайн-машине»): команда публикуется в machine.commands, когда машины НЕТ
+// в ConnRegistry вообще (fakeConnRegistry с пустой картой conns — машина
+// офлайн с самого начала, а не просто "онлайн, но без ack", как в
+// TestIntegration_Bridge_NoAck_RedeliversAndDoesNotCommit выше). Мост крутится
+// в offline-ретрае (deliver, bridge.go) без коммита офсета; когда машина
+// "выходит онлайн" (в реестр напрямую добавляется WS-соединение — эмуляция
+// момента переподключения агента), мост подхватывает её на следующей
+// итерации offline-ретрая и доставляет ИМЕННО ту же команду (совпадающий
+// message_id) — без потери сообщения. После ack — offset коммитится ровно
+// один раз: свежий консьюмер ТОЙ ЖЕ consumer group не видит запись повторно.
+func TestIntegration_Bridge_OfflineThenOnline_DeliversWithoutLoss(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	seed, cleanupRedpanda := startRedpanda(ctx, t)
+	defer cleanupRedpanda()
+	seeds := []string{seed}
+	waitTopicReady(ctx, t, seeds)
+
+	if err := bus.EnsureMVPTopics(ctx, seeds); err != nil {
+		t.Fatalf("провижининг топиков: %v", err)
+	}
+
+	const group = "bridge-it-offline-then-online"
+	integrationID := uuid.New()
+	messageID := bus.NewMessageID()
+
+	producer, err := bus.NewProducer(seeds)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	defer producer.Close()
+
+	// Публикуем команду ДО того, как машина хоть раз появится в реестре
+	// соединений — ровно ситуация тикета 5.6: "машина сейчас оффлайн" в
+	// момент постановки задачи.
+	env := testCommandEnvelope(messageID, integrationID.String())
+	if err := producer.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
+		t.Fatalf("publish команды: %v", err)
+	}
+
+	bridgeConsumer, err := bus.NewConsumer(bus.ConsumerConfig{
+		Seeds:  seeds,
+		Group:  group,
+		Topics: []string{bus.TopicMachineCommands},
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer (мост): %v", err)
+	}
+
+	// Машина офлайн с самого начала: пустая карта соединений (её нет в
+	// реестре вообще, в отличие от "онлайн, но без ack" в других тестах).
+	conns := &fakeConnRegistry{conns: map[uuid.UUID]*websocket.Conn{}}
+
+	const offlineRetryInterval = 200 * time.Millisecond
+	b, err := New(bridgeConsumer, conns,
+		WithAckTimeout(10*time.Second),
+		WithOfflineRetryInterval(offlineRetryInterval),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		_ = b.Run(runCtx)
+		close(runDone)
+	}()
+
+	// Выдерживаем несколько интервалов offline-ретрая — доставлять некому
+	// (соединения нет вообще ни у кого), мост должен просто крутиться в
+	// ретрае, не коммитя offset. Явная пауза показывает, что тест доказывает
+	// устойчивость к продолжительному оффлайну, а не полагается на гонку
+	// между публикацией и "подключением" машины.
+	time.Sleep(5 * offlineRetryInterval)
+
+	// "Машина выходит онлайн": заводим настоящую пару WS-соединений и
+	// напрямую (тот же пакет bridge) добавляем serverConn в реестр — это и
+	// есть момент переподключения агента с точки зрения моста.
+	serverConn, clientConn, cleanupWS := newWSPair(t)
+	defer cleanupWS()
+	conns.mu.Lock()
+	conns.conns[integrationID] = serverConn
+	conns.mu.Unlock()
+
+	// Мост должен заметить появившееся соединение на следующей итерации
+	// offline-ретрая и доставить ИМЕННО ту команду, что была опубликована в
+	// офлайн-период — без потери сообщения.
+	readCtx, readCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readCancel()
+	_, data, err := clientConn.Read(readCtx)
+	if err != nil {
+		t.Fatalf("чтение доставленной команды после выхода машины в онлайн: %v", err)
+	}
+	var gotEnv bus.Envelope
+	if err := json.Unmarshal(data, &gotEnv); err != nil {
+		t.Fatalf("unmarshal доставленного конверта: %v", err)
+	}
+	if gotEnv.MessageID != messageID {
+		t.Fatalf("доставлен не тот конверт: message_id=%s, ожидался %s", gotEnv.MessageID, messageID)
+	}
+	t.Logf("OK: команда message_id=%s, опубликованная при полностью оффлайн-машине, доставлена после выхода в онлайн", messageID)
+
+	// "Агент" подтверждает доставку.
+	b.HandleAck(messageID)
+
+	// Убеждаемся, что повторной доставки не происходит (ackTimeout — 10s,
+	// ждём заметно меньше, чтобы поймать ошибочный ретрай, если бы он
+	// случился сразу же после ack).
+	noRedeliveryCtx, noRedeliveryCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer noRedeliveryCancel()
+	if _, _, err := clientConn.Read(noRedeliveryCtx); err == nil {
+		t.Fatal("получена повторная доставка после ack — не ожидалась")
+	}
+
+	runCancel()
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Bridge.Run не завершился после отмены ctx")
+	}
+	bridgeConsumer.Close()
+
+	// Свежий консьюмер ТОЙ ЖЕ группы НЕ должен получить эту запись повторно —
+	// прямое доказательство, что offset был закоммичен на брокере после ack
+	// РОВНО один раз (без лишних передоставок/повторных коммитов).
+	recs := fetchWithFreshGroup(ctx, t, seeds, group, 10*time.Second)
+	for _, rec := range recs {
+		if got := recordMessageID(t, rec); got == messageID {
+			t.Fatalf("свежий консьюмер группы %s заново получил message_id=%s — offset не был закоммичен после ack", group, messageID)
+		}
+	}
+	t.Logf("OK: offset закоммичен ровно один раз — свежий консьюмер группы %s не видит message_id=%s повторно", group, messageID)
 }
