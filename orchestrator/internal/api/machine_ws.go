@@ -249,11 +249,13 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 //   - type==agent_completed — агент сообщил о завершении работы (FR E2,
 //     тикет 8.1, Gherkin §7 «Агент сообщил о завершении — задача ещё не
 //     закрыта»), см. handleAgentCompleted;
+//   - type==agent_progress — прогресс/предупреждение агента, например об
+//     отложенной из-за критической операции остановке (FR E6, тикет 8.5,
+//     Gherkin §8 «Приоритет сохранности данных при отмене»), записывается в
+//     task_events БЕЗ смены статуса задачи, см. handleAgentProgress;
 //   - любой другой тип, а также нераспознанный/битый кадр — безопасно
 //     игнорируется, без побочных эффектов (ни паники, ни закрытия
-//     соединения): обработка прочих типов кадров (agent_progress/... —
-//     тикеты 6.x) не должна блокироваться/ломаться из-за их временного
-//     отсутствия здесь.
+//     соединения).
 func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
 	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -289,8 +291,10 @@ func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, i
 		s.handleAgentCompleted(ctx, conn, integrationID, env)
 	case bus.MessageTypeCommandApprovalRequest:
 		s.handleCommandApprovalRequest(ctx, conn, integrationID, env)
+	case bus.MessageTypeAgentProgress:
+		s.handleAgentProgress(ctx, conn, integrationID, env)
 	default:
-		// Прочие типы событий (тикеты 3.5/6.x) — вне объёма, молча игнорируем.
+		// Прочие типы событий — вне объёма, молча игнорируем.
 	}
 }
 
@@ -577,6 +581,59 @@ func (s *Server) handleAgentCompleted(ctx context.Context, conn *websocket.Conn,
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_completed")
+}
+
+// handleAgentProgress обрабатывает кадр agent_progress (тикет 8.5, FR E6,
+// Gherkin §8 «Приоритет сохранности данных при отмене»): агент сообщает о
+// прогрессе/предупреждении (например, что отмена отложена до безопасного
+// завершения критической операции, см. claudecode.Provider.warnCancelDeferred)
+// — событие пишется в task_events БЕЗ изменения статуса задачи (см.
+// task.Transitioner.RecordEvent) — это НЕ переход FSM, просто запись
+// истории/аудита (FR H1/F4). Статус задачи не проверяется: событие может
+// прийти уже после того, как задача переведена в cancelled (см. годок
+// RecordEvent).
+func (s *Server) handleAgentProgress(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	if env.TaskID == nil || *env.TaskID == "" {
+		s.logError("handleAgentProgress", errors.New("конверт agent_progress без task_id"))
+		return
+	}
+	taskUUID, err := uuid.Parse(*env.TaskID)
+	if err != nil {
+		s.logError("handleAgentProgress: разобрать task_id", err)
+		return
+	}
+
+	var payload bus.AgentProgressPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		s.logError("handleAgentProgress: разобрать payload", err)
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+		ID:            taskID,
+		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.logError("handleAgentProgress", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
+			return
+		}
+		s.logError("GetTaskByIDAndIntegration", err)
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("handleAgentProgress", errors.New("transitioner не настроен"))
+		return
+	}
+
+	if _, err := transitioner.RecordEvent(ctx, taskID, "agent_progress", pgtype.UUID{}, env.Payload); err != nil {
+		s.logError("RecordEvent(agent_progress)", err)
+		return
+	}
+
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_progress")
 }
 
 // handleTaskAccepted обрабатывает кадр task_accepted (FR E1, тикет 5.4,

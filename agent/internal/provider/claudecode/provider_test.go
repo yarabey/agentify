@@ -85,6 +85,10 @@ type scriptStep struct {
 	RequestID string `json:"request_id"`
 	ToolName  string `json:"tool_name"`
 	Command   string `json:"command"`
+	// SleepAfterApproveMs — см. testdata/fakeclaude.scriptStep (тикет 8.5):
+	// сколько миллисекунд fakeclaude "выполняет" инструмент после allow,
+	// прежде чем перейти к следующему шагу/result.
+	SleepAfterApproveMs int `json:"sleep_after_approve_ms"`
 }
 
 // newTestProvider собирает Provider поверх fakeClaudeBin со сценарием
@@ -321,6 +325,12 @@ func TestProvider_Approve_InvalidDecision(t *testing.T) {
 // подпроцесса (тикет 4.5, задел под 8.4): Close должен разблокировать Run
 // без зависших процессов, даже если CLI ждёт согласования, которое так и
 // не пришло.
+//
+// Этот тест использует denyAll — запрос уходит в pending, ни один вызов
+// инструмента не получает allow, поэтому criticalInFlight никогда не
+// становится true (тикет 8.5). Тем самым он же служит регрессионным
+// доказательством того, что при criticalInFlight==false поведение Close
+// НЕ изменилось этим тикетом: немедленный kill, как и раньше.
 func TestProvider_Close_TerminatesSubprocess(t *testing.T) {
 	pub := &fakePublisher{}
 	denyAll := allowFunc(func(string, string) bool { return false })
@@ -373,6 +383,74 @@ func TestProvider_ContextCancellation_StopsSubprocess(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("Run не завершился вовремя после отмены ctx")
+	}
+}
+
+// TestProvider_Close_DuringCriticalOperation_DefersKillAndWarns — приёмочный
+// сценарий тикета 8.5 (FR E6, Gherkin §8 «Приоритет сохранности данных при
+// отмене»): Close, вызванный пока разрешённый (allow) вызов инструмента ещё
+// выполняется (criticalInFlight), НЕ убивает подпроцесс немедленно, а
+// публикует agent_progress-предупреждение и откладывает остановку до
+// безопасного завершения текущей операции.
+func TestProvider_Close_DuringCriticalOperation_DefersKillAndWarns(t *testing.T) {
+	pub := &fakePublisher{}
+	allowAll := allowFunc(func(string, string) bool { return true })
+
+	p := newTestProvider(t, allowAll, pub, []scriptStep{
+		{RequestID: "req-critical", ToolName: "Bash", Command: "echo critical", SleepAfterApproveMs: 500},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	done := runAsync(ctx, p, "критическая операция")
+
+	// Allowlist-путь синхронен и почти мгновенен (Provider отвечает allow
+	// сам, без обращения к Publisher) — небольшая пауза достаточна, чтобы
+	// fakeclaude успела получить control_response и уйти в
+	// SleepAfterApproveMs, а Provider успел выставить criticalInFlight.
+	time.Sleep(100 * time.Millisecond)
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Run НЕ должен завершиться немедленно — критическая операция ещё не
+	// доиграла свой SleepAfterApproveMs.
+	select {
+	case err := <-done:
+		t.Fatalf("Run завершился сразу после Close (err=%v) — критическая операция не должна прерываться немедленно (FR E6)", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	waitForCalls(t, pub, 1)
+	calls := pub.Calls()
+	var found *bus.Envelope
+	for i := range calls {
+		if calls[i].Type == bus.MessageTypeAgentProgress {
+			found = &calls[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("не найден вызов Publisher.Enqueue с Type=%q среди %+v", bus.MessageTypeAgentProgress, calls)
+	}
+	var payload bus.AgentProgressPayload
+	if err := json.Unmarshal(found.Payload, &payload); err != nil {
+		t.Fatalf("демаршалинг AgentProgressPayload: %v", err)
+	}
+	if payload.Text == "" {
+		t.Fatal("AgentProgressPayload.Text пуст, ожидалось предупреждение")
+	}
+
+	// В итоге, после того как fakeclaude "доиграет" sleep и закроет stdout,
+	// Run должен всё же завершиться (отложенная остановка доводится до
+	// конца, см. Provider.Run про fallback-Kill после readLoop) — без
+	// проверки конкретной ошибки, важен сам факт, что процесс не завис.
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run не завершился вовремя — подозрение, что отложенная остановка не была доведена до конца")
 	}
 }
 

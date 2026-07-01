@@ -48,6 +48,28 @@ type fakeTransitioner struct {
 	lastEventType    string
 	lastRefEventID   pgtype.UUID
 	lastEventPayload []byte
+
+	// lastRecordEvent* / recordEventSeq / recordEventErr — ОТДЕЛЬНЫЕ поля для
+	// RecordEvent (тикет 8.5), не пересекающиеся с lastEventType/
+	// lastRefEventID/lastEventPayload, которые уже заняты TransitionWithEvent
+	// (см. её комментарий выше).
+	lastRecordEventTaskID  pgtype.UUID
+	lastRecordEventType    string
+	lastRecordEventRefID   pgtype.UUID
+	lastRecordEventPayload []byte
+	recordEventSeq         int64
+	recordEventErr         error
+}
+
+func (f *fakeTransitioner) RecordEvent(_ context.Context, taskID pgtype.UUID, eventType string, refEventID pgtype.UUID, eventPayload []byte) (int64, error) {
+	f.lastRecordEventTaskID = taskID
+	f.lastRecordEventType = eventType
+	f.lastRecordEventRefID = refEventID
+	f.lastRecordEventPayload = eventPayload
+	if f.recordEventErr != nil {
+		return 0, f.recordEventErr
+	}
+	return f.recordEventSeq, nil
 }
 
 func (f *fakeTransitioner) Transition(_ context.Context, taskID pgtype.UUID, trigger task.Trigger) (task.Status, task.Status, error) {

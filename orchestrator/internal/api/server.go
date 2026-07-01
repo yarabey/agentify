@@ -318,6 +318,9 @@ type taskTransitioner interface {
 	// 6.1): атомарно пишет бизнес-событие (agent_question/user_answer) перед
 	// status_change в одной транзакции с самим переходом.
 	TransitionWithEvent(ctx context.Context, taskID pgtype.UUID, trigger task.Trigger, eventType string, refEventID pgtype.UUID, eventPayload []byte) (from, to task.Status, err error)
+	// RecordEvent — см. task.Transitioner.RecordEvent (тикет 8.5): атомарно
+	// пишет событие БЕЗ смены статуса (agent_progress, FR E6).
+	RecordEvent(ctx context.Context, taskID pgtype.UUID, eventType string, refEventID pgtype.UUID, eventPayload []byte) (seq int64, err error)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose

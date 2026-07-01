@@ -868,3 +868,93 @@ func TestIntegration_TransitionWithEvent_FullLifecycleAuditTrail(t *testing.T) {
 		t.Fatalf("итоговый tasks.status в БД = %s, хотим running", row.status)
 	}
 }
+
+// TestIntegration_RecordEvent_HappyPath — приёмка тикета 8.5 (FR E6):
+// RecordEvent атомарно добавляет запись task_events БЕЗ смены статуса задачи
+// — в отличие от Transition/TransitionWithEvent. Проверяем: возвращённый seq
+// продолжает уже существующую последовательность событий, tasks.status в БД
+// НЕ меняется, а сама запись появляется в task_events с ожидаемыми
+// type/ref_event_id/payload.
+func TestIntegration_RecordEvent_HappyPath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	q := db.New(pool)
+	taskID := seedTask(ctx, t, pool, q, "record-event-owner")
+
+	tr := task.NewTransitioner(pool)
+
+	// Довести задачу до running обычным Transition (seq 1, 2: status_change).
+	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
+		if _, _, err := tr.Transition(ctx, taskID, trigger); err != nil {
+			t.Fatalf("подготовка (%s): %v", trigger, err)
+		}
+	}
+
+	before := getTaskRow(ctx, t, pool, taskID)
+	if before.status != string(task.StatusRunning) {
+		t.Fatalf("подготовка: статус = %s, хотим running", before.status)
+	}
+
+	progressPayload := []byte(`{"text":"критическая операция доводится до безопасного завершения"}`)
+	seq, err := tr.RecordEvent(ctx, taskID, "agent_progress", pgtype.UUID{}, progressPayload)
+	if err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+	if seq != 3 {
+		t.Fatalf("RecordEvent: seq = %d, хотим 3 (продолжение seq 1,2 от status_change)", seq)
+	}
+
+	after := getTaskRow(ctx, t, pool, taskID)
+	if after.status != string(task.StatusRunning) {
+		t.Fatalf("RecordEvent не должен менять tasks.status: было running, стало %s", after.status)
+	}
+
+	events := listTaskEventsFull(ctx, t, pool, taskID)
+	if len(events) != 3 {
+		t.Fatalf("ожидалось 3 события task_events после RecordEvent, получено %d", len(events))
+	}
+	last := events[2]
+	if last.seq != 3 || last.evtType != "agent_progress" {
+		t.Fatalf("событие 3 = (seq=%d, type=%s), хотим (3, agent_progress)", last.seq, last.evtType)
+	}
+	if last.refEventID.Valid {
+		t.Fatalf("ref_event_id agent_progress должен быть NULL, получено %v", last.refEventID)
+	}
+
+	// Второй вызов RecordEvent должен продолжить seq дальше (4), доказывая,
+	// что он корректно взаимодействует с FOR UPDATE-локом при повторных
+	// вызовах.
+	seq2, err := tr.RecordEvent(ctx, taskID, "agent_progress", pgtype.UUID{}, progressPayload)
+	if err != nil {
+		t.Fatalf("RecordEvent (второй вызов): %v", err)
+	}
+	if seq2 != 4 {
+		t.Fatalf("RecordEvent (второй вызов): seq = %d, хотим 4", seq2)
+	}
+}
+
+// TestIntegration_RecordEvent_TaskNotFound — RecordEvent с несуществующим
+// taskID должен вернуть ошибку (не панику) — тот же принцип, что и
+// GetTaskStatusForUpdate в Transition (см. TestIntegration_Transition_*).
+func TestIntegration_RecordEvent_TaskNotFound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, cleanup := setupPool(ctx, t)
+	defer cleanup()
+
+	tr := task.NewTransitioner(pool)
+
+	var unknownTaskID pgtype.UUID
+	if err := unknownTaskID.Scan("00000000-0000-0000-0000-000000000000"); err != nil {
+		t.Fatalf("Scan unknownTaskID: %v", err)
+	}
+
+	if _, err := tr.RecordEvent(ctx, unknownTaskID, "agent_progress", pgtype.UUID{}, []byte(`{"text":"..."}`)); err == nil {
+		t.Fatal("RecordEvent с несуществующим taskID должен вернуть ошибку")
+	}
+}

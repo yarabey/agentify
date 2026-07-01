@@ -132,6 +132,13 @@ type AgentCompletedPayload struct {
 	Summary string `json:"summary"`
 }
 
+// AgentProgressPayload — payload события agent_progress (тикет 8.5, FR E6):
+// человекочитаемый текст прогресса/предупреждения, показываемый в истории
+// задачи (аудит, FR F4).
+type AgentProgressPayload struct {
+	Text string `json:"text"`
+}
+
 // CommandApprovalRequestPayload — payload сообщения type ==
 // MessageTypeCommandApprovalRequest (тикет 4.5/6.1, FR F3): провайдер
 // (agent/internal/provider/claudecode) перехватил запрос CLI на выполнение

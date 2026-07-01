@@ -165,6 +165,23 @@ type Provider struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]pendingRequest
+
+	// criticalInFlight — true, пока выполняется вызов инструмента, которому
+	// Provider уже ответил allow, и который ещё не завершился (тикет 8.5, FR
+	// E6). "Критическая операция" в MVP-трактовке (docs/MANUAL_STEPS.md,
+	// строка 35 — нерешённый бизнес-вопрос, безопасный дефолт вместо ADR, см.
+	// прецедент EmptyAllowChecker/ORCH_STALE_THRESHOLD) — ЛЮБОЙ разрешённый,
+	// ещё не завершившийся вызов инструмента, без классификации на
+	// "деструктивные"/"безопасные": это самая консервативная трактовка
+	// "приоритет — сохранность данных" без изобретения несуществующего
+	// классификатора команд.
+	criticalInFlight bool
+	// cancelRequested — Close вызван, пока criticalInFlight==true: реальная
+	// остановка подпроцесса отложена до момента, когда текущая критическая
+	// операция сама завершится (следующий control_request или EOF stdout, см.
+	// consumePriorCompletion/Run) — FR E6, "мгновенная остановка не
+	// гарантируется".
+	cancelRequested bool
 }
 
 // New собирает Provider, валидируя Config (см. поля Config и sentinel
@@ -293,6 +310,23 @@ func (p *Provider) Run(ctx context.Context, taskText string) error {
 
 	scanErr := p.readLoop(stdout)
 
+	// Защитный fallback (тикет 8.5, FR E6): если подпроцесс сам естественно
+	// завершился (закрыл stdout, readLoop вернулся по EOF) ровно в момент
+	// отложенной отмены, так и не прислав ещё один control_request —
+	// consumePriorCompletion (единственное другое место, доводящее отложенную
+	// остановку до конца) не успеет сработать. Kill на уже завершившемся
+	// процессе — no-op/ErrProcessDone, поэтому идемпотентен здесь.
+	p.mu.Lock()
+	if p.cancelRequested {
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+		}
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+	}
+	p.mu.Unlock()
+
 	waitErr := cmd.Wait()
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -349,6 +383,10 @@ func (p *Provider) readLoop(stdout io.Reader) error {
 // docs/User_stories_Gherkin.md §5): решает, отвечать CLI немедленно
 // (allowlist) или уйти на согласование пользователя.
 func (p *Provider) handleControlRequest(req controlRequestLine) {
+	if p.consumePriorCompletion() {
+		return
+	}
+
 	toolName := req.Request.ToolName
 	command := extractCommand(req.Request.Input)
 
@@ -356,7 +394,9 @@ func (p *Provider) handleControlRequest(req controlRequestLine) {
 		if err := p.respondAllow(req.RequestID, req.Request.Input); err != nil {
 			p.logger.Warn("claudecode: не удалось ответить allow на allowlist-команду",
 				"request_id", req.RequestID, "error", err)
+			return
 		}
+		p.markCriticalInFlight()
 		return
 	}
 
@@ -368,6 +408,45 @@ func (p *Provider) handleControlRequest(req controlRequestLine) {
 		p.logger.Warn("claudecode: не удалось опубликовать command_approval_request",
 			"request_id", req.RequestID, "error", err)
 	}
+}
+
+// consumePriorCompletion фиксирует завершение предыдущей критической
+// операции (если она была) — единственный сигнал этого в протоколе
+// control_request/control_response (см. wire.go: нет отдельного кадра
+// "инструмент завершился") — появление СЛЕДУЮЩЕГО control_request. Если
+// Close был вызван, пока операция была in-flight (см. cancelRequested),
+// здесь — самый ранний безопасный момент довести отложенную остановку до
+// конца: закрывает stdin и убивает подпроцесс, НЕ обрабатывая новый
+// control_request. Возвращает true, если так и произошло (вызывающий
+// должен немедленно вернуться, ничего больше не делая).
+func (p *Provider) consumePriorCompletion() bool {
+	p.mu.Lock()
+	wasInFlight := p.criticalInFlight
+	p.criticalInFlight = false
+	cancelPending := p.cancelRequested
+	cmd := p.cmd
+	stdin := p.stdin
+	p.mu.Unlock()
+
+	if !wasInFlight || !cancelPending {
+		return false
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	return true
+}
+
+// markCriticalInFlight отмечает, что Provider только что разрешил (allow)
+// выполнение вызова инструмента, ещё не завершившегося — см. godoc поля
+// criticalInFlight (тикет 8.5, FR E6).
+func (p *Provider) markCriticalInFlight() {
+	p.mu.Lock()
+	p.criticalInFlight = true
+	p.mu.Unlock()
 }
 
 // extractCommand достаёт поле "command" из input инструмента, если оно там
@@ -438,7 +517,11 @@ func (p *Provider) Approve(requestID, decision string) error {
 	}
 
 	if decision == "approve" {
-		return p.respondAllow(requestID, pending.input)
+		if err := p.respondAllow(requestID, pending.input); err != nil {
+			return err
+		}
+		p.markCriticalInFlight()
+		return nil
 	}
 	return p.respondDeny(requestID, "команда отклонена пользователем")
 }
@@ -478,14 +561,35 @@ func (p *Provider) writeLine(v interface{}) error {
 	return nil
 }
 
-// Close принудительно останавливает подпроцесс (если он запущен),
-// закрывая stdin и посылая ему SIGKILL (см. godoc пакета про задел под
-// тикет 8.4 "отмена долетает до машины"). Безопасен к повторному вызову и к
-// вызову до Run (no-op). Не ждёт завершения подпроцесса — это делает сам
-// Run (единственный владелец cmd.Wait, см. её godoc), Close лишь
-// инициирует остановку, чтобы Run быстрее вернул управление.
+// Close останавливает подпроцесс (если он запущен), закрывая stdin и посылая
+// ему SIGKILL (см. godoc пакета про задел под тикет 8.4 "отмена долетает до
+// машины") — НО с приоритетом сохранности данных при отмене (тикет 8.5, FR
+// E6, docs/MANUAL_STEPS.md строка 35): если в момент вызова выполняется
+// разрешённый (allow), ещё не завершившийся вызов инструмента
+// (criticalInFlight — MVP-трактовка "критической операции", см. godoc поля),
+// немедленной остановки НЕ происходит — вместо неё Close лишь помечает
+// cancelRequested и публикует agent_progress-предупреждение
+// (warnCancelDeferred), а реальная остановка откладывается до момента,
+// когда операция сама завершится (consumePriorCompletion при следующем
+// control_request либо fallback в Run при EOF stdout). Это соответствует
+// FR E6 буквально: "мгновенная остановка не гарантируется".
+//
+// Если criticalInFlight==false (нет in-flight разрешённого вызова, включая
+// случай ожидания согласования пользователя через pending) — поведение
+// НЕ отличается от прежнего: немедленный kill.
+//
+// Безопасен к повторному вызову и к вызову до Run (no-op). Не ждёт
+// завершения подпроцесса — это делает сам Run (единственный владелец
+// cmd.Wait, см. её godoc), Close лишь инициирует остановку (немедленную или
+// отложенную), чтобы Run в итоге вернул управление.
 func (p *Provider) Close() error {
 	p.mu.Lock()
+	if p.criticalInFlight {
+		p.cancelRequested = true
+		p.mu.Unlock()
+		p.warnCancelDeferred()
+		return nil
+	}
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
@@ -499,4 +603,34 @@ func (p *Provider) Close() error {
 		return fmt.Errorf("claudecode: остановка подпроцесса: %w", err)
 	}
 	return nil
+}
+
+// warnCancelDeferred публикует agent_progress-предупреждение о том, что
+// остановка отложена до безопасного завершения текущей критической
+// операции (FR E6, "мгновенная остановка не гарантируется") — вызывается
+// Close, когда criticalInFlight==true. Публикация best-effort: ошибка
+// только логируется (тот же принцип, что publishApprovalRequest) — сама
+// остановка уже поставлена в очередь (cancelRequested) независимо от того,
+// дошло ли предупреждение.
+func (p *Provider) warnCancelDeferred() {
+	payload, err := json.Marshal(bus.AgentProgressPayload{
+		Text: "отмена получена во время критической операции — операция будет доведена до безопасного завершения, мгновенная остановка не гарантируется",
+	})
+	if err != nil {
+		p.logger.Warn("claudecode: маршалинг AgentProgressPayload", "error", err)
+		return
+	}
+	taskID := p.cfg.TaskID
+	env := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskID,
+		IntegrationID:   p.cfg.IntegrationID,
+		Type:            bus.MessageTypeAgentProgress,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+	if err := p.cfg.Publisher.Enqueue(env); err != nil {
+		p.logger.Warn("claudecode: не удалось опубликовать agent_progress", "error", err)
+	}
 }

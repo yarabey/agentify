@@ -1586,6 +1586,203 @@ func TestHandleMachineFrame_AgentCompleted_EmptySummary_HappyPath(t *testing.T) 
 	}
 }
 
+// agentProgressEnvelope собирает валидный конверт type==agent_progress
+// (тикет 8.5, FR E6, protocol.md §4) для заданной задачи. Payload —
+// bus.AgentProgressPayload{text}.
+func agentProgressEnvelope(t *testing.T, messageID, taskID, text string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.AgentProgressPayload{Text: text})
+	if err != nil {
+		t.Fatalf("marshal AgentProgressPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   uuid.New().String(), // не используется handleAgentProgress — см. аргумент integrationID
+		Type:            bus.MessageTypeAgentProgress,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// TestHandleMachineFrame_AgentProgress_HappyPath — agent_progress пишется в
+// task_events через RecordEvent БЕЗ изменения статуса задачи (тикет 8.5, FR
+// E6), и агенту приходит ack с ack_message_id исходного конверта.
+func TestHandleMachineFrame_AgentProgress_HappyPath(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	transitioner := &fakeTransitioner{recordEventSeq: 7}
+	s.SetTransitioner(transitioner)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := agentProgressEnvelope(t, messageID, taskID.String(), "отмена отложена до безопасного завершения")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if transitioner.lastRecordEventTaskID.Bytes != taskID {
+		t.Fatalf("RecordEvent вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastRecordEventTaskID.Bytes), taskID)
+	}
+	if transitioner.lastRecordEventType != "agent_progress" {
+		t.Fatalf("RecordEvent вызван с eventType = %q, ожидался %q", transitioner.lastRecordEventType, "agent_progress")
+	}
+	if transitioner.lastRecordEventRefID.Valid {
+		t.Fatalf("RecordEvent вызван с ref_event_id = %v, ожидался NULL", transitioner.lastRecordEventRefID)
+	}
+	if !bytes.Equal(transitioner.lastRecordEventPayload, env.Payload) {
+		t.Fatalf("RecordEvent вызван с eventPayload = %s, ожидался %s", transitioner.lastRecordEventPayload, env.Payload)
+	}
+	// TransitionWithEvent/Transition НЕ должны вызываться — agent_progress не
+	// является переходом FSM.
+	if transitioner.lastTrigger != "" {
+		t.Fatalf("Transition/TransitionWithEvent не должны вызываться для agent_progress, lastTrigger = %q", transitioner.lastTrigger)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	if ackEnv.Type != bus.MessageTypeAck {
+		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_AgentProgress_TaskNotFoundOrWrongIntegration —
+// задача не найдена для этой интеграции (GetTaskByIDAndIntegration →
+// pgx.ErrNoRows, в т.ч. подделанный task_id чужой задачи) → RecordEvent НЕ
+// вызывается, ack НЕ отправляется, соединение не падает.
+func TestHandleMachineFrame_AgentProgress_TaskNotFoundOrWrongIntegration(t *testing.T) {
+	q := fakeQuerier{getTaskByIDAndIntegrationErr: pgx.ErrNoRows}
+	s := newTestServer(q)
+	transitioner := &fakeTransitioner{recordEventSeq: 1}
+	s.SetTransitioner(transitioner)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentProgressEnvelope(t, bus.NewMessageID(), uuid.New().String(), "прогресс")
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя задача не найдена для этой интеграции")
+	}
+	if transitioner.lastRecordEventType != "" {
+		t.Fatalf("RecordEvent не должен вызываться, если задача не найдена, lastRecordEventType = %q", transitioner.lastRecordEventType)
+	}
+}
+
+// TestHandleMachineFrame_AgentProgress_NoTransitionerConfigured —
+// transitioner не зарегистрирован (nil) → ack НЕ отправляется, паники нет.
+func TestHandleMachineFrame_AgentProgress_NoTransitionerConfigured(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	// transitioner намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentProgressEnvelope(t, bus.NewMessageID(), taskID.String(), "прогресс")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя transitioner не настроен")
+	}
+}
+
+// TestHandleMachineFrame_AgentProgress_NoTaskID_DoesNotPanic — конверт
+// agent_progress без task_id → ack НЕ отправляется, handleMachineFrame не
+// паникует и не закрывает соединение (тот же принцип «безопасно
+// игнорировать», что и у agent_completed/error/agent_question).
+func TestHandleMachineFrame_AgentProgress_NoTaskID_DoesNotPanic(t *testing.T) {
+	payload, err := json.Marshal(bus.AgentProgressPayload{Text: "прогресс без task_id"})
+	if err != nil {
+		t.Fatalf("marshal AgentProgressPayload: %v", err)
+	}
+	env := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   uuid.New().String(),
+		Type:            bus.MessageTypeAgentProgress,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+
+	q := fakeQuerier{}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{recordEventSeq: 1})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, _, err = clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя конверт agent_progress без task_id")
+	}
+}
+
+// TestHandleMachineFrame_AgentProgress_RecordEventError — RecordEvent вернул
+// ошибку (например, проблема с БД) → залогировано, ack не отправляется,
+// соединение не падает.
+func TestHandleMachineFrame_AgentProgress_RecordEventError(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{recordEventErr: errors.New("db error")})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := agentProgressEnvelope(t, bus.NewMessageID(), taskID.String(), "прогресс")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя RecordEvent вернул ошибку")
+	}
+}
+
 // helloEnvelope собирает конверт type==hello (protocol.md §2/§4,
 // bus.HelloPayload) с заданными protocol_version и uuid-секретом — для
 // тестов authenticateMachineHello (тикеты 2.3/4.7).

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 )
 
 // scriptStep — один элемент FAKE_CLAUDE_SCRIPT.
@@ -28,6 +29,13 @@ type scriptStep struct {
 	RequestID string `json:"request_id"`
 	ToolName  string `json:"tool_name"`
 	Command   string `json:"command"`
+	// SleepAfterApproveMs — если > 0, fakeclaude ждёт столько миллисекунд
+	// ПОСЛЕ получения control_response на этот шаг, ПЕРЕД тем как перейти к
+	// следующему шагу (или напечатать финальный result, если шаг последний)
+	// — симулирует реально выполняющийся инструмент (тикет 8.5), давая тесту
+	// окно, в котором можно вызвать Provider.Close() и убедиться, что
+	// подпроцесс НЕ убит немедленно.
+	SleepAfterApproveMs int `json:"sleep_after_approve_ms"`
 }
 
 // controlRequestOut — исходящая строка control_request (зеркало
@@ -125,6 +133,10 @@ func main() {
 		// Provider'а, а не из вывода fakeclaude).
 		fmt.Fprintf(os.Stderr, "fakeclaude: request_id=%s behavior=%s\n",
 			resp.Response.RequestID, resp.Response.Response.Behavior)
+
+		if step.SleepAfterApproveMs > 0 {
+			time.Sleep(time.Duration(step.SleepAfterApproveMs) * time.Millisecond)
+		}
 	}
 
 	fmt.Fprintln(stdout, `{"type":"result","subtype":"success"}`)

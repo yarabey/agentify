@@ -75,6 +75,47 @@ func (t *Transitioner) TransitionWithEvent(ctx context.Context, taskID pgtype.UU
 	return t.transition(ctx, taskID, trigger, eventType, refEventID, eventPayload)
 }
 
+// RecordEvent атомарно добавляет запись task_events БЕЗ смены статуса задачи
+// (в отличие от Transition/TransitionWithEvent) — под тем же FOR UPDATE-локом
+// строки tasks (см. GetTaskStatusForUpdate), что исключает гонку за seq с
+// конкурентным Transition той же задачи (см. годок InsertNextTaskEvent в
+// queries/tasks.sql). Нужен для событий, не являющихся переходом FSM
+// (agent_progress, тикет 8.5, FR E6) — статус задачи в момент записи может
+// быть любым, в т.ч. терминальным (cancelled/completed/failed): агент может
+// сообщать о прогрессе критической операции уже ПОСЛЕ того, как оркестратор
+// перевёл задачу в cancelled (тикет 8.4 — переход в cancelled происходит
+// немедленно по запросу пользователя, ДО того как критическая операция на
+// машине фактически завершится, см. Gherkin §8) — статус НЕ проверяется и не
+// ограничивается.
+func (t *Transitioner) RecordEvent(ctx context.Context, taskID pgtype.UUID, eventType string, refEventID pgtype.UUID, eventPayload []byte) (seq int64, err error) {
+	tx, err := t.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("task: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	q := t.queries.WithTx(tx)
+
+	if _, err := q.GetTaskStatusForUpdate(ctx, taskID); err != nil {
+		return 0, fmt.Errorf("task: получить текущий статус: %w", err)
+	}
+
+	row, err := q.InsertNextTaskEvent(ctx, db.InsertNextTaskEventParams{
+		TaskID:     taskID,
+		Type:       eventType,
+		RefEventID: refEventID,
+		PayloadEnc: eventPayload,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("task: записать task_events(%s): %w", eventType, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("task: commit tx: %w", err)
+	}
+	return row.Seq, nil
+}
+
 // transition — общая реализация Transition/TransitionWithEvent (см. их
 // godoc). Если eventType непуст, ПЕРЕД записью status_change (но ПОСЛЕ
 // UpdateTaskStatus, внутри той же транзакции) вставляется дополнительная
