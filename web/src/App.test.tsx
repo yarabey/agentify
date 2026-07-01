@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { apiClient } from "@/api/client";
 import { App } from "@/App";
 import { AuthProvider } from "@/context/AuthContext";
 import { setTokens } from "@/lib/tokenStore";
@@ -13,8 +14,19 @@ import { setTokens } from "@/lib/tokenStore";
  * явно управляет им через `authenticated`, т.к. `/`, `/tasks`,
  * `/integrations`, `/settings` теперь под `RequireAuth`, а `/login`,
  * `/register` — под `RequireGuest`, см. `App.tsx`).
+ *
+ * С тикета 9.3 `/integrations` при монтировании реально дёргает
+ * `GET /integrations` (`IntegrationsPage`, а не заглушка) — `apiClient.GET`
+ * замокан здесь же на пустой список, чтобы тест шапки/роутинга не зависел от
+ * сети и не зависал в jsdom на незамоканном `fetch`.
  */
 function renderApp(initialPath = "/", { authenticated = false } = {}) {
+  vi.spyOn(apiClient, "GET").mockResolvedValue({
+    data: [],
+    error: undefined,
+    response: new Response(null, { status: 200 }),
+  } as never);
+
   if (authenticated) {
     setTokens({ accessToken: "test-access", refreshToken: "test-refresh" });
   }
@@ -32,6 +44,7 @@ function renderApp(initialPath = "/", { authenticated = false } = {}) {
 
 describe("App shell", () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     localStorage.clear();
   });
 
@@ -64,7 +77,7 @@ describe("App shell", () => {
     expect(screen.queryByText("Agentify")).not.toBeInTheDocument();
   });
 
-  it("рендерит заглушки /integrations и /settings (авторизован)", () => {
+  it("рендерит экран /integrations (тикет 9.3) и заглушку /settings (авторизован)", () => {
     const { unmount } = renderApp("/integrations", { authenticated: true });
     expect(
       screen.getByRole("heading", { name: "Интеграции" }),
