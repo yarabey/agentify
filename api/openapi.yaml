@@ -28,6 +28,8 @@ tags:
     description: Привязка каналов, напр. Telegram (FR D3)
   - name: machine
     description: Точка подключения агента (WebSocket, auth по UUID)
+  - name: web
+    description: Точка подключения браузера (WebSocket, auth по access-токену)
 
 paths:
   /healthz:
@@ -389,6 +391,23 @@ paths:
         Агент устанавливает исходящее WS-соединение и аутентифицируется по UUID интеграции
         (FR B3). Все команды/события идут асинхронно через шину (FR §7). Формат сообщений —
         docs/protocol.md. Это не обычный REST-эндпоинт.
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---------- WEB (WebSocket, auth по access-токену) ----------
+  /ws:
+    get:
+      tags: [web]
+      security: []
+      summary: Точка подключения браузера (WebSocket Upgrade)
+      description: |
+        Открытая вкладка web держит исходящее WS-соединение к оркестратору и
+        аутентифицируется по access-токену (FR G1). Уведомления (например, "агент
+        задал вопрос") доставляются в открытую вкладку без перезагрузки страницы
+        (§6 «Уведомление в web по WebSocket»). Формат сообщений — простой JSON,
+        НЕ конверт машинного протокола docs/protocol.md; это не обычный
+        REST-эндпоинт.
       responses:
         "101": { description: Switching Protocols (WebSocket) }
         "401": { $ref: "#/components/responses/Unauthorized" }

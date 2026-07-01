@@ -247,18 +247,27 @@ func run() error {
 
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
 		server.SetTransitioner(task.NewTransitioner(pool))
+		// Web-канал доставки уведомлений (тикет 7.2, FR G1): ClientConnHub —
+		// реестр активных WS-соединений браузера (server.ClientConnHub(),
+		// заведён в NewServer безусловно, в отличие от опциональных
+		// ackSink/eventSink) — регистрируется как Notifier ЗДЕСЬ же, сразу
+		// после создания сервера, до начала обслуживания HTTP/WS-трафика (тот
+		// же принцип, что и у SetTransitioner). НЕ гейтится ORCH_REDPANDA_SEEDS
+		// — web-доставка не зависит от Redpanda/моста, только от БД (тот же
+		// довод, что и у answerTimeoutWorker ниже).
+		server.SetNotifier(server.ClientConnHub())
 		svc.SetHandler(api.NewRouter(server))
 
 		// Таймаут ответа пользователя (тикет 6.7, FR F5): в отличие от
 		// StaleWorker/presence-подсистемы ниже, НЕ зависит от Redpanda/heartbeat —
 		// работает напрямую по tasks/task_events, поэтому запускается
 		// безусловно при наличии БД, а не только когда задан ORCH_REDPANDA_SEEDS.
-		// notifier=nil: реальная доставка напоминания (web WS/Telegram) появится
-		// в тикетах 7.2/7.3 — тогда эта же строка получит конкретный экземпляр
-		// (тот же паттерн отложенного wiring, что и Notifier в api.Server,
-		// тикет 7.1).
+		// notifier=server.ClientConnHub(): реальная доставка напоминания в web
+		// (тикет 7.2) — тот же реестр/Notifier, что и у Server выше; Telegram
+		// (тикет 7.3) добавится сюда же отдельным каналом, когда будет
+		// реализован.
 		answerTimeoutWorker, err := task.NewAnswerTimeoutWorker(
-			task.NewTransitioner(pool), db.New(pool), nil,
+			task.NewTransitioner(pool), db.New(pool), server.ClientConnHub(),
 			task.WithAnswerTimeoutThreshold(cfg.AnswerTimeoutThreshold),
 			task.WithAnswerTimeoutBehavior(task.AnswerTimeoutBehavior(cfg.AnswerTimeoutBehavior)),
 		)

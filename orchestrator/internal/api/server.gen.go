@@ -80,6 +80,9 @@ type ServerInterface interface {
 	// Отклонить результат (на доработку)
 	// (POST /tasks/{id}/reject)
 	PostTasksIdReject(w http.ResponseWriter, r *http.Request, id IdPath)
+	// Точка подключения браузера (WebSocket Upgrade)
+	// (GET /ws)
+	GetWs(w http.ResponseWriter, r *http.Request)
 }
 
 // Unimplemented server implementation that returns http.StatusNotImplemented for each endpoint.
@@ -215,6 +218,12 @@ func (_ Unimplemented) GetTasksIdEvents(w http.ResponseWriter, r *http.Request, 
 // Отклонить результат (на доработку)
 // (POST /tasks/{id}/reject)
 func (_ Unimplemented) PostTasksIdReject(w http.ResponseWriter, r *http.Request, id IdPath) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Точка подключения браузера (WebSocket Upgrade)
+// (GET /ws)
+func (_ Unimplemented) GetWs(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -809,6 +818,20 @@ func (siw *ServerInterfaceWrapper) PostTasksIdReject(w http.ResponseWriter, r *h
 	handler.ServeHTTP(w, r)
 }
 
+// GetWs operation middleware
+func (siw *ServerInterfaceWrapper) GetWs(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetWs(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 type UnescapedCookieParamError struct {
 	ParamName string
 	Err       error
@@ -987,6 +1010,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/tasks/{id}/reject", wrapper.PostTasksIdReject)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/ws", wrapper.GetWs)
 	})
 
 	return r

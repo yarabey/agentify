@@ -916,6 +916,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Точка подключения браузера (WebSocket Upgrade)
+         * @description Открытая вкладка web держит исходящее WS-соединение к оркестратору и
+         *     аутентифицируется по access-токену (FR G1). Уведомления (например, "агент
+         *     задал вопрос") доставляются в открытую вкладку без перезагрузки страницы
+         *     (§6 «Уведомление в web по WebSocket»). Формат сообщений — простой JSON,
+         *     НЕ конверт машинного протокола docs/protocol.md; это не обычный
+         *     REST-эндпоинт.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Switching Protocols (WebSocket) */
+                101: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {

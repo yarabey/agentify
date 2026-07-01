@@ -199,6 +199,21 @@ type Server struct {
 	machineConns   map[uuid.UUID]*websocket.Conn
 	machineConnsMu sync.Mutex
 
+	// clientHub — реестр активных WS-соединений браузера по user_id и
+	// одновременно реализация Notifier для web-канала доставки уведомлений
+	// (тикет 7.2, FR G1, см. ClientConnHub в client_ws.go). В отличие от
+	// machineConns (ADR 0002, одно соединение на integration_id) допускает
+	// НЕСКОЛЬКО одновременных соединений на один user_id — пользователь может
+	// держать открытыми несколько вкладок, и уведомление должно прийти в
+	// каждую (docs/adr/0005-client-ws-multi-connection-per-user.md).
+	// В отличие от notifier/ackSink/eventSink НЕ nil по умолчанию и не
+	// настраивается отдельным Setter — сам реестр соединений нужен GetWs
+	// независимо от того, зарегистрирован ли он ЕЩЁ и как Notifier (это
+	// делает отдельный вызов SetNotifier в orchestrator/main.go, см. godoc
+	// SetNotifier); поэтому клиентский реестр инициализируется прямо в
+	// NewServer, как и machineConns.
+	clientHub *ClientConnHub
+
 	// ackSink — получатель ack-кадров машины (тикет 3.4, см. AckSink). nil по
 	// умолчанию — ack-кадры просто игнорируются (штатно, если Redpanda-мост не
 	// настроен, например в тестах/каркасных прогонах без ORCH_REDPANDA_SEEDS,
@@ -364,6 +379,7 @@ func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encry
 		integrationUUIDAEADKey: crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
 		integrationUUIDHMACKey: crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
 		machineConns:           make(map[uuid.UUID]*websocket.Conn),
+		clientHub:              NewClientConnHub(logger),
 	}
 }
 
@@ -407,6 +423,18 @@ func (s *Server) MachineConn(integrationID uuid.UUID) (*websocket.Conn, bool) {
 	defer s.machineConnsMu.Unlock()
 	conn, ok := s.machineConns[integrationID]
 	return conn, ok
+}
+
+// ClientConnHub возвращает реестр активных WS-соединений браузера (тикет
+// 7.2, см. godoc ClientConnHub в client_ws.go) — вызывающая сторона
+// (orchestrator/main.go) использует его как Notifier (server.SetNotifier)
+// и, при желании, как answerNotifier task.NewAnswerTimeoutWorker (тикет 6.7):
+// один и тот же экземпляр реестра обслуживает оба вида web-уведомлений
+// (agent_question и answer_reminder) единой точкой доставки. Никогда не nil
+// (инициализируется в NewServer, в отличие от опциональных ackSink/
+// eventSink/notifier).
+func (s *Server) ClientConnHub() *ClientConnHub {
+	return s.clientHub
 }
 
 // SetAckSink регистрирует получателя ack-кадров машины (тикет 3.4, см. godoc
