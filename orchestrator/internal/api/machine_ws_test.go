@@ -48,6 +48,15 @@
 //   - задача не найдена/принадлежит другой интеграции, transitioner не
 //     настроен, TransitionWithEvent вернул ошибку, конверт без task_id,
 //     payload с пустым message → ack НЕ отправляется, паники нет.
+//
+// А также приёмочное требование тикета 6.4 (FR F3, Gherkin §5 «Команда вне
+// allowlist требует согласования», handleCommandApprovalRequest):
+//   - command_approval_request для задачи в running →
+//     TransitionWithEvent(running→waiting_user) вызван с правильными
+//     taskID/trigger/eventType, агенту приходит ack;
+//   - задача не найдена/принадлежит другой интеграции, transitioner не
+//     настроен, TransitionWithEvent вернул ошибку, конверт без task_id,
+//     payload без request_id → ack НЕ отправляется, паники нет.
 package api
 
 import (
@@ -575,6 +584,208 @@ func TestHandleMachineFrame_AgentQuestion_InvalidPayload_DoesNotPanic(t *testing
 	for name, env := range map[string]bus.Envelope{
 		"без question_id": envNoQuestionID,
 		"без task_id":     envNoTaskID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			_, _, err := clientConn.Read(ctx)
+			if err == nil {
+				t.Fatalf("%s: клиент получил ack, хотя payload/конверт невалиден", name)
+			}
+		})
+	}
+}
+
+// commandApprovalRequestEnvelope собирает валидный конверт
+// type==command_approval_request (тикет 6.4, FR F3, Gherkin §5) для заданной
+// задачи с bus.CommandApprovalRequestPayload{RequestID, Command, Reason}.
+func commandApprovalRequestEnvelope(t *testing.T, messageID, taskID, requestID, command, reason string) bus.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(bus.CommandApprovalRequestPayload{RequestID: requestID, Command: command, Reason: reason})
+	if err != nil {
+		t.Fatalf("marshal CommandApprovalRequestPayload: %v", err)
+	}
+	return bus.Envelope{
+		MessageID:       messageID,
+		TaskID:          &taskID,
+		IntegrationID:   uuid.New().String(), // перезаписывается на DB id в handleCommandApprovalRequest не требуется — используется параметр integrationID
+		Type:            bus.MessageTypeCommandApprovalRequest,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         payload,
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_HappyPath —
+// command_approval_request успешно переводит задачу running→waiting_user
+// (fakeTransitioner) и агенту приходит ack с ack_message_id исходного
+// конверта (тикет 6.4, FR F3, Gherkin §5).
+func TestHandleMachineFrame_CommandApprovalRequest_HappyPath(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	requestID := uuid.New().String()
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{
+			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+			IntegrationID: pgtype.UUID{Bytes: dbIntegrationID, Valid: true},
+		},
+	}
+	s := newTestServer(q)
+	transitioner := &fakeTransitioner{to: task.StatusWaitingUser}
+	s.SetTransitioner(transitioner)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	messageID := bus.NewMessageID()
+	env := commandApprovalRequestEnvelope(t, messageID, taskID.String(), requestID, "rm -rf /tmp/build", "нужно очистить директорию сборки")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("TransitionWithEvent вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerApprovalRequested {
+		t.Fatalf("TransitionWithEvent вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerApprovalRequested)
+	}
+	if transitioner.lastEventType != "command_approval_request" {
+		t.Fatalf("TransitionWithEvent вызван с eventType = %q, ожидался %q", transitioner.lastEventType, "command_approval_request")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	if ackEnv.Type != bus.MessageTypeAck {
+		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_TaskNotFoundOrWrongIntegration
+// — задача не найдена для этой интеграции (GetTaskByIDAndIntegration →
+// pgx.ErrNoRows, в т.ч. подделанный task_id чужой задачи) → ack НЕ
+// отправляется, соединение не падает (тикет 6.4, FR A4/I3).
+func TestHandleMachineFrame_CommandApprovalRequest_TaskNotFoundOrWrongIntegration(t *testing.T) {
+	q := fakeQuerier{getTaskByIDAndIntegrationErr: pgx.ErrNoRows}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := commandApprovalRequestEnvelope(t, bus.NewMessageID(), uuid.New().String(), uuid.New().String(), "rm -rf /", "опасная команда")
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя задача не найдена для этой интеграции")
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_NoTransitionerConfigured —
+// transitioner не зарегистрирован (nil) → ack НЕ отправляется, паники нет.
+func TestHandleMachineFrame_CommandApprovalRequest_NoTransitionerConfigured(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	// transitioner намеренно не зарегистрирован.
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := commandApprovalRequestEnvelope(t, bus.NewMessageID(), taskID.String(), uuid.New().String(), "make deploy", "деплой прод")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя transitioner не настроен")
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_TransitionError —
+// TransitionWithEvent вернул ошибку (недопустимый переход FSM/сбой БД) →
+// ack НЕ отправляется.
+func TestHandleMachineFrame_CommandApprovalRequest_TransitionError(t *testing.T) {
+	dbIntegrationID := uuid.New()
+	taskID := uuid.New()
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{err: errors.New("недопустимый переход")})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	env := commandApprovalRequestEnvelope(t, bus.NewMessageID(), taskID.String(), uuid.New().String(), "make deploy", "деплой прод")
+	s.handleMachineFrame(context.Background(), serverConn, dbIntegrationID, marshalEnvelope(t, env))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил ack, хотя TransitionWithEvent вернул ошибку")
+	}
+}
+
+// TestHandleMachineFrame_CommandApprovalRequest_InvalidPayload_DoesNotPanic —
+// payload без request_id (или отсутствующий task_id) → ack НЕ отправляется,
+// handleMachineFrame не паникует и не закрывает соединение (тот же принцип
+// «безопасно игнорировать», что и у agent_question).
+func TestHandleMachineFrame_CommandApprovalRequest_InvalidPayload_DoesNotPanic(t *testing.T) {
+	taskID := uuid.New().String()
+	envNoRequestID := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          &taskID,
+		IntegrationID:   uuid.New().String(),
+		Type:            bus.MessageTypeCommandApprovalRequest,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage(`{"command":"rm -rf /","reason":"нет request_id"}`),
+	}
+	envNoTaskID := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   uuid.New().String(),
+		Type:            bus.MessageTypeCommandApprovalRequest,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage(`{"request_id":"r1","command":"rm -rf /","reason":"нет task_id"}`),
+	}
+
+	q := fakeQuerier{
+		getTaskByIDAndIntegrationResult: db.Task{},
+	}
+	s := newTestServer(q)
+	s.SetTransitioner(&fakeTransitioner{to: task.StatusWaitingUser})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	for name, env := range map[string]bus.Envelope{
+		"без request_id": envNoRequestID,
+		"без task_id":    envNoTaskID,
 	} {
 		t.Run(name, func(t *testing.T) {
 			s.handleMachineFrame(context.Background(), serverConn, uuid.New(), marshalEnvelope(t, env))

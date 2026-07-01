@@ -54,9 +54,10 @@ package api
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
 // "unauthorized". При успехе соединение остаётся открытым; read-loop
-// (тикеты 3.4/3.6/5.4/5.8/6.1) разбирает каждый дальнейший кадр (см.
+// (тикеты 3.4/3.6/5.4/5.8/6.1/6.4) разбирает каждый дальнейший кадр (см.
 // handleMachineFrame/parseAckFrame/handleMachineEvent/handleAgentQuestion/
-// handleTaskAccepted/handleAgentError) и активно обрабатывает пять типов:
+// handleTaskAccepted/handleAgentError/handleCommandApprovalRequest) и активно
+// обрабатывает шесть типов:
 // type==ack — пересылается зарегистрированному s.ackSink (мосту оркестратора
 // machine.commands → WS, commit-after-ACK, protocol.md §5, см. godoc AckSink
 // в server.go); type==heartbeat — публикуется через зарегистрированный
@@ -70,12 +71,14 @@ package api
 // задачу queued→running через taskTransitioner.Transition, см.
 // handleTaskAccepted; type==error (FR E1, тикет 5.8) — переводит задачу
 // running→failed через taskTransitioner.TransitionWithEvent, см.
-// handleAgentError. Любой другой тип кадра
-// (command_approval_request/... — тикеты 5.x/6.x) и любой нераспознанный/битый
-// кадр МОЛЧА игнорируются — ни паники, ни закрытия соединения (нужно и чтобы
-// коннект не выглядел повисшим, и чтобы control-фреймы coder/websocket
-// обрабатывались штатно — см. godoc websocket.Conn "You must always read
-// from the connection").
+// handleAgentError; type==command_approval_request (FR F3, тикет 6.4,
+// Gherkin §5 «Команда вне allowlist требует согласования») — переводит
+// задачу running→waiting_user через taskTransitioner.TransitionWithEvent, см.
+// handleCommandApprovalRequest. Любой другой тип кадра и любой
+// нераспознанный/битый кадр МОЛЧА игнорируются — ни паники, ни закрытия
+// соединения (нужно и чтобы коннект не выглядел повисшим, и чтобы
+// control-фреймы coder/websocket обрабатывались штатно — см. godoc
+// websocket.Conn "You must always read from the connection").
 //
 // IP клиента берётся из net.SplitHostPort(r.RemoteAddr) — прямого TCP-пира,
 // БЕЗ доверия заголовку X-Forwarded-For: в MVP нет инфраструктуры доверенных
@@ -207,10 +210,10 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	// handleMachineEvent), agent_question переводит задачу в waiting_user (см.
 	// handleAgentQuestion), task_accepted переводит задачу в running (см.
 	// handleTaskAccepted), error переводит задачу в failed (FR E1, тикет
-	// 5.8, см. handleAgentError); любой иной тип кадра (а также
-	// нераспознанный/битый JSON) МОЛЧА игнорируется — обработка прочих типов
-	// (command_approval_request/... — тикеты 5.x/6.x) вне объёма этого
-	// тикета, но получение такого кадра не должно ронять или закрывать
+	// 5.8, см. handleAgentError), command_approval_request переводит задачу
+	// в waiting_user (FR F3, тикет 6.4, см. handleCommandApprovalRequest);
+	// любой иной тип кадра (а также нераспознанный/битый JSON) МОЛЧА
+	// игнорируется — получение такого кадра не должно ронять или закрывать
 	// соединение (см. godoc файла).
 	for {
 		_, data, err := conn.Read(r.Context())
@@ -234,12 +237,14 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 //     handleTaskAccepted;
 //   - type==error — ошибка агента/машины (FR E1, тикет 5.8), см.
 //     handleAgentError;
+//   - type==command_approval_request — команда вне allowlist требует
+//     согласования пользователя (FR F3, тикет 6.4, Gherkin §5 «Команда вне
+//     allowlist требует согласования»), см. handleCommandApprovalRequest;
 //   - любой другой тип, а также нераспознанный/битый кадр — безопасно
 //     игнорируется, без побочных эффектов (ни паники, ни закрытия
-//     соединения): обработка прочих типов кадров
-//     (command_approval_request/agent_progress/agent_completed/user_decision/... —
-//     тикеты 5.x/6.x) не должна блокироваться/ломаться из-за их временного
-//     отсутствия здесь.
+//     соединения): обработка прочих типов кадров (agent_progress/
+//     agent_completed/... — тикеты 6.x) не должна блокироваться/ломаться
+//     из-за их временного отсутствия здесь.
 func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
 	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -271,8 +276,10 @@ func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, i
 		s.handleTaskAccepted(ctx, conn, integrationID, env)
 	case bus.MessageTypeError:
 		s.handleAgentError(ctx, conn, integrationID, env)
+	case bus.MessageTypeCommandApprovalRequest:
+		s.handleCommandApprovalRequest(ctx, conn, integrationID, env)
 	default:
-		// Прочие типы событий (тикеты 3.5/5.x) — вне объёма, молча игнорируем.
+		// Прочие типы событий (тикеты 3.5/6.x) — вне объёма, молча игнорируем.
 	}
 }
 
@@ -521,6 +528,95 @@ func (s *Server) handleTaskAccepted(ctx context.Context, conn *websocket.Conn, i
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "task_accepted")
+}
+
+// handleCommandApprovalRequest обрабатывает кадр command_approval_request (FR
+// F3, тикет 6.4, Gherkin §5 «Команда вне allowlist требует согласования»):
+// агент обнаружил, что команда, которую он хочет выполнить, не входит в
+// allowlist (тикет 6.3), и просит владельца согласовать её выполнение —
+// переводит связанную задачу running→waiting_user, атомарно записывая
+// событие command_approval_request в task_events
+// (task.Transitioner.TransitionWithEvent — единственная точка смены
+// tasks.status, тикет 5.2), и, при успехе, отвечает агенту ack-кадром — тот
+// же at-least-once принцип, что и у handleAgentQuestion/handleAgentError:
+// провал любого шага (невалидный payload/task_id, задача не найдена или
+// принадлежит другой интеграции, недопустимый переход FSM, transitioner не
+// настроен) молча пропускает ack — агент должен повторить попытку сам
+// (durable outbox на стороне агента, тикет 3.5), соединение при этом не
+// закрывается и не паникует (см. godoc файла). Пока задача не покинула
+// waiting_user (т.е. пока владелец не вызвал POST /tasks/{id}/approve, см.
+// PostTasksIdApprove в tasks.go), сама команда НЕ выполняется — это и есть
+// приёмочное требование тикета 6.4: «команда не выполняется, пока я её не
+// одобрю».
+//
+// Обработка СИНХРОННАЯ, без отдельного Redpanda-потребителя — тот же приём,
+// что и у остальных обработчиков кадров машины (handleAgentQuestion,
+// handleTaskAccepted, handleAgentError).
+//
+// Задача ищется owner-scoped по integration_id (GetTaskByIDAndIntegration, НЕ
+// по user_id — на этом пути аутентифицирована машина, а не пользователь), что
+// не даёт одной машине запросить согласование для чужой задачи через
+// подделанный task_id в конверте.
+//
+// eventPayload, записываемый в task_events, — это RAW env.Payload конверта
+// (уже провалидированный как bus.CommandApprovalRequestPayload здесь), а не
+// повторно сериализованная структура: тот же байтовый payload, что реально
+// пришёл от агента, без риска расхождения форм при последующем сопоставлении
+// решения пользователя по request_id (см. PostTasksIdApprove, tasks.go,
+// ListCommandApprovalRequestEventsByTask, queries/tasks.sql) — тот же приём,
+// что и у handleAgentQuestion с question_id.
+//
+// Валидация payload: RequestID обязателен (пустое значение — невалидный
+// кадр, аналогично QuestionID у agent_question). Command/Reason не
+// обязательны к валидации — протокол (bus.CommandApprovalRequestPayload) не
+// делает их обязательными на этом пути; они лишь описательные для
+// пользователя, принимающего решение.
+func (s *Server) handleCommandApprovalRequest(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	if env.TaskID == nil || *env.TaskID == "" {
+		s.logError("handleCommandApprovalRequest", errors.New("конверт command_approval_request без task_id"))
+		return
+	}
+	taskUUID, err := uuid.Parse(*env.TaskID)
+	if err != nil {
+		s.logError("handleCommandApprovalRequest: разобрать task_id", err)
+		return
+	}
+
+	var payload bus.CommandApprovalRequestPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		s.logError("handleCommandApprovalRequest: разобрать payload", err)
+		return
+	}
+	if payload.RequestID == "" {
+		s.logError("handleCommandApprovalRequest", errors.New("payload command_approval_request без request_id"))
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+		ID:            taskID,
+		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.logError("handleCommandApprovalRequest", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
+			return
+		}
+		s.logError("GetTaskByIDAndIntegration", err)
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("handleCommandApprovalRequest", errors.New("transitioner не настроен"))
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerApprovalRequested, "command_approval_request", pgtype.UUID{}, env.Payload); err != nil {
+		s.logError("TransitionWithEvent(command_approval_request)", err)
+		return
+	}
+
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "command_approval_request")
 }
 
 // writeMachineAck строит и отправляет ack-конверт (protocol.md §4/§5,
