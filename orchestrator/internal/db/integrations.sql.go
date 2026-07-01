@@ -167,6 +167,36 @@ func (q *Queries) ListIntegrationsByUser(ctx context.Context, userID pgtype.UUID
 	return items, nil
 }
 
+const markIntegrationOnline = `-- name: MarkIntegrationOnline :exec
+UPDATE integrations
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1
+`
+
+// Идемпотентно помечает интеграцию online со свежим last_seen_at (FR B4,
+// heartbeat через machine.events, тикет 3.6). Повторный вызов для той же
+// интеграции — безопасен (at-least-once дедуп на уровне bus.Consumer это
+// дополнительно гасит, но сам запрос идемпотентен и без него).
+func (q *Queries) MarkIntegrationOnline(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, markIntegrationOnline, id)
+	return err
+}
+
+const markStaleIntegrationsOffline = `-- name: MarkStaleIntegrationsOffline :exec
+UPDATE integrations
+SET status = 'offline', updated_at = now()
+WHERE status = 'online' AND last_seen_at < $1
+`
+
+// Фоновый воркер (тикет 3.6, FR B4, protocol.md §6): переводит в offline все
+// интеграции, чей last_seen_at устарел (свежее OFFLINE_THRESHOLD). Не трогает
+// уже offline (WHERE status='online') — идемпотентно относительно частых
+// вызовов воркера.
+func (q *Queries) MarkStaleIntegrationsOffline(ctx context.Context, lastSeenAt pgtype.Timestamptz) error {
+	_, err := q.db.Exec(ctx, markStaleIntegrationsOffline, lastSeenAt)
+	return err
+}
+
 const updateIntegration = `-- name: UpdateIntegration :one
 UPDATE integrations
 SET name = $3, ip_hint = $4, updated_at = now()

@@ -1,7 +1,7 @@
-// Unit-тесты разбора пост-hello кадров WS машины (тикет 3.4, protocol.md §5):
-// parseAckFrame и handleMachineFrame — без сети/БД/Redpanda (в отличие от
-// machine_ws_integration_test.go, который гоняет полный handshake через
-// httptest.NewServer + реальный WS-клиент).
+// Unit-тесты разбора пост-hello кадров WS машины (тикеты 3.4/3.6,
+// protocol.md §5/§6): parseAckFrame и handleMachineFrame — без сети/БД/Redpanda
+// (в отличие от machine_ws_integration_test.go, который гоняет полный
+// handshake через httptest.NewServer + реальный WS-клиент).
 //
 // Покрывает приёмочное требование тикета 3.4 «прочие типы кадров безопасно
 // игнорируются, ack — пересылается в AckSink»:
@@ -14,11 +14,29 @@
 //     тем ack_message_id, что был в payload;
 //   - handleMachineFrame на НЕ-ack кадре не трогает AckSink вовсе;
 //   - handleMachineFrame не паникует, если AckSink не зарегистрирован (nil).
+//
+// А также приёмочное требование тикета 3.6 (FR B4, protocol.md §6):
+//   - heartbeat-кадр публикуется зарегистрированным EventSink с
+//     IntegrationID, ПЕРЕЗАПИСАННЫМ на аутентифицированный DB id соединения
+//     (а не на значение, присланное агентом в конверте);
+//   - успешная публикация → агенту приходит ack с ack_message_id исходного
+//     heartbeat-конверта;
+//   - ошибка EventSink.HandleEvent → ack агенту НЕ отправляется;
+//   - EventSink не зарегистрирован (nil) → кадр молча игнорируется, без паники.
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
 
 	"github.com/yarabey/agentify/internal/bus"
 )
@@ -133,7 +151,7 @@ func TestHandleMachineFrame_AckDispatchedToSink(t *testing.T) {
 	s.SetAckSink(sink)
 
 	wantID := bus.NewMessageID()
-	s.handleMachineFrame(marshalEnvelope(t, ackEnvelope(t, wantID)))
+	s.handleMachineFrame(context.Background(), nil, uuid.New(), marshalEnvelope(t, ackEnvelope(t, wantID)))
 
 	if len(sink.received) != 1 {
 		t.Fatalf("AckSink.HandleAck вызван %d раз(а), ожидался 1: %v", len(sink.received), sink.received)
@@ -156,7 +174,7 @@ func TestHandleMachineFrame_NonAckFrameIgnoredBySink(t *testing.T) {
 		[]byte(`{"type":"task_accepted"}`),
 	}
 	for _, data := range frames {
-		s.handleMachineFrame(data)
+		s.handleMachineFrame(context.Background(), nil, uuid.New(), data)
 	}
 
 	if len(sink.received) != 0 {
@@ -169,5 +187,173 @@ func TestHandleMachineFrame_NonAckFrameIgnoredBySink(t *testing.T) {
 // handleMachineFrame на ack-кадре не паникует, просто игнорирует.
 func TestHandleMachineFrame_NoSinkRegistered_DoesNotPanic(t *testing.T) {
 	s := newTestServer(fakeQuerier{})
-	s.handleMachineFrame(marshalEnvelope(t, ackEnvelope(t, bus.NewMessageID())))
+	s.handleMachineFrame(context.Background(), nil, uuid.New(), marshalEnvelope(t, ackEnvelope(t, bus.NewMessageID())))
+}
+
+// heartbeatEnvelope собирает валидный конверт type==heartbeat (protocol.md
+// §4/§6) с заданным integration_id (эмулирует то, что реально присылает
+// агент, — секрет интеграции, НЕ DB id).
+func heartbeatEnvelope(t *testing.T, messageID, integrationID string) bus.Envelope {
+	t.Helper()
+	return bus.Envelope{
+		MessageID:       messageID,
+		IntegrationID:   integrationID,
+		Type:            bus.MessageTypeHeartbeat,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage(`{}`),
+	}
+}
+
+// fakeEventSink — фейковая реализация EventSink для unit-тестов
+// handleMachineFrame/handleMachineEvent (тикет 3.6): запоминает все
+// полученные конверты; err (если задан) возвращается из HandleEvent для
+// проверки ветки «публикация не удалась → ack не отправляется».
+type fakeEventSink struct {
+	received []bus.Envelope
+	err      error
+}
+
+func (f *fakeEventSink) HandleEvent(_ context.Context, env bus.Envelope) error {
+	f.received = append(f.received, env)
+	return f.err
+}
+
+// newWSPair поднимает настоящую пару WS-соединений (сервер/клиент) через
+// httptest.NewServer — без Redpanda/Docker, тот же приём, что и
+// orchestrator/internal/bridge.newWSPair (неэкспортированный помощник
+// другого пакета напрямую не переиспользовать — здесь отдельная копия).
+// serverConn — сторона, которую handleMachineEvent использует для записи
+// ack-кадра; clientConn — сторона теста, играющая роль агента (читает ack).
+func newWSPair(t *testing.T) (serverConn, clientConn *websocket.Conn, cleanup func()) {
+	t.Helper()
+	accepted := make(chan *websocket.Conn, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}))
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1)
+	clientConn, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	if err != nil {
+		ts.Close()
+		t.Fatalf("websocket.Dial: %v", err)
+	}
+
+	select {
+	case serverConn = <-accepted:
+	case <-time.After(5 * time.Second):
+		ts.Close()
+		t.Fatal("сервер не принял WS-соединение за отведённое время")
+	}
+
+	cleanup = func() {
+		_ = clientConn.CloseNow()
+		_ = serverConn.CloseNow()
+		ts.Close()
+	}
+	return serverConn, clientConn, cleanup
+}
+
+// TestHandleMachineFrame_HeartbeatRewritesIntegrationIDAndAcks — heartbeat-кадр
+// публикуется зарегистрированным EventSink с IntegrationID, ПЕРЕЗАПИСАННЫМ на
+// аутентифицированный DB id соединения (а не на значение из кадра, которое
+// эмулирует секрет интеграции), и агенту приходит ack с ack_message_id
+// исходного heartbeat-конверта (тикет 3.6, FR B4, protocol.md §6).
+func TestHandleMachineFrame_HeartbeatRewritesIntegrationIDAndAcks(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	sink := &fakeEventSink{}
+	s.SetEventSink(sink)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	dbID := uuid.New()
+	agentSentSecret := uuid.New().String()
+	messageID := bus.NewMessageID()
+
+	s.handleMachineFrame(context.Background(), serverConn, dbID,
+		marshalEnvelope(t, heartbeatEnvelope(t, messageID, agentSentSecret)))
+
+	if len(sink.received) != 1 {
+		t.Fatalf("EventSink.HandleEvent вызван %d раз(а), ожидался 1", len(sink.received))
+	}
+	got := sink.received[0]
+	if got.IntegrationID != dbID.String() {
+		t.Fatalf("EventSink получил IntegrationID=%q, ожидался DB id %q (НЕ секрет агента %q)",
+			got.IntegrationID, dbID.String(), agentSentSecret)
+	}
+	if got.Type != bus.MessageTypeHeartbeat {
+		t.Fatalf("EventSink получил type=%q, ожидался %q", got.Type, bus.MessageTypeHeartbeat)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("клиент не получил ack-кадр: %v", err)
+	}
+	var ackEnv bus.Envelope
+	if err := json.Unmarshal(data, &ackEnv); err != nil {
+		t.Fatalf("ack-кадр не парсится: %v", err)
+	}
+	if ackEnv.Type != bus.MessageTypeAck {
+		t.Fatalf("ack-кадр type=%q, ожидался %q", ackEnv.Type, bus.MessageTypeAck)
+	}
+	var ackPayload bus.AckPayload
+	if err := json.Unmarshal(ackEnv.Payload, &ackPayload); err != nil {
+		t.Fatalf("ack-payload не парсится: %v", err)
+	}
+	if ackPayload.AckMessageID != messageID {
+		t.Fatalf("ack_message_id=%q, ожидался %q", ackPayload.AckMessageID, messageID)
+	}
+}
+
+// TestHandleMachineFrame_HeartbeatSinkError_NoAckSent — EventSink.HandleEvent
+// возвращает ошибку (публикация не удалась) → агенту НЕ должен прийти ack:
+// он повторит heartbeat через свой durable outbox (тикет 3.5, protocol.md §5).
+func TestHandleMachineFrame_HeartbeatSinkError_NoAckSent(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	sink := &fakeEventSink{err: errors.New("publish failed")}
+	s.SetEventSink(sink)
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(),
+		marshalEnvelope(t, heartbeatEnvelope(t, bus.NewMessageID(), uuid.New().String())))
+
+	if len(sink.received) != 1 {
+		t.Fatalf("EventSink.HandleEvent вызван %d раз(а), ожидался 1", len(sink.received))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил кадр, хотя EventSink вернул ошибку — ack не должен отправляться")
+	}
+}
+
+// TestHandleMachineFrame_HeartbeatNoSinkRegistered_DoesNotPanic — EventSink не
+// зарегистрирован (nil) → heartbeat-кадр молча игнорируется, соединение не
+// падает (тот же принцип, что и у AckSink).
+func TestHandleMachineFrame_HeartbeatNoSinkRegistered_DoesNotPanic(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+
+	serverConn, clientConn, cleanup := newWSPair(t)
+	defer cleanup()
+
+	s.handleMachineFrame(context.Background(), serverConn, uuid.New(),
+		marshalEnvelope(t, heartbeatEnvelope(t, bus.NewMessageID(), uuid.New().String())))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := clientConn.Read(ctx)
+	if err == nil {
+		t.Fatal("клиент получил кадр, хотя EventSink не зарегистрирован")
+	}
 }

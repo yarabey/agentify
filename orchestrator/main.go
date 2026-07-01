@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -43,14 +44,23 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/bridge"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
+	"github.com/yarabey/agentify/orchestrator/internal/presence"
 	"github.com/yarabey/agentify/orchestrator/migrations"
 )
 
 // bridgeConsumerGroup — имя consumer group моста (тикет 3.4, ADR 0001:
 // «мост команд — своя группа (orchestrator-bridge)»). Отдельная от любых
-// других consumer group (например, будущих обработчиков machine.events),
-// чтобы коммиты моста не задевали офсеты других подписчиков той же темы.
+// других consumer group (например, обработчика heartbeat, см.
+// heartbeatConsumerGroup), чтобы коммиты моста не задевали офсеты других
+// подписчиков той же темы.
 const bridgeConsumerGroup = "orchestrator-bridge"
+
+// heartbeatConsumerGroup — имя consumer group presence-консьюмера (тикет 3.6,
+// FR B4, ADR 0001). ОБЯЗАНА отличаться от bridgeConsumerGroup — обе группы
+// читают разные топики (machine.commands у моста, machine.events у presence),
+// но принцип "своя группа на свою роль потребления" общий: раздельные группы
+// не делят офсеты и ребалансируются независимо.
+const heartbeatConsumerGroup = "orchestrator-heartbeat"
 
 // serviceName — каноническое имя сервиса в логах и в теле /healthz.
 const serviceName = "orchestrator"
@@ -102,8 +112,16 @@ type config struct {
 	// Redpanda → WS отключён» (тикет 3.4) — оркестратор работает как раньше,
 	// только REST+WS-handshake, без доставки команд из machine.commands; тот
 	// же принцип «пустая опциональная фича — не ошибка старта», что у
-	// DatabaseURL/OrchestratorWSURL в остальных конфигах сервисов.
+	// DatabaseURL/OrchestratorWSURL в остальных конфигах сервисов. Presence-
+	// подсистема (тикет 3.6) гейтится ТЕМ ЖЕ условием (см. run) — heartbeat
+	// тоже идёт через Redpanda (machine.events).
 	RedpandaSeeds []string `env:"REDPANDA_SEEDS" envSeparator:","`
+
+	// OfflineThreshold — порог устаревания last_seen_at, после которого
+	// фоновый воркер переводит интеграцию в offline (FR B4, protocol.md §6:
+	// OFFLINE_THRESHOLD). Переменная ORCH_OFFLINE_THRESHOLD, дефолт 45s — как
+	// зафиксировано протоколом.
+	OfflineThreshold time.Duration `env:"OFFLINE_THRESHOLD" envDefault:"45s"`
 }
 
 func main() {
@@ -231,6 +249,53 @@ func run() error {
 
 			g.Go(func() error {
 				return brg.Run(gctx)
+			})
+
+			// Presence-подсистема (тикет 3.6, FR B4, protocol.md §6): агент
+			// шлёт heartbeat в machine.events (WS → GetMachineWs →
+			// EventSink.HandleEvent → сюда), Sink публикует его дальше в
+			// Redpanda, отдельный consumer группы heartbeatConsumerGroup читает
+			// machine.events и помечает интеграцию online, а OfflineWorker
+			// независимо от этого фонового чтения переводит в offline
+			// интеграции с устаревшим last_seen_at. Гейтится тем же условием
+			// ORCH_REDPANDA_SEEDS != "", что и мост выше — heartbeat тоже идёт
+			// через Redpanda.
+			producer, err := bus.NewProducer(cfg.RedpandaSeeds)
+			if err != nil {
+				return fmt.Errorf("orchestrator: ORCH_REDPANDA_SEEDS задан, но создание Redpanda-продьюсера presence не удалось: %w", err)
+			}
+			defer producer.Close()
+
+			sink, err := presence.NewSink(producer)
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка presence.Sink: %w", err)
+			}
+			server.SetEventSink(sink)
+
+			heartbeatConsumer, err := bus.NewConsumer(bus.ConsumerConfig{
+				Seeds:  cfg.RedpandaSeeds,
+				Group:  heartbeatConsumerGroup,
+				Topics: []string{bus.TopicMachineEvents},
+			})
+			if err != nil {
+				return fmt.Errorf("orchestrator: ORCH_REDPANDA_SEEDS задан, но создание Redpanda-консьюмера presence не удалось: %w", err)
+			}
+			defer heartbeatConsumer.Close()
+
+			presenceConsumer, err := presence.NewConsumer(heartbeatConsumer, db.New(pool))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка presence.Consumer: %w", err)
+			}
+			g.Go(func() error {
+				return presenceConsumer.Run(gctx)
+			})
+
+			offlineWorker, err := presence.NewOfflineWorker(db.New(pool), presence.WithOfflineThreshold(cfg.OfflineThreshold))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка presence.OfflineWorker: %w", err)
+			}
+			g.Go(func() error {
+				return offlineWorker.Run(gctx)
 			})
 		}
 	} else if len(cfg.RedpandaSeeds) != 0 {

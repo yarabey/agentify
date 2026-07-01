@@ -53,14 +53,18 @@ package api
 // providers[]} (docs/protocol.md §4). Провал любой из этих проверок —
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
-// "unauthorized". При успехе соединение остаётся открытым; read-loop тикета
-// 3.4 разбирает каждый дальнейший кадр (см. handleMachineFrame/parseAckFrame)
-// и активно обрабатывает только type==ack — пересылает его
-// зарегистрированному s.ackSink (мосту оркестратора machine.commands → WS,
-// commit-after-ACK, protocol.md §5, см. godoc AckSink в server.go). Любой
-// другой тип кадра (task_accepted/agent_question/command_approval_request/...
-// — тикеты 3.5/5.x) и любой нераспознанный/битый кадр МОЛЧА игнорируются —
-// ни паники, ни закрытия соединения (нужно и чтобы коннект не выглядел
+// "unauthorized". При успехе соединение остаётся открытым; read-loop
+// (тикеты 3.4/3.6) разбирает каждый дальнейший кадр (см.
+// handleMachineFrame/parseAckFrame/handleMachineEvent) и активно обрабатывает
+// два типа: type==ack — пересылается зарегистрированному s.ackSink (мосту
+// оркестратора machine.commands → WS, commit-after-ACK, protocol.md §5, см.
+// godoc AckSink в server.go); type==heartbeat — публикуется через
+// зарегистрированный s.eventSink (presence-подсистема, FR B4, protocol.md §6,
+// см. godoc EventSink в server.go) с ПЕРЕЗАПИСАННЫМ на аутентифицированный DB
+// id полем IntegrationID, после чего агенту отправляется ack. Любой другой
+// тип кадра (task_accepted/agent_question/command_approval_request/... —
+// тикеты 3.5/5.x) и любой нераспознанный/битый кадр МОЛЧА игнорируются — ни
+// паники, ни закрытия соединения (нужно и чтобы коннект не выглядел
 // повисшим, и чтобы control-фреймы coder/websocket обрабатывались штатно —
 // см. godoc websocket.Conn "You must always read from the connection").
 //
@@ -115,6 +119,14 @@ const wsCloseSuperseded websocket.StatusCode = 4409
 // бесконечно.
 const machineHelloReadTimeout = 10 * time.Second
 
+// machineEventAckWriteTimeout — сколько handleMachineEvent ждёт запись
+// ack-кадра в ответ на успешно обработанное событие машины (heartbeat, тикет
+// 3.6, protocol.md §5/§6), прежде чем считать запись провалившейся и просто
+// залогировать ошибку. По аналогии с machineHelloReadTimeout/bridge.writeTimeout
+// — разумный таймаут на одну сетевую операцию записи, не завязанный на
+// HEARTBEAT_INTERVAL/OFFLINE_THRESHOLD.
+const machineEventAckWriteTimeout = 10 * time.Second
+
 // GetMachineWs реализует GET /machine/ws — WS-handshake с аутентификацией
 // машины по UUID (FR B3, B6, тикет 2.3, см. godoc файла).
 //
@@ -145,10 +157,12 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	s.registerMachineConn(integrationID, conn)
 	defer s.unregisterMachineConn(integrationID, conn)
 
-	// Успешный hello: соединение остаётся открытым. Read-loop тикета 3.4:
-	// разбираем каждый дальнейший кадр и пересылаем ack мосту оркестратора
-	// (s.ackSink, см. handleMachineFrame); любой иной тип кадра (а также
-	// нераспознанный/битый JSON) МОЛЧА игнорируется — обработка прочих типов
+	// Успешный hello: соединение остаётся открытым. Read-loop (тикеты 3.4/3.6):
+	// разбираем каждый дальнейший кадр и маршрутизируем по типу (см.
+	// handleMachineFrame) — ack пересылается мосту оркестратора (s.ackSink),
+	// heartbeat публикуется presence-подсистеме (s.eventSink, см.
+	// handleMachineEvent); любой иной тип кадра (а также нераспознанный/битый
+	// JSON) МОЛЧА игнорируется — обработка прочих типов
 	// (task_accepted/agent_question/command_approval_request/... — тикеты
 	// 3.5/5.x) вне объёма этого тикета, но получение такого кадра не должно
 	// ронять или закрывать соединение (см. godoc файла).
@@ -157,30 +171,107 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		s.handleMachineFrame(data)
+		s.handleMachineFrame(r.Context(), conn, integrationID, data)
 	}
 }
 
 // handleMachineFrame разбирает один кадр, полученный ПОСЛЕ успешного hello
-// (тикет 3.4, protocol.md §5). Сейчас активно обрабатывается только
-// type==ack (commit-after-ack для machine.commands — см. godoc AckSink в
-// server.go); ЛЮБОЙ другой тип, а также нераспознанный/битый кадр —
-// безопасно игнорируется, без побочных эффектов (ни паники, ни закрытия
-// соединения): это явное требование тикета 3.4 — обработка прочих типов
-// кадров (task_accepted/agent_question/... — тикеты 3.5/5.x) не должна
-// блокироваться/ломаться из-за их временного отсутствия здесь.
-func (s *Server) handleMachineFrame(data []byte) {
-	ackMessageID, ok := parseAckFrame(data)
-	if !ok {
+// (тикеты 3.4/3.6, protocol.md §5/§6). Кадр разбирается как конверт ОДИН раз
+// и маршрутизируется по env.Type:
+//   - type==ack — commit-after-ack для machine.commands, пересылается
+//     s.ackSink (см. godoc AckSink в server.go);
+//   - type==heartbeat — событие машины (FR B4, protocol.md §6), см.
+//     handleMachineEvent;
+//   - любой другой тип, а также нераспознанный/битый кадр — безопасно
+//     игнорируется, без побочных эффектов (ни паники, ни закрытия
+//     соединения): обработка прочих типов кадров
+//     (task_accepted/agent_question/... — тикеты 3.5/5.x) не должна
+//     блокироваться/ломаться из-за их временного отсутствия здесь.
+func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
+	var env bus.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
 		return
 	}
-	sink := s.getAckSink()
+
+	switch env.Type {
+	case bus.MessageTypeAck:
+		// parseAckFrame — та же (само-достаточная) логика разбора ack-кадра,
+		// что и раньше (тикет 3.4); повторный разбор data здесь дешёв и
+		// сохраняет единственный источник правды для валидации ack-payload,
+		// покрытый TestParseAckFrame_*.
+		ackMessageID, ok := parseAckFrame(data)
+		if !ok {
+			return
+		}
+		sink := s.getAckSink()
+		if sink == nil {
+			// Мост не зарегистрирован (Redpanda отключён/тест без тикета 3.4) —
+			// штатно игнорируем, см. godoc SetAckSink.
+			return
+		}
+		sink.HandleAck(ackMessageID)
+	case bus.MessageTypeHeartbeat:
+		s.handleMachineEvent(ctx, conn, integrationID, env)
+	default:
+		// Прочие типы событий (тикеты 3.5/5.x) — вне объёма, молча игнорируем.
+	}
+}
+
+// handleMachineEvent обрабатывает событие машины (сейчас — только heartbeat,
+// FR B4, тикет 3.6, protocol.md §6): публикует конверт через
+// зарегистрированный s.eventSink и, при успехе, отвечает ack-кадром — тот же
+// at-least-once принцип, что и у команд оркестратора (protocol.md §5): если
+// публикация не удалась, ack НЕ отправляется, и агент повторит событие сам
+// (durable outbox, тикет 3.5).
+//
+// КРИТИЧНО: env.IntegrationID здесь ВСЕГДА перезаписывается на
+// integrationID — DB id этого уже аутентифицированного соединения
+// (см. authenticateMachineHello), а НЕ то значение, что прислал агент в
+// самом кадре (там — секрет интеграции, plaintext UUID, см.
+// wsclient.Config.IntegrationUUID). Доверять присланному значению нельзя:
+// во-первых, дальнейшие потребители шины (presence.Consumer и др.) ищут
+// интеграцию по DB id, а не по секрету; во-вторых, публикация секрета в
+// Redpanda была бы утечкой чувствительных данных на шину сообщений.
+func (s *Server) handleMachineEvent(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	env.IntegrationID = integrationID.String()
+
+	sink := s.getEventSink()
 	if sink == nil {
-		// Мост не зарегистрирован (Redpanda отключён/тест без тикета 3.4) —
-		// штатно игнорируем, см. godoc SetAckSink.
+		// Presence-подсистема не зарегистрирована (Redpanda отключён/тест без
+		// тикета 3.6) — штатно игнорируем, см. godoc SetEventSink.
 		return
 	}
-	sink.HandleAck(ackMessageID)
+
+	if err := sink.HandleEvent(ctx, env); err != nil {
+		s.logError("EventSink.HandleEvent", err)
+		return
+	}
+
+	ack := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   integrationID.String(),
+		Type:            bus.MessageTypeAck,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+	}
+	payload, err := json.Marshal(bus.AckPayload{AckMessageID: env.MessageID})
+	if err != nil {
+		s.logError("marshal AckPayload для heartbeat", err)
+		return
+	}
+	ack.Payload = payload
+
+	data, err := ack.Marshal()
+	if err != nil {
+		s.logError("marshal ack-конверта для heartbeat", err)
+		return
+	}
+
+	writeCtx, cancel := context.WithTimeout(ctx, machineEventAckWriteTimeout)
+	defer cancel()
+	if err := conn.Write(writeCtx, websocket.MessageText, data); err != nil {
+		s.logError("запись ack-кадра heartbeat в WS", err)
+	}
 }
 
 // parseAckFrame пытается разобрать сырой WS-кадр как конверт type==ack
