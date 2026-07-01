@@ -101,6 +101,14 @@ type taskAcceptor struct {
 
 	logger *slog.Logger
 
+	// allowChecker — конфигурируемый allowlist команд CLI (тикет 6.3, FR F3):
+	// строится один раз в newTaskAcceptor из cfg.AllowlistPatterns
+	// (AGENT_ALLOWLIST_PATTERNS) и передаётся в каждый claudecode.Config в
+	// buildRunner. Пустой AllowlistPatterns → пустой PatternAllowChecker,
+	// ведёт себя как claudecode.EmptyAllowChecker (docs/MANUAL_STEPS.md,
+	// строка 33).
+	allowChecker claudecode.AllowChecker
+
 	// mu защищает active — доступ конкурентный: onTaskAssigned вызывается
 	// синхронно из read-loop wsclient, а runTask (в отдельной горутине)
 	// удаляет task_id по завершении.
@@ -110,14 +118,23 @@ type taskAcceptor struct {
 
 // newTaskAcceptor собирает taskAcceptor с пустым множеством активных задач.
 // sender заполняется отдельно, после конструирования wsclient.Client (см.
-// run() и годок поля sender).
-func newTaskAcceptor(cfg config, publisher claudecode.Publisher, logger *slog.Logger) *taskAcceptor {
-	return &taskAcceptor{
-		cfg:       cfg,
-		publisher: publisher,
-		logger:    logger,
-		active:    make(map[string]struct{}),
+// run() и годок поля sender). Возвращает ошибку, если cfg.AllowlistPatterns
+// (AGENT_ALLOWLIST_PATTERNS) содержит невалидный паттерн allowlist (тикет
+// 6.3, см. claudecode.NewPatternAllowChecker) — агент не должен молча
+// стартовать с частично разобранной/проигнорированной конфигурацией
+// allowlist.
+func newTaskAcceptor(cfg config, publisher claudecode.Publisher, logger *slog.Logger) (*taskAcceptor, error) {
+	allowChecker, err := claudecode.NewPatternAllowChecker(cfg.AllowlistPatterns)
+	if err != nil {
+		return nil, fmt.Errorf("agent: сконструировать allowlist: %w", err)
 	}
+	return &taskAcceptor{
+		cfg:          cfg,
+		publisher:    publisher,
+		logger:       logger,
+		allowChecker: allowChecker,
+		active:       make(map[string]struct{}),
+	}, nil
 }
 
 // onTaskAssigned — реализация wsclient.Config.OnTaskAssigned (см. её годок:
@@ -200,6 +217,7 @@ func (a *taskAcceptor) buildRunner(taskID string) (taskRunner, error) {
 		IntegrationID: a.cfg.IntegrationUUID,
 		Env:           []string{"CLAUDE_CODE_API_KEY=" + a.cfg.ClaudeCodeAPIKey},
 		Logger:        a.logger,
+		AllowChecker:  a.allowChecker,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent: сконструировать провайдера claude-code: %w", err)
