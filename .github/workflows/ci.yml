@@ -3,7 +3,8 @@
 # Назначение (бизнес): исполняемый Definition of Done. Этот workflow блокирует
 # мёрж недокументированного/несобираемого/непротестированного кода. Обязательные
 # гейты (AGENTS.md §0 п.6 и §7): lint / test / bdd / docs-check. Дополнительно
-# держим build, generate-check (контракт-генерёнка синхронна) и web-typecheck.
+# держим build, generate-check (контракт-генерёнка синхронна) и web (реальная
+# Vite-сборка + typecheck + Vitest, тикет 9.1).
 #
 # Как устроено (тех):
 #   * Один корневой Go-модуль (github.com/yarabey/agentify) — поэтому изменения в
@@ -475,9 +476,12 @@ jobs:
           sudo rm -f /etc/systemd/system/agentify-agent.service
           sudo systemctl daemon-reload
 
-  # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
-  # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим
-  # TS-типы из openapi.yaml и проверяем типы (tsc --noEmit).
+  # --- Web: реальная Vite-сборка + typecheck + Vitest (тикет 9.1) ------------
+  # Ставим зависимости, регенерим TS-типы из openapi.yaml (чтобы схема была
+  # актуальна перед сборкой — тот же шаг, что и раньше), затем `npm run build`
+  # (tsc -b по всему приложению, не только по schema.ts, + vite build — падает
+  # на любой ошибке типов или сборки PWA-оболочки) и `npm run test` (vitest run,
+  # без watch-режима, чтобы джоба завершалась).
   web:
     name: web
     needs: changes
@@ -497,8 +501,7 @@ jobs:
         run: npm ci
       - name: gen:api (TS-схема из контракта)
         run: npm run gen:api
-      # Полноценного tsconfig пока нет (Vite-приложение — тикет 9.1), поэтому
-      # типизируем сгенерированную из контракта схему напрямую с явными опциями.
-      # Это реальный гейт: битая TS-схема из openapi.yaml уронит джобу.
-      - name: tsc typecheck (generated API schema)
-        run: npx tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler src/api/schema.ts
+      - name: npm run build (tsc -b + vite build)
+        run: npm run build
+      - name: npm run test (vitest run)
+        run: npm run test
