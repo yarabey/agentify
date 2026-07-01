@@ -55,3 +55,21 @@ RETURNING *;
 -- WS-аутентификации (close 4401), без утечки причины.
 SELECT * FROM integrations
 WHERE uuid_hmac = $1;
+
+-- name: MarkIntegrationOnline :exec
+-- Идемпотентно помечает интеграцию online со свежим last_seen_at (FR B4,
+-- heartbeat через machine.events, тикет 3.6). Повторный вызов для той же
+-- интеграции — безопасен (at-least-once дедуп на уровне bus.Consumer это
+-- дополнительно гасит, но сам запрос идемпотентен и без него).
+UPDATE integrations
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1;
+
+-- name: MarkStaleIntegrationsOffline :exec
+-- Фоновый воркер (тикет 3.6, FR B4, protocol.md §6): переводит в offline все
+-- интеграции, чей last_seen_at устарел (свежее OFFLINE_THRESHOLD). Не трогает
+-- уже offline (WHERE status='online') — идемпотентно относительно частых
+-- вызовов воркера.
+UPDATE integrations
+SET status = 'offline', updated_at = now()
+WHERE status = 'online' AND last_seen_at < $1;

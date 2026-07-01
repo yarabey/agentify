@@ -57,6 +57,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/auth"
+	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
@@ -152,6 +153,16 @@ type Server struct {
 	// NewServer, но до начала обслуживания WS-трафика.
 	ackSink   AckSink
 	ackSinkMu sync.RWMutex
+
+	// eventSink — получатель кадров-событий машины (heartbeat и далее, тикет
+	// 3.6, FR B4, см. EventSink). nil по умолчанию — событийные кадры (в т.ч.
+	// heartbeat) молча игнорируются (штатно, если presence-подсистема не
+	// настроена, например в тестах/каркасных прогонах без
+	// ORCH_REDPANDA_SEEDS, см. orchestrator/main.go). Регистрируется один раз
+	// при старте через SetEventSink, читается под eventSinkMu — тот же
+	// принцип, что и у ackSink/ackSinkMu.
+	eventSink   EventSink
+	eventSinkMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -171,6 +182,24 @@ type AckSink interface {
 	// protocol.md §5) — никогда не паниковать, просто проигнорировать
 	// несовпавший вызов.
 	HandleAck(ackMessageID string)
+}
+
+// EventSink — получатель конвертов-событий от машины (heartbeat и далее,
+// тикет 3.6, FR B4, protocol.md §6): GetMachineWs (machine_ws.go) публикует
+// через него события, не зная ничего об их внутреннем устройстве (Redpanda,
+// топик machine.events) — та же граница между транспортным слоем (api) и
+// бизнес-подсистемой, что и у AckSink/бриджа (orchestrator/internal/presence.Sink
+// реализует EventSink структурно, без импорта пакета api пакетом presence и
+// наоборот — зависимость только в одну сторону, от orchestrator/main.go,
+// которая и связывает Server с presence.Sink через SetEventSink).
+type EventSink interface {
+	// HandleEvent публикует конверт события (env.IntegrationID уже
+	// перезаписан вызывающим на аутентифицированный DB id, см.
+	// handleMachineFrame/handleMachineEvent в machine_ws.go — агенту доверять
+	// нельзя, он присылает секрет интеграции, а не DB id). Ошибка —
+	// публикация не удалась, ack агенту отправлять НЕЛЬЗЯ (агент повторит
+	// через свой durable outbox, тикет 3.5).
+	HandleEvent(ctx context.Context, env bus.Envelope) error
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -268,6 +297,26 @@ func (s *Server) getAckSink() AckSink {
 	s.ackSinkMu.RLock()
 	defer s.ackSinkMu.RUnlock()
 	return s.ackSink
+}
+
+// SetEventSink регистрирует получателя кадров-событий машины (тикет 3.6, см.
+// godoc EventSink). Вызывается ОДИН раз при старте (orchestrator/main.go),
+// после конструирования presence.Sink и до начала обслуживания HTTP/WS-трафика;
+// nil — допустимое значение (в т.ч. явный сброс) — тогда GetMachineWs молча
+// игнорирует событийные кадры (см. machine_ws.go), что штатно при отключённой
+// presence-подсистеме (ORCH_REDPANDA_SEEDS пуст) и в тестах, не относящихся к
+// тикету 3.6.
+func (s *Server) SetEventSink(sink EventSink) {
+	s.eventSinkMu.Lock()
+	defer s.eventSinkMu.Unlock()
+	s.eventSink = sink
+}
+
+// getEventSink читает текущий EventSink под eventSinkMu (см. godoc полей Server).
+func (s *Server) getEventSink() EventSink {
+	s.eventSinkMu.RLock()
+	defer s.eventSinkMu.RUnlock()
+	return s.eventSink
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

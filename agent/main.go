@@ -26,16 +26,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/yarabey/agentify/agent/internal/outbox"
 	"github.com/yarabey/agentify/agent/internal/wsclient"
+	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/platform"
 )
 
@@ -89,6 +93,13 @@ type config struct {
 	// выключенном WS-транспорте outbox’у нечего доставлять, поэтому нет
 	// смысла заводить файл на диске.
 	OutboxPath string `env:"OUTBOX_PATH" envDefault:"agent-outbox.db"`
+
+	// HeartbeatInterval — пауза между heartbeat-событиями агент→оркестратор
+	// (тикет 3.6, FR B4, docs/protocol.md §6: HEARTBEAT_INTERVAL). Переменная
+	// AGENT_HEARTBEAT_INTERVAL, дефолт 15s — как зафиксировано протоколом.
+	// Используется, только если задан OrchestratorWSURL (см. run) — без
+	// WS-транспорта слать heartbeat некуда.
+	HeartbeatInterval time.Duration `env:"HEARTBEAT_INTERVAL" envDefault:"15s"`
 }
 
 func main() {
@@ -162,6 +173,19 @@ func run() error {
 		g.Go(func() error {
 			return wsClient.Run(gctx)
 		})
+
+		// Heartbeat-цикл (тикет 3.6, FR B4, docs/protocol.md §6): каждые
+		// HeartbeatInterval шлёт machine-level событие type=="heartbeat" через
+		// тот же durable-путь (wsclient.Client.SendEvent → outbox → WS), что и
+		// остальные события агент→оркестратор — героя не выделяем: SendEvent
+		// сам переживает и временную недоступность оркестратора (durable
+		// outbox), и падение самого агента (bbolt переживает рестарт). Именно
+		// эти heartbeat-конверты дальше публикует presence.Sink в
+		// machine.events, откуда их читает presence.Consumer
+		// (orchestrator/internal/presence) и помечает интеграцию online.
+		g.Go(func() error {
+			return runHeartbeatLoop(gctx, wsClient, cfg.IntegrationUUID, cfg.HeartbeatInterval, svc.Logger())
+		})
 	}
 
 	// errgroup.Wait возвращает первую реальную ошибку любой из горутин;
@@ -172,4 +196,57 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+// eventSender — узкий интерфейс той части wsclient.Client, что нужна
+// heartbeat-циклу (только SendEvent), — сужение позволяет юнит-тестам
+// подменить отправку фейком, не поднимая реальный WS/outbox (тот же приём,
+// что и в orchestrator/internal/presence для busProducer/busConsumer).
+type eventSender interface {
+	SendEvent(ctx context.Context, env bus.Envelope) error
+}
+
+// runHeartbeatLoop — основной цикл отправки heartbeat (тикет 3.6, FR B4,
+// docs/protocol.md §6): каждые interval шлёт machine-level событие
+// type=="heartbeat" (task_id == nil) через sender.SendEvent. Первый heartbeat
+// уходит сразу при старте (не через interval) — иначе интеграция выглядела
+// бы offline первые HeartbeatInterval секунд после каждого запуска/реконнекта
+// агента без веской причины. Возвращает управление только при отмене ctx
+// (nil, штатное завершение, тот же принцип, что presence.OfflineWorker.Run)
+// — ошибка отдельной отправки логируется и не останавливает цикл (durable
+// outbox сам переживает временный сбой; агент, падающий из-за отдельного
+// неуспешного heartbeat, был бы явно избыточной реакцией).
+func runHeartbeatLoop(ctx context.Context, sender eventSender, integrationUUID string, interval time.Duration, logger *slog.Logger) error {
+	sendHeartbeat(ctx, sender, integrationUUID, logger)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			sendHeartbeat(ctx, sender, integrationUUID, logger)
+		}
+	}
+}
+
+// sendHeartbeat собирает и отправляет один heartbeat-конверт (protocol.md
+// §2, §6). Ошибку SendEvent (только сбой durable-записи в outbox, см. её
+// godoc) не пробрасывает выше — героическая ретрай-логика не нужна: следующий
+// тик runHeartbeatLoop попробует снова.
+func sendHeartbeat(ctx context.Context, sender eventSender, integrationUUID string, logger *slog.Logger) {
+	env := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		TaskID:          nil, // machine-level сообщение (protocol.md §2)
+		IntegrationID:   integrationUUID,
+		Type:            bus.MessageTypeHeartbeat,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         json.RawMessage("{}"),
+	}
+	if err := sender.SendEvent(ctx, env); err != nil && ctx.Err() == nil {
+		logger.Warn("agent: не удалось поставить heartbeat в outbox", "error", err)
+	}
 }
