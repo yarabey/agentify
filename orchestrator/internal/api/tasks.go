@@ -1,9 +1,11 @@
 package api
 
 // tasks.go — постановка задачи в очередь к машине (тикет 5.3, FR E1, E4, §4
-// «Постановка задачи из канала» (web/telegram)) и ответ пользователя на
+// «Постановка задачи из канала» (web/telegram)), ответ пользователя на
 // вопрос агента (тикет 6.1, FR F1, F2, PostTasksIdAnswer, Gherkin §5 «Агент
-// задаёт вопрос и получает ответ»).
+// задаёт вопрос и получает ответ») и согласование команды вне allowlist
+// (тикет 6.4, FR F3, PostTasksIdApprove, Gherkin §5 «Команда вне allowlist
+// требует согласования»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -326,6 +328,160 @@ func (s *Server) PostTasksIdAnswer(w http.ResponseWriter, r *http.Request, id Id
 	}
 	if err := publisher.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
 		s.logError("PublishKeyed(user_answer)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// PostTasksIdApprove реализует POST /tasks/{id}/approve — согласование
+// пользователем команды агента вне allowlist (тикет 6.4, FR F3, Gherkin §5
+// «Команда вне allowlist требует согласования»).
+//
+// Алгоритм: авторизация (JWT, тот же путь, что и PostTasksIdAnswer) →
+// декодировать и провалидировать тело (request_id обязателен по схеме типа;
+// decision обязан быть ровно "approve" или "reject" — тип
+// PostTasksIdApproveJSONBodyDecision в контракте (types.gen.go) это просто
+// string, JSON-декодирование само по себе не проверяет словарь значений) →
+// проверить владение задачей (id пути, owner-scoped, единый 404 — как и в
+// PostTasksIdAnswer) → сопоставить request_id тела запроса с КОНКРЕТНОЙ
+// записью task_events(command_approval_request) этой задачи
+// (ListCommandApprovalRequestEventsByTask + сравнение payload.request_id на
+// стороне Go — тот же приём и то же обоснование, что и у
+// ListAgentQuestionEventsByTask/question_id в PostTasksIdAnswer, см. годок
+// самого запроса в queries/tasks.sql) → перевести задачу
+// waiting_user→running через task.Transitioner.TransitionWithEvent, атомарно
+// записав user_decision с ref_event_id найденного запроса (FR F3) →
+// опубликовать конверт command_decision в machine.commands,
+// партиционированный по integration_id (ADR 0001) → 202.
+//
+// И "approve", и "reject" — валидные значения decision в рамках ЭТОГО
+// тикета: контракт (FR F3, protocol.md §4) их не различает на уровне
+// перехода FSM/публикации — обе публикуют command_decision с ref_event_id
+// найденного запроса и оба переводят задачу обратно в running, само решение
+// прозрачно передаётся агенту (который на стороне Provider.Approve решает,
+// продолжать ли выполнение команды CLI или сообщить об отказе, тикет 4.5).
+// Поведенческая приёмка именно "агент учёл отказ и не выполнил команду" —
+// предмет ОТДЕЛЬНОГО тикета 6.5 (deps: 6.4), не проверяется здесь: здесь
+// закрывается контракт (оба значения decision корректно публикуются) и
+// приёмка САМОГО 6.4 — «команда не выполняется, пока я её не одобрю» (до
+// approve публикации command_decision не происходит вовсе, см.
+// TestPostTasksIdApprove_CommandNotPublishedBeforeApprove).
+//
+// Несопоставленный request_id (валиден как UUID, но не найден среди
+// command_approval_request именно этой задачи) — отдельный 404 not_found:
+// та же логика, что и с question_id в PostTasksIdAnswer (не является
+// объектом, которым можно чужим владеть, различать причины 404 здесь не
+// требует ни FR, ни Gherkin).
+func (s *Server) PostTasksIdApprove(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	var req PostTasksIdApproveJSONBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "тело запроса не является валидным JSON")
+		return
+	}
+	if req.Decision != Approve && req.Decision != Reject {
+		writeError(w, http.StatusBadRequest, "validation_error", "decision должен быть approve или reject")
+		return
+	}
+
+	taskUUID := uuid.UUID(id)
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+
+	// Владение задачей — owner-scoped прямо в SQL (FR A4, I3), как и владение
+	// задачей в PostTasksIdAnswer: чужая/несуществующая задача неотличимы,
+	// единый 404.
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	requestEvents, err := s.queries.ListCommandApprovalRequestEventsByTask(ctx, taskID)
+	if err != nil {
+		s.logError("ListCommandApprovalRequestEventsByTask", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	requestIDStr := uuid.UUID(req.RequestId).String()
+	var matched *db.TaskEvent
+	for i := range requestEvents {
+		var rp bus.CommandApprovalRequestPayload
+		if err := json.Unmarshal(requestEvents[i].PayloadEnc, &rp); err != nil {
+			// Битый/несовместимый payload у конкретной записи не должен ронять
+			// весь поиск — пропускаем её и продолжаем сопоставление остальных.
+			continue
+		}
+		if rp.RequestID == requestIDStr {
+			matched = &requestEvents[i]
+			break
+		}
+	}
+	if matched == nil {
+		writeError(w, http.StatusNotFound, "not_found", "запрос на согласование не найден")
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("PostTasksIdApprove", errors.New("transitioner не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	decisionPayload, err := json.Marshal(bus.CommandDecisionPayload{RequestID: requestIDStr, Decision: string(req.Decision)})
+	if err != nil {
+		s.logError("json.Marshal(CommandDecisionPayload)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerCommandDecision, "user_decision", matched.ID, decisionPayload); err != nil {
+		s.logError("TransitionWithEvent(user_decision)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	publisher := s.getCommandPublisher()
+	if publisher == nil {
+		s.logError("PostTasksIdApprove", errors.New("CommandPublisher не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	taskIDStr := taskUUID.String()
+	integrationID := uuid.UUID(row.IntegrationID.Bytes)
+	env := bus.Envelope{
+		MessageID:     bus.NewMessageID(),
+		TaskID:        &taskIDStr,
+		IntegrationID: integrationID.String(),
+		Type:          bus.MessageTypeCommandDecision,
+		// Seq: то же упрощение, что и в PostTasksIdAnswer (вне объёма 6.4) —
+		// порядок гарантирован партиционированием по integration_id (ADR 0001).
+		Seq:             1,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         decisionPayload,
+	}
+	if err := publisher.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
+		s.logError("PublishKeyed(command_decision)", err)
 		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
 		return
 	}
