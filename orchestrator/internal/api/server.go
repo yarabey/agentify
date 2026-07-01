@@ -60,6 +60,7 @@ import (
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
 // pgUniqueViolation — код ошибки PostgreSQL «нарушение уникального ограничения»
@@ -107,6 +108,11 @@ type Querier interface {
 	// user_id: владелец на этом шаге ещё не известен (FR B3, B6, тикет 2.3,
 	// см. machine_ws.go).
 	GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (db.Integration, error)
+
+	// CreateTask вставляет новую задачу владельца со статусом 'created'
+	// (тикет 5.3, FR E1) — постановку в очередь выполняет отдельно
+	// task.Transitioner (см. PostTasks в tasks.go).
+	CreateTask(ctx context.Context, arg db.CreateTaskParams) (db.Task, error)
 }
 
 // Server — реализация сгенерированного api.ServerInterface для оркестратора.
@@ -163,6 +169,23 @@ type Server struct {
 	// принцип, что и у ackSink/ackSinkMu.
 	eventSink   EventSink
 	eventSinkMu sync.RWMutex
+
+	// transitioner — единственная точка смены статуса задачи (тикет 5.2, см.
+	// taskTransitioner). Устанавливается один раз при старте через
+	// SetTransitioner (orchestrator/main.go), сразу после NewServer — в
+	// отличие от ackSink/eventSink НЕ является опциональной фичей: если nil,
+	// PostTasks отвечает 500 (это означало бы ошибку инициализации сервиса,
+	// не штатный случай).
+	transitioner   taskTransitioner
+	transitionerMu sync.RWMutex
+
+	// commandPublisher — см. CommandPublisher. nil по умолчанию — штатно, если
+	// Redpanda-подсистема не настроена (ORCH_REDPANDA_SEEDS пуст, тесты без
+	// брокера); PostTasks в этом случае отвечает 500 (задачу нельзя доставить
+	// без шины). Регистрируется один раз при старте через
+	// SetCommandPublisher.
+	commandPublisher   CommandPublisher
+	commandPublisherMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -200,6 +223,29 @@ type EventSink interface {
 	// публикация не удалась, ack агенту отправлять НЕЛЬЗЯ (агент повторит
 	// через свой durable outbox, тикет 3.5).
 	HandleEvent(ctx context.Context, env bus.Envelope) error
+}
+
+// CommandPublisher — публикатор команд машине в топик machine.commands
+// (тикет 5.3, FR E1): PostTasks (tasks.go) публикует конверт task_assigned,
+// не зная ничего о его внутреннем устройстве (Redpanda) — та же граница
+// между транспортным/API-слоем и шиной, что и у AckSink/EventSink выше.
+// Сигнатура НАМЕРЕННО совпадает с бизнес-методом *bus.Producer.PublishKeyed
+// — тем самым сам *bus.Producer уже удовлетворяет этому интерфейсу БЕЗ
+// отдельного адаптера (тот же структурный приём, что и у AckSink/EventSink,
+// реализуемых bridge.Bridge/presence.Sink без импорта пакета api).
+type CommandPublisher interface {
+	PublishKeyed(ctx context.Context, topic, keyField string, env bus.Envelope) error
+}
+
+// taskTransitioner — узкий интерфейс на *task.Transitioner.Transition,
+// нужный PostTasks (тикет 5.3) для перевода новой задачи created→queued
+// (FR E1, единственная точка смены статуса — тикет 5.2). Сужение — для
+// юнит-тестов: PostTasks не завязан на весь *task.Transitioner (который сам
+// требует *pgxpool.Pool, недоступный обработчикам через узкий Querier) —
+// тесты подставляют фейк, реализующий только этот метод (см. tasks_test.go).
+// *task.Transitioner удовлетворяет этому интерфейсу структурно.
+type taskTransitioner interface {
+	Transition(ctx context.Context, taskID pgtype.UUID, trigger task.Trigger) (from, to task.Status, err error)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -317,6 +363,43 @@ func (s *Server) getEventSink() EventSink {
 	s.eventSinkMu.RLock()
 	defer s.eventSinkMu.RUnlock()
 	return s.eventSink
+}
+
+// SetTransitioner регистрирует единственную точку смены статуса задачи
+// (тикет 5.2, см. taskTransitioner). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), сразу после NewServer, до начала обслуживания
+// HTTP-трафика.
+func (s *Server) SetTransitioner(t taskTransitioner) {
+	s.transitionerMu.Lock()
+	defer s.transitionerMu.Unlock()
+	s.transitioner = t
+}
+
+// getTransitioner читает текущий taskTransitioner под transitionerMu (см.
+// godoc полей Server).
+func (s *Server) getTransitioner() taskTransitioner {
+	s.transitionerMu.RLock()
+	defer s.transitionerMu.RUnlock()
+	return s.transitioner
+}
+
+// SetCommandPublisher регистрирует публикатора команд машине (тикет 5.3, см.
+// CommandPublisher). Вызывается ОДИН раз при старте (orchestrator/main.go),
+// после создания Redpanda-продьюсера и до начала обслуживания HTTP-трафика;
+// nil — допустимое значение (в т.ч. явный сброс) — тогда PostTasks отвечает
+// 500 (см. godoc поля commandPublisher).
+func (s *Server) SetCommandPublisher(p CommandPublisher) {
+	s.commandPublisherMu.Lock()
+	defer s.commandPublisherMu.Unlock()
+	s.commandPublisher = p
+}
+
+// getCommandPublisher читает текущий CommandPublisher под
+// commandPublisherMu (см. godoc полей Server).
+func (s *Server) getCommandPublisher() CommandPublisher {
+	s.commandPublisherMu.RLock()
+	defer s.commandPublisherMu.RUnlock()
+	return s.commandPublisher
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

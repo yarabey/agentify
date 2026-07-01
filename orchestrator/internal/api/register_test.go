@@ -61,6 +61,9 @@ type fakeQuerier struct {
 
 	getIntegrationByUUIDHMACResult db.Integration
 	getIntegrationByUUIDHMACErr    error
+
+	createTaskResult db.Task
+	createTaskErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -149,6 +152,13 @@ func (f fakeQuerier) GetIntegrationByUUIDHMAC(context.Context, string) (db.Integ
 		return db.Integration{}, f.getIntegrationByUUIDHMACErr
 	}
 	return f.getIntegrationByUUIDHMACResult, nil
+}
+
+func (f fakeQuerier) CreateTask(context.Context, db.CreateTaskParams) (db.Task, error) {
+	if f.createTaskErr != nil {
+		return db.Task{}, f.createTaskErr
+	}
+	return f.createTaskResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api

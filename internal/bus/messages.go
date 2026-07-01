@@ -91,3 +91,9 @@ type HelloPayload struct {
 	// claude-code, ...; EPIC 4.5). Тикетом 3.3 не валидируется.
 	Providers []string `json:"providers"`
 }
+
+// TaskAssignedPayload — payload сообщения type == MessageTypeTaskAssigned
+// (тикет 5.3, FR E1): текст задачи, которую агент должен выполнить.
+type TaskAssignedPayload struct {
+	Text string `json:"text"`
+}

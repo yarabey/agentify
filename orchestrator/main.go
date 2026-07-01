@@ -45,6 +45,7 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
 	"github.com/yarabey/agentify/orchestrator/internal/presence"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 	"github.com/yarabey/agentify/orchestrator/migrations"
 )
 
@@ -219,6 +220,7 @@ func run() error {
 		defer pool.Close()
 
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
+		server.SetTransitioner(task.NewTransitioner(pool))
 		svc.SetHandler(api.NewRouter(server))
 
 		// Мост Redpanda → WS (тикет 3.4, protocol.md §5): опционален, как и
@@ -265,6 +267,12 @@ func run() error {
 				return fmt.Errorf("orchestrator: ORCH_REDPANDA_SEEDS задан, но создание Redpanda-продьюсера presence не удалось: %w", err)
 			}
 			defer producer.Close()
+
+			// Тот же producer instance переиспользуется как CommandPublisher
+			// постановки задач (тикет 5.3, FR E1, machine.commands) — Producer
+			// потокобезопасен (godoc internal/bus/producer.go), отдельный
+			// экземпляр не нужен.
+			server.SetCommandPublisher(producer)
 
 			sink, err := presence.NewSink(producer)
 			if err != nil {
