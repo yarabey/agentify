@@ -21,6 +21,14 @@
 // быть UNIQUE, что критично для будущей аутентификации машины по HMAC(UUID)
 // без коллизий (тикет 2.3, FR B6).
 //
+// Тикет 5.1 («Схема задач», deps: 1.1, 2.1, миграция 00003_tasks_and_events.sql —
+// не редактируется этим тикетом, схема уже подготовлена) добавляет к (a)
+// проверку таблиц tasks и task_events и их ключевых колонок после up и их
+// исчезновение после down, а также отдельный тест
+// TestIntegration_TaskEventsSeqUnique — task_events.seq должен быть UNIQUE в
+// рамках task_id, что гарантирует детерминированный порядок событий задачи
+// для FSM/аудита (FR F2).
+//
 // Контейнер чистится через testcontainers terminate (defer) + Ryuk reaper.
 package db_test
 
@@ -204,7 +212,20 @@ func TestIntegration_MigrationUpDown(t *testing.T) {
 		"id", "user_id", "name", "ip_hint", "uuid_hmac", "uuid_enc",
 		"status", "last_seen_at", "created_at", "updated_at")
 
-	allTables := append(append([]string{}, authTables...), integrationsTable)
+	// Тикет 5.1: таблицы tasks и task_events (миграция
+	// 00003_tasks_and_events.sql, уже подготовлена и этим тикетом не
+	// редактируется) — сами таблицы и их ключевые колонки, включая поле
+	// упорядочивания событий seq (FR F1–F2).
+	const tasksTable = "tasks"
+	const taskEventsTable = "task_events"
+	tablesExist(ctx, t, sqlDB, tasksTable, taskEventsTable)
+	columnsExist(ctx, t, sqlDB, tasksTable,
+		"id", "user_id", "integration_id", "text_enc", "status",
+		"idempotency_key", "created_at", "updated_at")
+	columnsExist(ctx, t, sqlDB, taskEventsTable,
+		"id", "task_id", "seq", "type", "ref_event_id", "payload_enc", "created_at")
+
+	allTables := append(append([]string{}, authTables...), integrationsTable, tasksTable, taskEventsTable)
 
 	// Down: откатываем все миграции до версии 0 — проверяем обратимость схемы.
 	if derr := goose.DownToContext(ctx, sqlDB, ".", 0); derr != nil {
@@ -295,6 +316,114 @@ func TestIntegration_IntegrationsUUIDHMACUnique(t *testing.T) {
 		owner.ID, []byte("ciphertext-three"))
 	if err != nil {
 		t.Fatalf("вставка integrations с уникальным uuid_hmac неожиданно упала: %v", err)
+	}
+}
+
+// TestIntegration_TaskEventsSeqUnique — приёмка 5.1: task_events.seq обязан
+// быть UNIQUE в рамках одной задачи (уникальный индекс uq_task_events_seq на
+// (task_id, seq)). Это не декоративное ограничение: seq задаёт единственно
+// верный порядок событий задачи, на который опирается и FSM (последовательная
+// обработка команд/ответов агента), и аудит/replay истории задачи для
+// пользователя (FR F2) — при коллизии seq порядок стал бы недетерминированным.
+// Поднимаем отдельный контейнер (как TestIntegration_IntegrationsUUIDHMACUnique),
+// чтобы тест не зависел от состояния, оставленного другими тестами файла.
+func TestIntegration_TaskEventsSeqUnique(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn, cleanup := startPostgres(ctx, t)
+	defer cleanup()
+
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	goose.SetBaseFS(migrations.FS)
+	if derr := goose.SetDialect("postgres"); derr != nil {
+		t.Fatalf("goose SetDialect: %v", derr)
+	}
+	if uperr := goose.UpContext(ctx, sqlDB, "."); uperr != nil {
+		t.Fatalf("goose Up: %v", uperr)
+	}
+	_ = sqlDB.Close()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	// tasks.user_id/integration_id — NOT NULL FK, нужны реальные владелец и
+	// интеграция для вставки задачи (владелец — через sqlc CreateUser, как и
+	// соседние тесты; интеграция — прямым INSERT, как в
+	// TestIntegration_IntegrationsUUIDHMACUnique, отдельного sqlc-запроса для
+	// этого в файле нет и он не нужен для 5.1).
+	q := db.New(pool)
+	owner, err := q.CreateUser(ctx, db.CreateUserParams{
+		Username:     "seq-test-owner",
+		PasswordHash: "argon2id$stub",
+		IsAdmin:      false,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	var integrationID pgtype.UUID
+	err = pool.QueryRow(ctx, `
+		INSERT INTO integrations (user_id, name, uuid_hmac, uuid_enc)
+		VALUES ($1, 'seq-test-machine', 'seq-test-hmac-probe', $2)
+		RETURNING id`,
+		owner.ID, []byte("ciphertext-stub")).Scan(&integrationID)
+	if err != nil {
+		t.Fatalf("вставка integrations для теста seq: %v", err)
+	}
+
+	var taskID pgtype.UUID
+	err = pool.QueryRow(ctx, `
+		INSERT INTO tasks (user_id, integration_id, text_enc)
+		VALUES ($1, $2, $3)
+		RETURNING id`,
+		owner.ID, integrationID, []byte("ciphertext-stub")).Scan(&taskID)
+	if err != nil {
+		t.Fatalf("вставка tasks для теста seq: %v", err)
+	}
+
+	// Первая вставка task_events с seq=1 должна пройти без ошибок.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO task_events (task_id, seq, type, payload_enc)
+		VALUES ($1, 1, 'status_change', $2)`,
+		taskID, []byte("payload-one"))
+	if err != nil {
+		t.Fatalf("первая вставка task_events с seq=1: %v", err)
+	}
+
+	// Вторая вставка с ТЕМ ЖЕ task_id и ТЕМ ЖЕ seq=1 (другой payload_enc)
+	// обязана упасть с нарушением уникальности (Postgres SQLSTATE 23505).
+	_, err = pool.Exec(ctx, `
+		INSERT INTO task_events (task_id, seq, type, payload_enc)
+		VALUES ($1, 1, 'status_change', $2)`,
+		taskID, []byte("payload-one-duplicate"))
+	if err == nil {
+		t.Fatal("вставка дубликата (task_id, seq) прошла без ошибки — UNIQUE-ограничение не работает")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("ожидалась ошибка Postgres (*pgconn.PgError) при дубликате seq, получено: %v", err)
+	}
+	if pgErr.Code != pgUniqueViolationCode {
+		t.Fatalf("ожидался SQLSTATE %s (unique_violation) при дубликате seq, получено %s: %v",
+			pgUniqueViolationCode, pgErr.Code, pgErr)
+	}
+
+	// Контрольная вставка с тем же task_id, но seq=2 обязана пройти —
+	// доказывает, что отказ выше вызван именно дубликатом seq в рамках
+	// задачи, а не случайной поломкой INSERT/FK.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO task_events (task_id, seq, type, payload_enc)
+		VALUES ($1, 2, 'status_change', $2)`,
+		taskID, []byte("payload-two"))
+	if err != nil {
+		t.Fatalf("вставка task_events с уникальным seq=2 неожиданно упала: %v", err)
 	}
 }
 
