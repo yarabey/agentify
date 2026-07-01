@@ -123,6 +123,15 @@ type config struct {
 	// OFFLINE_THRESHOLD). Переменная ORCH_OFFLINE_THRESHOLD, дефолт 45s — как
 	// зафиксировано протоколом.
 	OfflineThreshold time.Duration `env:"OFFLINE_THRESHOLD" envDefault:"45s"`
+
+	// StaleThreshold — порог устаревания last_seen_at интеграции, после
+	// которого её активные (running/waiting_user) задачи переводятся в stale с
+	// уведомлением (FR E5, protocol.md §6: STALE_THRESHOLD; тикет 5.7).
+	// Переменная ORCH_STALE_THRESHOLD. Продуктовое решение об окончательном
+	// значении не зафиксировано (docs/MANUAL_STEPS.md §4) — дефолт 120s выбран
+	// заметно больше OfflineThreshold (45s), чтобы задача помечалась зависшей
+	// уже ПОСЛЕ того, как сама интеграция определённо помечена offline.
+	StaleThreshold time.Duration `env:"STALE_THRESHOLD" envDefault:"120s"`
 }
 
 func main() {
@@ -304,6 +313,20 @@ func run() error {
 			}
 			g.Go(func() error {
 				return offlineWorker.Run(gctx)
+			})
+
+			// «Зависание» машины (тикет 5.7, FR E5, protocol.md §6): StaleWorker
+			// читает ТУ ЖЕ integrations.last_seen_at, что и OfflineWorker выше, но
+			// со своим (заметно бОльшим) порогом STALE_THRESHOLD и независимо от
+			// integrations.status — гейтится тем же условием ORCH_REDPANDA_SEEDS,
+			// потому что last_seen_at в принципе обновляется только через
+			// heartbeat-consumer, который сам гейтится этим условием.
+			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка task.StaleWorker: %w", err)
+			}
+			g.Go(func() error {
+				return staleWorker.Run(gctx)
 			})
 		}
 	} else if len(cfg.RedpandaSeeds) != 0 {
