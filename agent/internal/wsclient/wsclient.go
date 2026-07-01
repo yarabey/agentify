@@ -1,5 +1,5 @@
 // Package wsclient — исходящий WS-транспорт агента к оркестратору (тикеты
-// 3.3/3.5, docs/protocol.md §1, §2, §4, §5; зеркало серверной стороны
+// 3.3/3.5/6.5, docs/protocol.md §1, §2, §4, §5; зеркало серверной стороны
 // orchestrator/internal/api/machine_ws.go, тикеты 2.3/2.4, и моста
 // orchestrator/internal/bridge, тикет 3.4).
 //
@@ -35,9 +35,13 @@
 //     Config.OnTaskAssigned и, при успехе, немедленно отвечает ack-кадром
 //     (writeAck); бизнес-логика запуска задачи (выбор провайдера, durable
 //     постановка task_accepted в outbox) целиком живёт в вызывающем коде
-//     (agent/main.go), wsclient её не знает. Любой иной/нераспознанный кадр
-//     молча игнорируется (обработка user_answer/command_decision/
-//     cancel/ping — EPIC 5.x, вне объёма).
+//     (agent/main.go), wsclient её не знает; а также type==command_decision
+//     (FR F3, тикет 6.5) — вызывает Config.OnCommandDecision и, при успехе,
+//     так же немедленно отвечает ack-кадром; бизнес-логика применения решения
+//     к конкретному активному провайдеру задачи (agent/task_runner.go)
+//     аналогично живёт вне wsclient. Любой иной/нераспознанный кадр молча
+//     игнорируется (обработка user_answer/cancel/ping — EPIC 5.x/6.x, вне
+//     объёма).
 //   - send-loop читает outbox.Pending() и последовательно шлёт каждое
 //     событие, ждёт ack именно на его message_id (или разрыва
 //     сессии/отмены ctx — БЕЗ отдельного внутреннего таймера "нет ack →
@@ -158,6 +162,23 @@ type Config struct {
 	// с тикетом 3.5), но логируется предупреждением (см. handleFrame) —
 	// отличимо от штатного игнорирования прочих типов.
 	OnTaskAssigned func(ctx context.Context, env bus.Envelope) error
+
+	// OnCommandDecision — колбэк входящей команды command_decision (тикет
+	// 6.5, FR F3, Gherkin §5 «Отклонение команды»): решение пользователя
+	// (approve/reject) по ранее запрошенному согласованию команды вне
+	// allowlist (тикет 6.4, bus.MessageTypeCommandApprovalRequest). Вызывается
+	// синхронно из read-loop сессии СРАЗУ по получении кадра — реализация
+	// ОБЯЗАНА вернуться быстро (та же дисциплина, что и у OnTaskAssigned).
+	// Возвращает ошибку ТОЛЬКО если решение не удалось применить (нет
+	// активной задачи/провайдера для указанного в конверте task_id,
+	// невалидный payload, неизвестный/уже применённый request_id —
+	// claudecode.ErrUnknownRequest) — в этом случае wsclient НЕ отправляет
+	// ack (агент получит редоставку того же решения от моста, тот же
+	// at-least-once принцип, что и у OnTaskAssigned). Пусто (nil) →
+	// command_decision молча игнорируется, как и любой нераспознанный кадр,
+	// но логируется предупреждением (см. handleFrame) — отличимо от штатного
+	// игнорирования прочих типов.
+	OnCommandDecision func(ctx context.Context, env bus.Envelope) error
 }
 
 // validate проверяет обязательные поля Config (см. godoc New).
@@ -460,11 +481,10 @@ type connSession struct {
 }
 
 // readLoop читает входящие кадры до ошибки/закрытия соединения. Распознаёт
-// type==ack и type==task_assigned (см. handleFrame) — любой иной или
-// нераспознанный кадр молча игнорируется (обработка
-// user_answer/command_decision/cancel/ping — вне объёма тикета 5.4, EPIC
-// 5.x; тот же принцип, что handleMachineFrame в
-// orchestrator/internal/api/machine_ws.go).
+// type==ack, type==task_assigned и type==command_decision (см. handleFrame)
+// — любой иной или нераспознанный кадр молча игнорируется (обработка
+// user_answer/cancel/ping — вне объёма тикетов 5.4/6.5, EPIC 5.x/6.x; тот же
+// принцип, что handleMachineFrame в orchestrator/internal/api/machine_ws.go).
 func (s *connSession) readLoop(ctx context.Context) error {
 	for {
 		_, data, err := s.conn.Read(ctx)
@@ -483,7 +503,10 @@ func (s *connSession) readLoop(ctx context.Context) error {
 //     удалось даже начать) ack НЕ отправляется — агент получит редоставку
 //     той же команды от моста оркестратора (at-least-once, тот же принцип,
 //     что и у остальных путей протокола); при успехе — немедленно отправляет
-//     ack-кадр (writeAck).
+//     ack-кадр (writeAck);
+//   - type==command_decision (FR F3, тикет 6.5) вызывает
+//     Config.OnCommandDecision — та же дисциплина ack, что и у
+//     task_assigned (см. handleCommandDecisionFrame);
 //   - любой другой/нераспознанный кадр — no-op (см. godoc readLoop).
 func (s *connSession) handleFrame(ctx context.Context, data []byte) {
 	if ackMessageID, ok := parseAckFrame(data); ok {
@@ -495,10 +518,20 @@ func (s *connSession) handleFrame(ctx context.Context, data []byte) {
 	if err := json.Unmarshal(data, &env); err != nil {
 		return
 	}
-	if env.Type != bus.MessageTypeTaskAssigned {
-		return
-	}
 
+	switch env.Type {
+	case bus.MessageTypeTaskAssigned:
+		s.handleTaskAssignedFrame(ctx, env)
+	case bus.MessageTypeCommandDecision:
+		s.handleCommandDecisionFrame(ctx, env)
+	default:
+		// Любой другой/нераспознанный тип — no-op (см. godoc readLoop).
+	}
+}
+
+// handleTaskAssignedFrame обрабатывает уже разобранный кадр
+// type==task_assigned (см. godoc handleFrame).
+func (s *connSession) handleTaskAssignedFrame(ctx context.Context, env bus.Envelope) {
 	if s.c.cfg.OnTaskAssigned == nil {
 		// Хэндлер не сконфигурирован (агент без wiring провайдера в
 		// main.go, либо намеренно) — штатно игнорируем, как и любой
@@ -524,6 +557,43 @@ func (s *connSession) handleFrame(ctx context.Context, data []byte) {
 
 	if err := s.writeAck(ctx, env.MessageID); err != nil {
 		s.c.logger.Warn("запись ack-кадра task_assigned в WS",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// handleCommandDecisionFrame обрабатывает уже разобранный кадр
+// type==command_decision (FR F3, тикет 6.5, Gherkin §5 «Отклонение
+// команды», см. godoc handleFrame и Config.OnCommandDecision) — зеркало
+// handleTaskAssignedFrame: при отсутствующем хэндлере или его ошибке ack не
+// отправляется (at-least-once, редоставка того же решения); при успехе —
+// немедленно отправляет ack-кадр.
+func (s *connSession) handleCommandDecisionFrame(ctx context.Context, env bus.Envelope) {
+	if s.c.cfg.OnCommandDecision == nil {
+		// Хэндлер не сконфигурирован — штатно игнорируем, как и любой
+		// нераспознанный кадр (см. godoc Config.OnCommandDecision), но
+		// логируем предупреждением, отличимо от штатного игнорирования
+		// прочих типов. Содержимое решения (env.Payload) в лог НЕ попадает.
+		s.c.logger.Warn("command_decision получен, но OnCommandDecision не настроен — кадр проигнорирован",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+		)
+		return
+	}
+
+	if err := s.c.cfg.OnCommandDecision(ctx, env); err != nil {
+		s.c.logger.Warn("OnCommandDecision вернул ошибку — ack не отправлен, ожидаем redelivery",
+			slog.String("integration_id", s.c.cfg.IntegrationUUID),
+			slog.String("message_id", env.MessageID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	if err := s.writeAck(ctx, env.MessageID); err != nil {
+		s.c.logger.Warn("запись ack-кадра command_decision в WS",
 			slog.String("integration_id", s.c.cfg.IntegrationUUID),
 			slog.String("message_id", env.MessageID),
 			slog.String("error", err.Error()),
