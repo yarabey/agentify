@@ -201,9 +201,30 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # Тулинг кодогенерации фиксированных версий: Go-инструменты + npm-пакеты web.
-      - name: Install codegen toolchain (oapi-codegen, sqlc, openapi-typescript)
-        run: make tools
+      # generate-check нужны ТОЛЬКО sqlc + oapi-codegen (для generate-sql/generate-go)
+      # и npm-зависимости web (для generate-ts) — НЕ полный `make tools` (тот же
+      # набор, что и для локальной разработки: ставит ещё golangci-lint и
+      # goreleaser, самые долгие в сборке из исходников инструменты в
+      # Makefile, но не нужные кодогенерации). Кэшируем бинари sqlc/oapi-codegen
+      # по ключу, зависящему от Makefile (там же зафиксированы их версии —
+      # SQLC_VERSION/OAPI_CODEGEN_VERSION), чтобы не пересобирать их из
+      # исходников на каждый прогон; при бампе версии в Makefile хэш файла
+      # изменится и кэш инвалидируется автоматически.
+      - name: Cache codegen tools (sqlc, oapi-codegen)
+        id: cache-codegen-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/sqlc
+            ~/go/bin/oapi-codegen
+          key: codegen-tools-${{ runner.os }}-${{ hashFiles('Makefile') }}
+      - name: Install Go codegen tools (sqlc, oapi-codegen)
+        if: steps.cache-codegen-tools.outputs.cache-hit != 'true'
+        run: make tools-generate-go
+      # npm ci выполняется всегда (не входит в кэшируемые пути выше; уже
+      # недорог благодаря cache: npm в actions/setup-node@v4 этой же джобы).
+      - name: npm ci (web deps for generate-ts)
+        run: npm --prefix web ci
       - name: make generate-check
         run: make generate-check
 
