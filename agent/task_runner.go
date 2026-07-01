@@ -4,12 +4,14 @@
 // §4) — оркестратор доставил команду type=task_assigned через мост
 // machine.commands (тикет 3.4), wsclient (тикет 3.3, тикет 5.4-Б) принял её и
 // вызвал OnTaskAssigned; здесь агент решает, ЧТО делать с текстом задачи:
-// выбирает провайдера (пока единственный доступный в MVP — Claude Code,
-// тикет 4.5; "claude"/Anthropic API — тикет 9.7, не реализован), запускает его
-// подпроцессом в отдельной горутине (сама задача может выполняться долго —
-// минуты; hook обязан вернуться быстро, см. годок wsclient.Config.OnTaskAssigned)
-// и подтверждает приём оркестратору событием task_accepted — именно оно
-// переводит задачу queued→running на стороне оркестратора
+// выбирает провайдера из двух доступных в MVP — Claude Code (подпроцесс CLI
+// `claude`, тикет 4.5) или "claude" (прямые HTTPS-вызовы Anthropic API,
+// agent/internal/provider/claude, тикет 9.7) — приоритет см. hasClaudeCodeConfigured/
+// hasClaudeConfigured/buildRunner, запускает выбранного провайдера в отдельной
+// горутине (сама задача может выполняться долго — минуты; hook обязан
+// вернуться быстро, см. годок wsclient.Config.OnTaskAssigned) и подтверждает
+// приём оркестратору событием task_accepted — именно оно переводит задачу
+// queued→running на стороне оркестратора
 // (orchestrator/internal/api/machine_ws.go, handleTaskAccepted).
 //
 // Границы (осознанно НЕ входит в этот тикет):
@@ -64,6 +66,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yarabey/agentify/agent/internal/provider/claude"
 	"github.com/yarabey/agentify/agent/internal/provider/claudecode"
 	"github.com/yarabey/agentify/internal/bus"
 )
@@ -96,20 +99,31 @@ type taskRunner interface {
 	Close() error
 }
 
-// newProvider — фабрика taskRunner, используемая onTaskAssigned. Отдельная
-// переменная (а не прямой вызов claudecode.New) — точка подмены в тестах
-// (см. годок taskRunner): в проде остаётся claudecode.New без изменений.
+// newProvider — фабрика taskRunner для провайдера claude-code, используемая
+// buildRunner. Отдельная переменная (а не прямой вызов claudecode.New) —
+// точка подмены в тестах (см. годок taskRunner): в проде остаётся
+// claudecode.New без изменений.
 var newProvider = func(cfg claudecode.Config) (taskRunner, error) {
 	return claudecode.New(cfg)
 }
 
+// newClaudeProvider — фабрика taskRunner для провайдера "claude" (прямые
+// HTTPS-вызовы Anthropic API, agent/internal/provider/claude, тикет 9.7) —
+// тот же приём подмены в тестах, что и newProvider, но отдельная переменная:
+// оба провайдера сосуществуют (см. buildRunner), подменять их в тестах нужно
+// независимо друг от друга.
+var newClaudeProvider = func(cfg claude.Config) (taskRunner, error) {
+	return claude.New(cfg)
+}
+
 // errNoProvider возвращает onTaskAssigned/buildRunner, если для машины не
-// сконфигурирован ни один поддерживаемый провайдер (MVP: только
-// "claude-code", см. hasClaudeCodeConfigured). Ack на task_assigned в этом
-// случае НЕ отправляется — агент получит редоставку кадра, пока оператор не
-// поправит конфигурацию (AGENT_PROVIDERS/AGENT_CLAUDE_CODE_API_KEY);
-// отдельный канал сообщить оркестратору «провайдер не настроен» — вне
-// объёма 5.4 (обработка ошибок — тикет 5.8).
+// сконфигурирован ни один поддерживаемый провайдер (MVP: "claude-code" или
+// "claude", см. hasClaudeCodeConfigured/hasClaudeConfigured). Ack на
+// task_assigned в этом случае НЕ отправляется — агент получит редоставку
+// кадра, пока оператор не поправит конфигурацию (AGENT_PROVIDERS/
+// AGENT_CLAUDE_CODE_API_KEY/AGENT_CLAUDE_API_KEY); отдельный канал сообщить
+// оркестратору «провайдер не настроен» — вне объёма 5.4 (обработка ошибок —
+// тикет 5.8).
 var errNoProvider = errors.New("agent: нет доступного провайдера для задачи")
 
 // taskAcceptor реализует wsclient.Config.OnTaskAssigned (тикет 5.4): принимает
@@ -303,12 +317,12 @@ func (a *taskAcceptor) onCancel(_ context.Context, env bus.Envelope) error {
 	return nil
 }
 
-// hasClaudeCodeConfigured — единственная поддерживаемая в MVP проверка
-// доступности провайдера (тикет 4.5): "claude-code" должен быть заявлен в
-// AGENT_PROVIDERS И для него должен быть задан AGENT_CLAUDE_CODE_API_KEY.
-// "claude" (Anthropic API, тикет 9.7) ещё не реализован — намеренно не
-// строим здесь абстракцию выбора между несколькими провайдерами, см. годок
-// файла.
+// hasClaudeCodeConfigured — проверка доступности провайдера claude-code
+// (тикет 4.5): "claude-code" должен быть заявлен в AGENT_PROVIDERS И для него
+// должен быть задан AGENT_CLAUDE_CODE_API_KEY. Приоритет между
+// claude-code и "claude" (Anthropic API, тикет 9.7, см.
+// hasClaudeConfigured) — см. годок buildRunner: claude-code проверяется
+// первым.
 func (a *taskAcceptor) hasClaudeCodeConfigured() bool {
 	if a.cfg.ClaudeCodeAPIKey == "" {
 		return false
@@ -321,26 +335,60 @@ func (a *taskAcceptor) hasClaudeCodeConfigured() bool {
 	return false
 }
 
+// hasClaudeConfigured — проверка доступности провайдера "claude" (прямые
+// HTTPS-вызовы Anthropic API, agent/internal/provider/claude, тикет 9.7):
+// "claude" должен быть заявлен в AGENT_PROVIDERS И для него должен быть
+// задан AGENT_CLAUDE_API_KEY (см. годок config.ClaudeAPIKey в agent/main.go).
+func (a *taskAcceptor) hasClaudeConfigured() bool {
+	if a.cfg.ClaudeAPIKey == "" {
+		return false
+	}
+	for _, p := range a.cfg.Providers {
+		if p == "claude" {
+			return true
+		}
+	}
+	return false
+}
+
 // buildRunner выбирает и конструирует провайдера для задачи taskID.
-// Возвращает errNoProvider, если "claude-code" не сконфигурирован (см. годок
-// errNoProvider) — вызывающий (onTaskAssigned) в этом случае возвращает
-// ошибку без ack, ack НЕ отправляется.
+// Приоритет (осознанный, MVP не выбирает провайдера по данным задачи, см.
+// годок файла): claude-code, если сконфигурирован (hasClaudeCodeConfigured),
+// иначе "claude" (Anthropic API, тикет 9.7, hasClaudeConfigured), иначе
+// errNoProvider (см. её годок) — вызывающий (onTaskAssigned) в этом случае
+// возвращает ошибку без ack, ack НЕ отправляется.
 func (a *taskAcceptor) buildRunner(taskID string) (taskRunner, error) {
-	if !a.hasClaudeCodeConfigured() {
+	switch {
+	case a.hasClaudeCodeConfigured():
+		runner, err := newProvider(claudecode.Config{
+			Publisher:     a.publisher,
+			TaskID:        taskID,
+			IntegrationID: a.cfg.IntegrationUUID,
+			Env:           []string{"CLAUDE_CODE_API_KEY=" + a.cfg.ClaudeCodeAPIKey},
+			Logger:        a.logger,
+			AllowChecker:  a.allowChecker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("agent: сконструировать провайдера claude-code: %w", err)
+		}
+		return runner, nil
+	case a.hasClaudeConfigured():
+		runner, err := newClaudeProvider(claude.Config{
+			APIKey:        a.cfg.ClaudeAPIKey,
+			WorkDir:       "",
+			Publisher:     a.publisher,
+			TaskID:        taskID,
+			IntegrationID: a.cfg.IntegrationUUID,
+			Logger:        a.logger,
+			AllowChecker:  a.allowChecker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("agent: сконструировать провайдера claude: %w", err)
+		}
+		return runner, nil
+	default:
 		return nil, errNoProvider
 	}
-	runner, err := newProvider(claudecode.Config{
-		Publisher:     a.publisher,
-		TaskID:        taskID,
-		IntegrationID: a.cfg.IntegrationUUID,
-		Env:           []string{"CLAUDE_CODE_API_KEY=" + a.cfg.ClaudeCodeAPIKey},
-		Logger:        a.logger,
-		AllowChecker:  a.allowChecker,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("agent: сконструировать провайдера claude-code: %w", err)
-	}
-	return runner, nil
 }
 
 // runTask выполняет задачу провайдером в отдельной горутине (см. годок

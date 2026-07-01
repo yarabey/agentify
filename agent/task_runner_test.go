@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yarabey/agentify/agent/internal/provider/claude"
 	"github.com/yarabey/agentify/agent/internal/provider/claudecode"
 	"github.com/yarabey/agentify/internal/bus"
 )
@@ -355,6 +356,115 @@ func TestBuildRunner_PassesConfiguredAllowChecker(t *testing.T) {
 	}
 	if capturedCfg.AllowChecker.Allowed("Bash", "rm -rf /") {
 		t.Fatal(`AllowChecker.Allowed("Bash", "rm -rf /") = true, ожидался false`)
+	}
+}
+
+// TestBuildRunner_BothProvidersConfigured_PrefersClaudeCode — тикет 9.7:
+// приоритет между двумя сконфигурированными провайдерами сохранён —
+// claude-code выбирается первым (см. годок buildRunner), "claude" (Anthropic
+// API) не используется, даже если тоже сконфигурирован.
+func TestBuildRunner_BothProvidersConfigured_PrefersClaudeCode(t *testing.T) {
+	origClaudeCode := newProvider
+	origClaude := newClaudeProvider
+	var claudeCodeCalls, claudeCalls int
+	newProvider = func(claudecode.Config) (taskRunner, error) {
+		claudeCodeCalls++
+		return &fakeRunner{}, nil
+	}
+	newClaudeProvider = func(claude.Config) (taskRunner, error) {
+		claudeCalls++
+		return &fakeRunner{}, nil
+	}
+	defer func() {
+		newProvider = origClaudeCode
+		newClaudeProvider = origClaude
+	}()
+
+	cfg := configuredCfg()
+	cfg.Providers = []string{"claude-code", "claude"}
+	cfg.ClaudeAPIKey = "test-claude-key"
+
+	acceptor, err := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	if _, err := acceptor.buildRunner("some-task-id"); err != nil {
+		t.Fatalf("buildRunner вернул ошибку: %v", err)
+	}
+
+	if claudeCodeCalls != 1 {
+		t.Fatalf("newProvider (claude-code) вызван %d раз(а), ожидался 1", claudeCodeCalls)
+	}
+	if claudeCalls != 0 {
+		t.Fatalf("newClaudeProvider вызван %d раз(а), ожидалось 0 (claude-code имеет приоритет)", claudeCalls)
+	}
+}
+
+// TestBuildRunner_OnlyClaudeConfigured_UsesClaudeProvider — тикет 9.7:
+// когда claude-code не сконфигурирован, а "claude" (Anthropic API) —
+// сконфигурирован, buildRunner строит именно его через newClaudeProvider, с
+// корректно переданными полями claude.Config.
+func TestBuildRunner_OnlyClaudeConfigured_UsesClaudeProvider(t *testing.T) {
+	origClaudeCode := newProvider
+	origClaude := newClaudeProvider
+	var capturedCfg claude.Config
+	var claudeCalls int
+	newProvider = func(claudecode.Config) (taskRunner, error) {
+		t.Fatal("newProvider (claude-code) не должен вызываться, когда claude-code не сконфигурирован")
+		return nil, nil
+	}
+	newClaudeProvider = func(cfg claude.Config) (taskRunner, error) {
+		claudeCalls++
+		capturedCfg = cfg
+		return &fakeRunner{}, nil
+	}
+	defer func() {
+		newProvider = origClaudeCode
+		newClaudeProvider = origClaude
+	}()
+
+	var cfg config
+	cfg.Providers = []string{"claude"}
+	cfg.ClaudeAPIKey = "test-claude-key"
+	cfg.IntegrationUUID = "44444444-4444-4444-4444-444444444444"
+
+	acceptor, err := newTaskAcceptor(cfg, fakePublisher{}, discardLogger())
+	if err != nil {
+		t.Fatalf("newTaskAcceptor: %v", err)
+	}
+
+	runner, err := acceptor.buildRunner("some-task-id")
+	if err != nil {
+		t.Fatalf("buildRunner вернул ошибку: %v", err)
+	}
+	if runner == nil {
+		t.Fatal("buildRunner вернул nil runner без ошибки")
+	}
+
+	if claudeCalls != 1 {
+		t.Fatalf("newClaudeProvider вызван %d раз(а), ожидался 1", claudeCalls)
+	}
+	if capturedCfg.APIKey != "test-claude-key" {
+		t.Fatalf("claude.Config.APIKey = %q, want %q", capturedCfg.APIKey, "test-claude-key")
+	}
+	if capturedCfg.TaskID != "some-task-id" {
+		t.Fatalf("claude.Config.TaskID = %q, want %q", capturedCfg.TaskID, "some-task-id")
+	}
+	if capturedCfg.IntegrationID != "44444444-4444-4444-4444-444444444444" {
+		t.Fatalf("claude.Config.IntegrationID = %q, want %q", capturedCfg.IntegrationID, "44444444-4444-4444-4444-444444444444")
+	}
+	if capturedCfg.Publisher == nil {
+		t.Fatal("claude.Config.Publisher == nil")
+	}
+	if capturedCfg.Logger == nil {
+		t.Fatal("claude.Config.Logger == nil")
+	}
+	if capturedCfg.AllowChecker == nil {
+		t.Fatal("claude.Config.AllowChecker == nil")
+	}
+	if capturedCfg.WorkDir != "" {
+		t.Fatalf("claude.Config.WorkDir = %q, want пустую строку (наследует рабочую директорию процесса)", capturedCfg.WorkDir)
 	}
 }
 
