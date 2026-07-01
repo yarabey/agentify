@@ -172,6 +172,37 @@ func TestTargetUser(t *testing.T) {
 	})
 }
 
+// TestWriteLaunchdPlist_FilePermissions0600 — тикет 4.6 "Безопасное хранение
+// кредов": launchd, в отличие от systemd (EnvironmentFile=), встраивает
+// креды провайдера буквально в текст plist (см. годок launchdPlistContent),
+// поэтому сам файл обязан быть root-only (0600), а не мирочитаемым 0644.
+// installLaunchdService пишет по системному пути launchdPlistPath и требует
+// root/launchctl, поэтому здесь проверяется вынесенная writeLaunchdPlist во
+// временной директории — без похода в launchctl и без системного пути.
+func TestWriteLaunchdPlist_FilePermissions0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "com.agentify.agent.plist")
+
+	// Содержимое, похожее на реальный сгенерированный plist со встроенными
+	// кредами — именно такой контент и должен быть защищён правами файла.
+	content := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+		"<plist version=\"1.0\"><dict>\n" +
+		"<key>AGENT_CLAUDE_API_KEY</key><string>sk-secret-test-value</string>\n" +
+		"</dict></plist>\n"
+
+	if err := writeLaunchdPlist(path, content); err != nil {
+		t.Fatalf("writeLaunchdPlist() error = %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("os.Stat() error = %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("права файла plist = %o, want 0600 (креды провайдера встроены в открытом виде — файл должен быть root-only)", perm)
+	}
+}
+
 // TestRunServiceInstall_RequiresRoot — go test всегда выполняется НЕ под
 // root, поэтому runServiceInstall должен вернуть ошибку про root/sudo ДО
 // каких-либо файловых операций — это делает тест безопасным и
