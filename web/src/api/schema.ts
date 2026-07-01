@@ -494,7 +494,9 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["Task"];
+                    };
                 };
                 /** @description Задача создана (status=queued) */
                 201: {

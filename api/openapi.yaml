@@ -247,6 +247,9 @@ paths:
               schema: { $ref: "#/components/schemas/Task" }
         "200":
           description: Идемпотентный повтор — возвращена уже созданная задача
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
 
   /tasks/{id}:
     parameters: [ { $ref: "#/components/parameters/IdPath" } ]
