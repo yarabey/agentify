@@ -124,6 +124,14 @@ type ErrorPayload struct {
 	Message string `json:"message"`
 }
 
+// AgentCompletedPayload — payload сообщения type == MessageTypeAgentCompleted
+// (тикет 8.1, FR E2): агент сообщил о завершении работы, задача переходит в
+// awaiting_confirm, но НЕ считается закрытой — закрытие требует явного
+// подтверждения пользователя (тикеты 8.2/8.3).
+type AgentCompletedPayload struct {
+	Summary string `json:"summary"`
+}
+
 // CommandApprovalRequestPayload — payload сообщения type ==
 // MessageTypeCommandApprovalRequest (тикет 4.5/6.1, FR F3): провайдер
 // (agent/internal/provider/claudecode) перехватил запрос CLI на выполнение

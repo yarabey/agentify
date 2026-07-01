@@ -54,10 +54,10 @@ package api
 // функциональный эквивалент "401" из контракта: закрытие WS-соединения кодом
 // close 4401 (приватный диапазон 4000-4999, RFC 6455 §7.4.2) и reason
 // "unauthorized". При успехе соединение остаётся открытым; read-loop
-// (тикеты 3.4/3.6/5.4/5.8/6.1/6.4) разбирает каждый дальнейший кадр (см.
+// (тикеты 3.4/3.6/5.4/5.8/6.1/6.4/8.1) разбирает каждый дальнейший кадр (см.
 // handleMachineFrame/parseAckFrame/handleMachineEvent/handleAgentQuestion/
-// handleTaskAccepted/handleAgentError/handleCommandApprovalRequest) и активно
-// обрабатывает шесть типов:
+// handleTaskAccepted/handleAgentError/handleCommandApprovalRequest/
+// handleAgentCompleted) и активно обрабатывает семь типов:
 // type==ack — пересылается зарегистрированному s.ackSink (мосту оркестратора
 // machine.commands → WS, commit-after-ACK, protocol.md §5, см. godoc AckSink
 // в server.go); type==heartbeat — публикуется через зарегистрированный
@@ -74,8 +74,11 @@ package api
 // handleAgentError; type==command_approval_request (FR F3, тикет 6.4,
 // Gherkin §5 «Команда вне allowlist требует согласования») — переводит
 // задачу running→waiting_user через taskTransitioner.TransitionWithEvent, см.
-// handleCommandApprovalRequest. Любой другой тип кадра и любой
-// нераспознанный/битый кадр МОЛЧА игнорируются — ни паники, ни закрытия
+// handleCommandApprovalRequest; type==agent_completed (FR E2, тикет 8.1) —
+// переводит задачу running→awaiting_confirm через
+// taskTransitioner.TransitionWithEvent (НЕ закрывает задачу, закрытие требует
+// явного действия пользователя), см. handleAgentCompleted. Любой другой тип
+// кадра и любой нераспознанный/битый кадр МОЛЧА игнорируются — ни паники, ни закрытия
 // соединения (нужно и чтобы коннект не выглядел повисшим, и чтобы
 // control-фреймы coder/websocket обрабатывались штатно — см. godoc
 // websocket.Conn "You must always read from the connection").
@@ -212,8 +215,10 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 	// handleAgentQuestion), task_accepted переводит задачу в running (см.
 	// handleTaskAccepted), error переводит задачу в failed (FR E1, тикет
 	// 5.8, см. handleAgentError), command_approval_request переводит задачу
-	// в waiting_user (FR F3, тикет 6.4, см. handleCommandApprovalRequest);
-	// любой иной тип кадра (а также нераспознанный/битый JSON) МОЛЧА
+	// в waiting_user (FR F3, тикет 6.4, см. handleCommandApprovalRequest),
+	// agent_completed переводит задачу в awaiting_confirm, НЕ закрывая её
+	// (FR E2, тикет 8.1, см. handleAgentCompleted); любой иной тип кадра
+	// (а также нераспознанный/битый JSON) МОЛЧА
 	// игнорируется — получение такого кадра не должно ронять или закрывать
 	// соединение (см. godoc файла).
 	for {
@@ -241,11 +246,14 @@ func (s *Server) GetMachineWs(w http.ResponseWriter, r *http.Request) {
 //   - type==command_approval_request — команда вне allowlist требует
 //     согласования пользователя (FR F3, тикет 6.4, Gherkin §5 «Команда вне
 //     allowlist требует согласования»), см. handleCommandApprovalRequest;
+//   - type==agent_completed — агент сообщил о завершении работы (FR E2,
+//     тикет 8.1, Gherkin §7 «Агент сообщил о завершении — задача ещё не
+//     закрыта»), см. handleAgentCompleted;
 //   - любой другой тип, а также нераспознанный/битый кадр — безопасно
 //     игнорируется, без побочных эффектов (ни паники, ни закрытия
-//     соединения): обработка прочих типов кадров (agent_progress/
-//     agent_completed/... — тикеты 6.x) не должна блокироваться/ломаться
-//     из-за их временного отсутствия здесь.
+//     соединения): обработка прочих типов кадров (agent_progress/... —
+//     тикеты 6.x) не должна блокироваться/ломаться из-за их временного
+//     отсутствия здесь.
 func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, data []byte) {
 	var env bus.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -277,6 +285,8 @@ func (s *Server) handleMachineFrame(ctx context.Context, conn *websocket.Conn, i
 		s.handleTaskAccepted(ctx, conn, integrationID, env)
 	case bus.MessageTypeError:
 		s.handleAgentError(ctx, conn, integrationID, env)
+	case bus.MessageTypeAgentCompleted:
+		s.handleAgentCompleted(ctx, conn, integrationID, env)
 	case bus.MessageTypeCommandApprovalRequest:
 		s.handleCommandApprovalRequest(ctx, conn, integrationID, env)
 	default:
@@ -487,6 +497,86 @@ func (s *Server) handleAgentError(ctx context.Context, conn *websocket.Conn, int
 	}
 
 	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "error")
+}
+
+// handleAgentCompleted обрабатывает кадр agent_completed (тикет 8.1, FR E2,
+// Gherkin §7 «Агент сообщил о завершении — задача ещё не закрыта»): переводит
+// связанную задачу running→awaiting_confirm, атомарно записывая событие
+// agent_completed в task_events (task.Transitioner.TransitionWithEvent —
+// единственная точка смены tasks.status, тикет 5.2), и, при успехе, отвечает
+// агенту ack-кадром — тот же at-least-once принцип, что и у handleAgentError:
+// провал любого шага (невалидный payload/task_id, задача не найдена или
+// принадлежит другой интеграции, недопустимый переход FSM, transitioner не
+// настроен) молча пропускает ack — агент должен повторить попытку сам
+// (durable outbox на стороне агента, тикет 3.5), соединение при этом не
+// закрывается и не паникует (см. godoc файла).
+//
+// КРИТИЧНО (FR E2, docs/glossary.md): этот переход НЕ закрывает задачу —
+// закрытой задачу делает только явное действие пользователя (тикеты 8.2/8.3,
+// /confirm и /reject), которых здесь намеренно нет. awaiting_confirm — это
+// промежуточный статус, ожидающий именно такого подтверждения; отчёт агента
+// сам по себе не является достаточным основанием считать работу принятой.
+//
+// Обработка СИНХРОННАЯ, без отдельного Redpanda-потребителя — тот же приём,
+// что и у остальных обработчиков кадров машины (handleAgentQuestion,
+// handleTaskAccepted, handleAgentError).
+//
+// Задача ищется owner-scoped по integration_id (GetTaskByIDAndIntegration, НЕ
+// по user_id — на этом пути аутентифицирована машина, а не пользователь), что
+// не даёт одной машине завершить чужую задачу подделанным task_id в
+// конверте.
+//
+// eventPayload, записываемый в task_events, — это RAW env.Payload конверта
+// (уже провалидированный как bus.AgentCompletedPayload здесь), а не повторно
+// сериализованная структура — тот же приём, что и в handleAgentQuestion/
+// handleAgentError.
+//
+// Валидация payload: в отличие от handleAgentError (где Message обязателен),
+// здесь Summary НЕ обязателен — протокол (protocol.md §4) не требует
+// непустой сводки, пустой summary не делает кадр невалидным (агент мог
+// просто не дать текстовое резюме завершения).
+func (s *Server) handleAgentCompleted(ctx context.Context, conn *websocket.Conn, integrationID uuid.UUID, env bus.Envelope) {
+	if env.TaskID == nil || *env.TaskID == "" {
+		s.logError("handleAgentCompleted", errors.New("конверт agent_completed без task_id"))
+		return
+	}
+	taskUUID, err := uuid.Parse(*env.TaskID)
+	if err != nil {
+		s.logError("handleAgentCompleted: разобрать task_id", err)
+		return
+	}
+
+	var payload bus.AgentCompletedPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		s.logError("handleAgentCompleted: разобрать payload", err)
+		return
+	}
+
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	if _, err := s.queries.GetTaskByIDAndIntegration(ctx, db.GetTaskByIDAndIntegrationParams{
+		ID:            taskID,
+		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.logError("handleAgentCompleted", fmt.Errorf("задача %s не найдена для интеграции %s", taskUUID, integrationID))
+			return
+		}
+		s.logError("GetTaskByIDAndIntegration", err)
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("handleAgentCompleted", errors.New("transitioner не настроен"))
+		return
+	}
+
+	if _, _, err := transitioner.TransitionWithEvent(ctx, taskID, task.TriggerAgentCompleted, "agent_completed", pgtype.UUID{}, env.Payload); err != nil {
+		s.logError("TransitionWithEvent(agent_completed)", err)
+		return
+	}
+
+	s.writeMachineAck(ctx, conn, integrationID, env.MessageID, "agent_completed")
 }
 
 // handleTaskAccepted обрабатывает кадр task_accepted (FR E1, тикет 5.4,
