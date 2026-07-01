@@ -1705,3 +1705,194 @@ func TestPostTasksIdReject_InvalidJSONBody(t *testing.T) {
 		t.Fatalf("статус = %d (%s), ожидался 400", rec.Code, rec.Body.String())
 	}
 }
+
+// doPostTasksIdCancel прогоняет POST /tasks/{id}/cancel через роутер, собранный
+// из postTasksServer, с Bearer-токеном userID, и возвращает записанный ответ.
+// Без тела запроса — контракт (api/openapi.yaml) не описывает requestBody для
+// cancel (тикет 8.4), как и confirm (тикет 8.2).
+func doPostTasksIdCancel(t *testing.T, cfg postTasksServer, userID, taskID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(cfg.q)
+	s.SetTransitioner(cfg.transitioner)
+	s.SetCommandPublisher(cfg.publisher)
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/cancel", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPostTasksIdCancel_RequiresBearerToken — без Authorization-заголовка
+// auth-middleware отвечает 401, не доходя до PostTasksIdCancel (тикет 1.4).
+func TestPostTasksIdCancel_RequiresBearerToken(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	s.SetTransitioner(&fakeTransitioner{})
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+uuid.New().String()+"/cancel", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404 (FR A4, I3).
+func TestPostTasksIdCancel_TaskNotFound(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_TaskLookupInternalError — неожиданная ошибка при
+// проверке владения задачей → 500.
+func TestPostTasksIdCancel_TaskLookupInternalError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_NoTransitionerConfigured — transitioner не установлен
+// (nil) → 500.
+func TestPostTasksIdCancel_NoTransitionerConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: nil,
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_TransitionError — Transition вернул ошибку. Это
+// покрывает в т.ч. приёмку «отмена из терминального статуса не проходит»:
+// сама проверка недопустимости перехода — на уровне task.NextStatus (уже
+// протестирована в fsm_test.go тикета 5.2); здесь проверяется только то, что
+// HTTP-обработчик корректно транслирует ошибку Transition в 500 — тот же
+// паттерн, что и TestPostTasksIdConfirm_TransitionError/
+// TestPostTasksIdApprove_TransitionError, отдельной ветки/статуса для
+// недопустимого перехода в проекте не заведено.
+func TestPostTasksIdCancel_TransitionError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{err: context.DeadlineExceeded},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_NoPublisherConfigured — CommandPublisher не
+// установлен (nil), хотя Transition прошёл успешно → 500.
+func TestPostTasksIdCancel_NoPublisherConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{to: task.StatusCancelled},
+		publisher:    nil,
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_PublishError — PublishKeyed вернул ошибку → 500.
+func TestPostTasksIdCancel_PublishError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{to: task.StatusCancelled},
+		publisher:    &fakePublisher{err: context.DeadlineExceeded},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdCancel_HappyPath — успешная отмена (FR E6, Gherkin §8
+// «Отмена доходит до машины»): Transition вызван с (taskID,
+// task.TriggerCancelRequested), 202 БЕЗ тела ответа (в отличие от confirm/
+// reject, которые возвращают 200+Task — контракт api/openapi.yaml описывает
+// голый 202 для cancel, как и для approve), PublishKeyed вызван ровно один
+// раз с конвертом type==cancel.
+func TestPostTasksIdCancel_HappyPath(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+
+	transitioner := &fakeTransitioner{to: task.StatusCancelled}
+	publisher := &fakePublisher{}
+	rec := doPostTasksIdCancel(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+		},
+		transitioner: transitioner,
+		publisher:    publisher,
+	}, userID, taskID)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("статус = %d (%s), ожидался 202", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("тело ответа = %q, ожидалось пустое (202 без тела, контракт cancel)", rec.Body.String())
+	}
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("Transition вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerCancelRequested {
+		t.Fatalf("Transition вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerCancelRequested)
+	}
+
+	if len(publisher.calls) != 1 {
+		t.Fatalf("PublishKeyed вызван %d раз(а), ожидался 1", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	if call.env.Type != bus.MessageTypeCancel {
+		t.Errorf("env.Type = %q, ожидался %q", call.env.Type, bus.MessageTypeCancel)
+	}
+	if call.topic != bus.TopicMachineCommands {
+		t.Errorf("topic = %q, ожидался %q", call.topic, bus.TopicMachineCommands)
+	}
+	if call.keyField != bus.PartitionKeyIntegrationID {
+		t.Errorf("keyField = %q, ожидался %q", call.keyField, bus.PartitionKeyIntegrationID)
+	}
+	if call.env.TaskID == nil || *call.env.TaskID != taskID.String() {
+		t.Errorf("env.TaskID = %v, ожидался %s", call.env.TaskID, taskID)
+	}
+	if call.env.IntegrationID != integrationID.String() {
+		t.Errorf("env.IntegrationID = %q, ожидался %s", call.env.IntegrationID, integrationID)
+	}
+}
