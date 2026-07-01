@@ -83,6 +83,17 @@ SELECT * FROM tasks WHERE id = $1 AND integration_id = $2;
 -- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
 SELECT * FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER BY seq DESC;
 
+-- name: ListCommandApprovalRequestEventsByTask :many
+-- Возвращает все события command_approval_request задачи, самые новые первыми —
+-- источник для сопоставления request_id из тела PostTasksIdApprove с конкретной
+-- записью task_events (её id становится ref_event_id решения, тикет 6.4, FR F3).
+-- Тот же приём, что и у ListAgentQuestionEventsByTask выше (тикет 6.1):
+-- сопоставление по request_id внутри payload_enc выполняется НА СТОРОНЕ GO
+-- (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
+-- payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
+-- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+SELECT * FROM task_events WHERE task_id = $1 AND type = 'command_approval_request' ORDER BY seq DESC;
+
 -- name: ListRunningTasksWithStaleMachine :many
 -- «Зависание» машины (тикет 5.7, FR E5, protocol.md §6: STALE_THRESHOLD):
 -- находит активные (running/waiting_user) задачи, чья интеграция не подавала

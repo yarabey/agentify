@@ -76,6 +76,9 @@ type fakeQuerier struct {
 
 	listAgentQuestionEventsByTaskResult []db.TaskEvent
 	listAgentQuestionEventsByTaskErr    error
+
+	listCommandApprovalRequestEventsByTaskResult []db.TaskEvent
+	listCommandApprovalRequestEventsByTaskErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -199,6 +202,13 @@ func (f fakeQuerier) ListAgentQuestionEventsByTask(context.Context, pgtype.UUID)
 		return nil, f.listAgentQuestionEventsByTaskErr
 	}
 	return f.listAgentQuestionEventsByTaskResult, nil
+}
+
+func (f fakeQuerier) ListCommandApprovalRequestEventsByTask(context.Context, pgtype.UUID) ([]db.TaskEvent, error) {
+	if f.listCommandApprovalRequestEventsByTaskErr != nil {
+		return nil, f.listCommandApprovalRequestEventsByTaskErr
+	}
+	return f.listCommandApprovalRequestEventsByTaskResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api

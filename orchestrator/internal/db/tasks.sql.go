@@ -250,6 +250,46 @@ func (q *Queries) ListAgentQuestionEventsByTask(ctx context.Context, taskID pgty
 	return items, nil
 }
 
+const listCommandApprovalRequestEventsByTask = `-- name: ListCommandApprovalRequestEventsByTask :many
+SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_events WHERE task_id = $1 AND type = 'command_approval_request' ORDER BY seq DESC
+`
+
+// Возвращает все события command_approval_request задачи, самые новые первыми —
+// источник для сопоставления request_id из тела PostTasksIdApprove с конкретной
+// записью task_events (её id становится ref_event_id решения, тикет 6.4, FR F3).
+// Тот же приём, что и у ListAgentQuestionEventsByTask выше (тикет 6.1):
+// сопоставление по request_id внутри payload_enc выполняется НА СТОРОНЕ GO
+// (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
+// payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
+// как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+func (q *Queries) ListCommandApprovalRequestEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]TaskEvent, error) {
+	rows, err := q.db.Query(ctx, listCommandApprovalRequestEventsByTask, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TaskEvent{}
+	for rows.Next() {
+		var i TaskEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.Type,
+			&i.RefEventID,
+			&i.PayloadEnc,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunningTasksWithStaleMachine = `-- name: ListRunningTasksWithStaleMachine :many
 SELECT tasks.id FROM tasks
 JOIN integrations ON integrations.id = tasks.integration_id
