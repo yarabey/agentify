@@ -6,6 +6,7 @@ import { IntegrationsPage } from "@/pages/IntegrationsPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { TaskDetailPage } from "@/pages/TaskDetailPage";
 import { TasksPage } from "@/pages/TasksPage";
 
 /**
@@ -44,8 +45,8 @@ function RequireGuest(): JSX.Element {
  * связывает shell (`Layout`, шапка+навигация) с экранами. `/login` и
  * `/register` рендерятся вне `Layout` (экраны входа/регистрации без общей
  * навигации) и доступны только гостю (`RequireGuest`); `/`, `/tasks`,
- * `/integrations`, `/settings` — внутри `Layout` через `<Outlet />` и только
- * авторизованному пользователю (`RequireAuth`). Провайдеры
+ * `/tasks/:id`, `/integrations`, `/settings` — внутри `Layout` через
+ * `<Outlet />` и только авторизованному пользователю (`RequireAuth`). Провайдеры
  * (QueryClientProvider, роутер, AuthProvider) подключаются на уровень выше, в
  * `main.tsx` (и в тестах — своя обёртка, см. App.test.tsx), чтобы `App` можно
  * было переиспользовать и с `BrowserRouter`, и с `MemoryRouter`.
@@ -61,6 +62,7 @@ export function App(): JSX.Element {
         <Route element={<Layout />}>
           <Route index element={<Navigate to="/tasks" replace />} />
           <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/tasks/:id" element={<TaskDetailPage />} />
           <Route path="/integrations" element={<IntegrationsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
