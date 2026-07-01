@@ -30,6 +30,12 @@ import (
 // тикет 6.7) добавят собственные константы Kind, когда придёт их очередь.
 const KindAgentQuestion = "agent_question"
 
+// KindAnswerReminder — вид уведомления "пользователь давно не отвечает на
+// вопрос агента" (FR F5, тикет 6.7): формируется task.AnswerTimeoutWorker,
+// когда самый свежий agent_question активной (waiting_user) задачи устарел
+// дольше настраиваемого порога.
+const KindAnswerReminder = "answer_reminder"
+
 // Notification — доменное событие уведомления (FR G1, тикет 7.1): пользователь
 // (UserID) должен быть уведомлён о событии Kind по задаче TaskID. Payload —
 // сырые данные события (например, RAW payload agent_question-кадра из
