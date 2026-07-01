@@ -320,6 +320,27 @@ func writePlistString(b *strings.Builder, value string) {
 	b.WriteString("</string>\n")
 }
 
+// writeLaunchdPlist пишет уже сгенерированное содержимое plist (см. godoc
+// launchdPlistContent) по указанному path с правами 0600. Вынесена в
+// отдельную функцию, параметризованную path (тот же приём, что и остальные
+// функции файла уже параметризуют configPath/workingDir/binaryPath вместо
+// использования глобальных констант напрямую), чтобы саму запись можно было
+// покрыть юнит-тестом (agent/service_test.go) во временной директории, не
+// требуя root и системного пути launchdPlistPath.
+//
+// Права 0600, а не 0644 (как у systemdUnitContent/installSystemdService,
+// где это осознанно верно — см. её комментарий): plist встраивает креды
+// провайдера в открытом виде (см. godoc launchdPlistContent) — файл должен
+// быть root-only, как и agent.env, а не мирочитаемым, иначе любой локальный
+// непривилегированный пользователь машины смог бы прочитать API-ключ
+// провайдера (тикет 4.6, FR C4).
+func writeLaunchdPlist(path, content string) error {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("не удалось записать launchd plist %s: %w", path, err)
+	}
+	return nil
+}
+
 // installLaunchdService пишет plist и загружает его через launchctl.
 func installLaunchdService(stdout io.Writer, binaryPath, configPath, workingDir, username string) error {
 	content, err := launchdPlistContent(binaryPath, configPath, workingDir, username)
@@ -327,8 +348,8 @@ func installLaunchdService(stdout io.Writer, binaryPath, configPath, workingDir,
 		return err
 	}
 
-	if err := os.WriteFile(launchdPlistPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("не удалось записать launchd plist %s: %w", launchdPlistPath, err)
+	if err := writeLaunchdPlist(launchdPlistPath, content); err != nil {
+		return err
 	}
 	_, _ = fmt.Fprintf(stdout, "launchd plist записан: %s.\n", launchdPlistPath)
 
