@@ -80,6 +80,7 @@ CI описан в [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (ти�
 | `bdd` | `make bdd` | Gherkin-сценарии (godog) — сейчас заглушка, та же команда заработает в 11.2 |
 | `integration` | `go test -tags=integration ./...` | testcontainers Postgres+Redpanda — каркас для 1.1/3.2/11.3 (тестов с тегом пока нет ⇒ no-op) |
 | `agent-release-build` | `goreleaser check` + `goreleaser build --snapshot --clean` | тикет 4.1: CI собирает все 4 кросс-таргета агента (darwin/linux × amd64/arm64) — без публикации; публикует релизы отдельный [`release-agent.yml`](.github/workflows/release-agent.yml) по git-тегу `v*` |
+| `agent-install-test` | `goreleaser release --snapshot ...` + `install/test-install.sh` в `docker run ubuntu:24.04` | тикет 4.2: `install/install.sh` (скачивание бинаря + sha256 + установка + Node.js) прогоняется целиком в чистом Ubuntu без предустановленного Node |
 | `web` | `npm ci` + `npm run gen:api` + `tsc` | TS-схема из контракта типизируется (без полного Vite — 9.1) |
 
 **Path-фильтры** (`dorny/paths-filter`, джоба `changes`): один корневой Go-модуль,
@@ -100,7 +101,7 @@ GitHub → Settings → Branches → Branch protection (для `main` и вет�
 required status checks по именам джоб:
 
 ```
-lint, build, test, generate-check, docs-check, bdd, integration, agent-release-build, web
+lint, build, test, generate-check, docs-check, bdd, integration, agent-release-build, agent-install-test, web
 ```
 
 > Замечание: джобы `lint/build/test/generate-check/docs-check/bdd/integration` и

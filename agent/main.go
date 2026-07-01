@@ -103,6 +103,14 @@ type config struct {
 }
 
 func main() {
+	// install.sh (тикет 4.2) делает финальную самопроверку установки через
+	// `agentify-agent --version` — обрабатываем это ДО run(), т.к. вывод
+	// версии не требует конфига/env и должен работать независимо от
+	// platform.LoadConfig (на чистой системе AGENT_* переменных ещё нет).
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println(version)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "agent: фатальная ошибка:", err)
 		os.Exit(1)
