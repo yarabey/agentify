@@ -1,0 +1,504 @@
+# CI — тикет 0.4 (deps: 0.3). Источник правды по командам: AGENTS.md §7.
+#
+# Назначение (бизнес): исполняемый Definition of Done. Этот workflow блокирует
+# мёрж недокументированного/несобираемого/непротестированного кода. Обязательные
+# гейты (AGENTS.md §0 п.6 и §7): lint / test / bdd / docs-check. Дополнительно
+# держим build, generate-check (контракт-генерёнка синхронна) и web-typecheck.
+#
+# Как устроено (тех):
+#   * Один корневой Go-модуль (github.com/yarabey/agentify) — поэтому изменения в
+#     любом Go-коде гоняют все Go-джобы (lint/build/test/docs-check/bdd/generate),
+#     а изменения web/** гоняют web-джобу. Маршрутизацию делает dorny/paths-filter
+#     (джоб `changes`), результат — булевы выходы go/web/ci.
+#   * golangci-lint фиксируется на ИМЕННО v2.5.0 (как локально и в Makefile):
+#     ставим v2-модуль через `go install ...golangci-lint/v2@v2.5.0` и кладём в
+#     PATH, после чего `make lint`/`make docs-check` используют именно его (v2-схема
+#     .golangci.yml). Это исключает рассинхрон CI с локальным прогоном.
+#   * Интеграционные тесты на testcontainers (Postgres+Redpanda) ещё НЕ написаны —
+#     их добавят тикеты 1.1/3.2/11.3. Джоба `integration` инфраструктурно готова
+#     (Docker в ubuntu-latest доступен по умолчанию) и гоняет
+#     `go test -tags=integration ./...`; сейчас файлов с тегом `integration` нет,
+#     поэтому джоба зелёная (no-op), но каркас готов к появлению тестов. Подробнее —
+#     deploy/README.md, раздел «CI».
+#   * Джоба `agent-release-build` (тикет 4.1) — CI-гейт «CI собирает все
+#     таргеты» из приёмки тикета: НЕ публикует релиз (это делает отдельный
+#     workflow release-agent.yml по git-тегу `v*`), а на каждый PR/push
+#     прогоняет `goreleaser build --snapshot --clean` по .goreleaser.yaml и
+#     явно проверяет, что в dist/ появились ровно 4 бинарника агента (по
+#     одному на darwin/amd64, darwin/arm64, linux/amd64, linux/arm64) — чтобы
+#     поломка кросс-компиляции не проходила незамеченной. GoReleaser
+#     фиксирован на v2.5.1 (совпадает с Makefile GORELEASER_VERSION и
+#     release-agent.yml).
+#   * Джоба `agent-install-test` (тикет 4.2, deps: 4.1) — CI-гейт приёмки
+#     тикета «прогон в чистых Docker-образах ubuntu»: собирает реальные
+#     релизные архивы (`goreleaser release --snapshot --clean
+#     --skip=publish,announce,sign,validate`, в отличие от agent-release-build
+#     нужен именно `release`, а не `build`, чтобы получить tar.gz+checksums.txt),
+#     синтезирует правдоподобный тег версии из имени собранного архива и
+#     гоняет install/test-install.sh целиком (скачивание+sha256+установка
+#     бинаря+установка Node.js+самопроверка --version) внутри одноразового
+#     `docker run ubuntu:24.04` — чистая ОС без предустановленного Node,
+#     реально проверяющая ветку установки Node.js «с нуля».
+#   * Джоба `agent-service-test` (тикет 4.4, deps: 4.3) — CI-гейт приёмки
+#     тикета «после kill процесс поднимается» (FR C5: автозапуск + рестарт
+#     при сбое). В отличие от `agent-install-test` (тестирует ВНУТРИ `docker
+#     run ubuntu:24.04` — вложенный контейнер БЕЗ настоящего systemd) эта
+#     джоба проверяет РЕАЛЬНОЕ поведение systemd и поэтому запускается
+#     НАПРЯМУЮ на хосте раннера ubuntu-latest (без Docker-обёртки):
+#     GitHub-hosted ubuntu-latest — полноценная VM с systemd как PID 1 и
+#     passwordless sudo для пользователя runner. Собирает agentify-agent
+#     нативно (go build, без GoReleaser), неинтерактивно настраивает конфиг
+#     через уже готовый механизм тикета 4.3 (AGENTIFY_SETUP_*), ставит
+#     systemd-сервис через `sudo agentify-agent service-install`, убивает
+#     процесс (kill -9) и проверяет, что systemd его перезапустил (сервис
+#     снова active И MainPID изменился). Teardown (disable+rm unit) — always,
+#     даже при падении предыдущих шагов.
+#
+# Required-статусы для branch protection (настраивается вручную, MANUAL_STEPS —
+# в коде protection не задаётся): lint, build, test, generate-check, docs-check,
+# bdd, web, integration, agent-release-build, agent-install-test,
+# agent-service-test. См. README.md раздел «CI».
+#
+# Секреты в YAML значениями НЕ храним (AGENTS.md §8) — этому workflow секреты не
+# нужны; при необходимости они приходят через GitHub Secrets/Environments (тикет 0.5).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "claude/**"
+      - "ticket/**"
+      - "fix/**"
+
+# Отменяем устаревшие запуски на той же ветке/PR, чтобы не жечь раннеры.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # pull-requests: read — нужен dorny/paths-filter@v3 на pull_request-событиях:
+  # без него джоба `changes` падает на Resource not accessible by integration
+  # при вызове GitHub API listFiles(pull_number) для списка изменённых файлов PR.
+  pull-requests: read
+
+env:
+  GO_VERSION: "1.24"
+  NODE_VERSION: "22"
+  # Версия golangci-lint фиксирована (совпадает с Makefile GOLANGCI_LINT_VERSION
+  # и системным /usr/local/bin/golangci-lint локально).
+  GOLANGCI_LINT_VERSION: "v2.5.0"
+  # Версия GoReleaser фиксирована (совпадает с Makefile GORELEASER_VERSION и
+  # .github/workflows/release-agent.yml) — используется джобой agent-release-build.
+  GORELEASER_VERSION: "v2.5.1"
+
+jobs:
+  # --- Маршрутизация по путям (path-фильтры) ---------------------------------
+  # Один Go-модуль ⇒ любые изменения в Go-исходниках/контракте/тулинге считаем
+  # «go-изменением»; изменения web/** — «web-изменением». Изменения только в
+  # документации (*.md без кода) не должны держать обязательные Go-гейты, поэтому
+  # выход `ci` отдельно сигналит, что менялось что-то требующее сборки/тестов.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.golangci.yml'
+              - 'api/**'
+              - 'sqlc.yaml'
+              - 'orchestrator/migrations/**'
+              - 'deploy/scripts/**'
+              - 'install/**'
+              - '.goreleaser.yaml'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+              - 'api/openapi.yaml'
+              - '.github/workflows/ci.yml'
+
+  # --- Линт (обязательный гейт, AGENTS.md §7) --------------------------------
+  lint:
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Ставим ИМЕННО v2.5.0 (v2-модуль) — тем же способом, что `make tools`.
+      - name: Install golangci-lint v2.5.0
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+      - name: golangci-lint version (assert v2.5.0)
+        run: |
+          golangci-lint version
+          golangci-lint version 2>&1 | grep -q "2.5.0" || { echo "ожидался golangci-lint 2.5.0"; exit 1; }
+      - name: make lint
+        run: make lint
+
+  # --- Сборка ----------------------------------------------------------------
+  build:
+    name: build
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build ./...
+        run: go build ./...
+
+  # --- Unit-тесты (обязательный гейт, AGENTS.md §7) --------------------------
+  test:
+    name: test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: make test
+        run: make test
+
+  # --- Контракт-генерёнка синхронна ------------------------------------------
+  # `make generate` детерминированно перегенерит Go-типы/chi-сервер (oapi-codegen),
+  # TS-схему web (openapi-typescript) и модели БД (sqlc); затем git diff --exit-code.
+  generate-check:
+    name: generate-check
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # generate-check нужны ТОЛЬКО sqlc + oapi-codegen (для generate-sql/generate-go)
+      # и npm-зависимости web (для generate-ts) — НЕ полный `make tools` (тот же
+      # набор, что и для локальной разработки: ставит ещё golangci-lint и
+      # goreleaser, самые долгие в сборке из исходников инструменты в
+      # Makefile, но не нужные кодогенерации). Кэшируем бинари sqlc/oapi-codegen
+      # по ключу, зависящему от Makefile (там же зафиксированы их версии —
+      # SQLC_VERSION/OAPI_CODEGEN_VERSION), чтобы не пересобирать их из
+      # исходников на каждый прогон; при бампе версии в Makefile хэш файла
+      # изменится и кэш инвалидируется автоматически.
+      - name: Cache codegen tools (sqlc, oapi-codegen)
+        id: cache-codegen-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/sqlc
+            ~/go/bin/oapi-codegen
+          key: codegen-tools-${{ runner.os }}-${{ hashFiles('Makefile') }}
+      - name: Install Go codegen tools (sqlc, oapi-codegen)
+        if: steps.cache-codegen-tools.outputs.cache-hit != 'true'
+        run: make tools-generate-go
+      # npm ci выполняется всегда (не входит в кэшируемые пути выше; уже
+      # недорог благодаря cache: npm в actions/setup-node@v4 этой же джобы).
+      - name: npm ci (web deps for generate-ts)
+        run: npm --prefix web ci
+      - name: make generate-check
+        run: make generate-check
+
+  # --- Документация (обязательный гейт, AGENTS.md §7) ------------------------
+  # docs-check вызывает системный golangci-lint через переменную GOLANGCI_LINT —
+  # обеспечиваем v2.5.0 на PATH и передаём её путь, чтобы использовалась v2-схема.
+  docs-check:
+    name: docs-check
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install golangci-lint v2.5.0
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+      # docs-check.sh по умолчанию ищет /usr/local/bin/golangci-lint; передаём путь
+      # к установленному v2.5.0 из GOBIN явно через SYSTEM_GOLANGCI_LINT.
+      - name: make docs-check
+        run: make docs-check SYSTEM_GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
+
+  # --- BDD (обязательный гейт, AGENTS.md §7) ---------------------------------
+  # Сейчас `make bdd` — заглушка (godog-харнесс придёт в тикете 11.2). Джоба
+  # зелёная; та же команда заработает без правок workflow, когда появятся .feature.
+  bdd:
+    name: bdd
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: make bdd
+        run: make bdd
+
+  # --- Интеграционные тесты на testcontainers (Postgres+Redpanda) ------------
+  # Каркас для тикетов 1.1/3.2/11.3. Docker доступен в ubuntu-latest по умолчанию,
+  # поэтому testcontainers-go сможет поднимать реальные Postgres+Redpanda.
+  # Сейчас интеграционных тестов нет: они будут помечены `//go:build integration`,
+  # а здесь гоняется `go test -tags=integration ./...` — на пустом множестве это
+  # no-op (exit 0). Каркас готов: добавление тестов с тегом сразу включит джобу.
+  integration:
+    name: integration
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Docker available (testcontainers)
+        run: docker version
+      - name: go test -tags=integration ./...
+        run: go test -tags=integration ./...
+
+  # --- Релиз агента: CI собирает все таргеты (приёмка тикета 4.1) ------------
+  # Проверяет, что кросс-сборка агента через GoReleaser (.goreleaser.yaml)
+  # реально работает на каждый PR/push — БЕЗ публикации (публикация — отдельный
+  # workflow release-agent.yml по git-тегу `v*`). `--snapshot` не требует
+  # реального тега (детерминированная версия из snapshot.version_template).
+  agent-release-build:
+    name: agent-release-build
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install goreleaser ${{ env.GORELEASER_VERSION }}
+        run: go install github.com/goreleaser/goreleaser/v2@${{ env.GORELEASER_VERSION }}
+      - name: goreleaser check (валидация .goreleaser.yaml)
+        run: goreleaser check
+      - name: goreleaser build --snapshot --clean
+        run: goreleaser build --snapshot --clean
+      # Явная проверка «собирает все таргеты» (приёмка тикета 4.1, дословно из
+      # MVP_TICKETS.md): ровно 4 бинарника agentify-agent — по одному на
+      # darwin/amd64, darwin/arm64, linux/amd64, linux/arm64. Не полагаемся
+      # только на success-код `goreleaser build`: если один таргет молча
+      # выпадет из матрицы (например, из-за правки .goreleaser.yaml), success
+      # code всё равно будет нулевым — считаем бинарники поимённо.
+      - name: Проверить, что собраны все 4 таргета
+        run: |
+          set -euo pipefail
+          expected="dist/agentify-agent_darwin_amd64_v1/agentify-agent
+          dist/agentify-agent_darwin_arm64_v8.0/agentify-agent
+          dist/agentify-agent_linux_amd64_v1/agentify-agent
+          dist/agentify-agent_linux_arm64_v8.0/agentify-agent"
+          missing=0
+          while IFS= read -r bin; do
+            if [ ! -f "${bin}" ]; then
+              echo "FAIL: не найден бинарник ${bin}" >&2
+              missing=1
+            else
+              echo "OK: ${bin}"
+            fi
+          done <<< "${expected}"
+          count="$(find dist -type f -name 'agentify-agent' | wc -l)"
+          if [ "${count}" -ne 4 ]; then
+            echo "FAIL: ожидалось 4 бинарника agentify-agent в dist/, найдено ${count}" >&2
+            missing=1
+          fi
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "agent-release-build: все 4 таргета собраны (darwin/linux × amd64/arm64)"
+
+  # --- Установка агента одной командой: install.sh в чистом Ubuntu -----------
+  # CI-гейт приёмки тикета 4.2 (deps: 4.1) «Тесты: прогон в чистых
+  # Docker-образах ubuntu». В отличие от agent-release-build (goreleaser
+  # build) здесь нужен полный `release` (без публикации), чтобы получить
+  # реальные tar.gz + checksums.txt — то, что реально качает install.sh.
+  # Реального git-тега на этом коммите нет, поэтому тег для фейкового релиза
+  # синтезируется здесь же (обязанность CI, не install.sh/test-install.sh) из
+  # версии, которую GoReleaser проставил в имя snapshot-архива. Node.js в
+  # контейнер НЕ предустанавливается — так тест реально проверяет ветку
+  # установки Node внутри install.sh.
+  agent-install-test:
+    name: agent-install-test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install goreleaser ${{ env.GORELEASER_VERSION }}
+        run: go install github.com/goreleaser/goreleaser/v2@${{ env.GORELEASER_VERSION }}
+      - name: goreleaser release --snapshot --clean --skip=publish,announce,sign,validate
+        run: goreleaser release --snapshot --clean --skip=publish,announce,sign,validate
+      - name: Вычислить тег для фейкового релиза из имени собранного архива
+        id: tag
+        run: |
+          set -euo pipefail
+          archive="$(basename dist/agentify-agent_*_linux_amd64.tar.gz)"
+          version="$(echo "${archive}" | sed -E 's/agentify-agent_(.+)_linux_amd64\.tar\.gz/\1/')"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+      # install.sh в реальности всегда запускается через `curl ... | bash`
+      # (пользователь уже доказал наличие curl самим способом запуска
+      # скрипта) — чистый ubuntu:24.04 не содержит даже curl, поэтому здесь
+      # явно предустанавливаем ровно тот минимум, который в реальном сценарии
+      # уже гарантирован способом доставки install.sh. Тестировать «системы
+      # совсем без curl» — нереалистичный edge case для curl-pipe-bash
+      # инсталлятора, сознательно не проверяем.
+      - name: install.sh целиком в одноразовом ubuntu:24.04 (docker run)
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo:ro" -w /work -e TAG="${TAG}" ubuntu:24.04 bash -c '
+            set -euo pipefail
+            cp -r /repo/install /repo/dist /work/
+            apt-get update -qq
+            apt-get install -y -qq curl ca-certificates tar python3
+            ./install/test-install.sh "${TAG}" dist
+          '
+      - name: agent-install-test итог
+        run: 'echo "agent-install-test: install.sh отработал в чистом ubuntu:24.04, Node установлен, agentify-agent --version прошёл самопроверку"'
+
+  # --- Демонизация: после kill процесс поднимается (приёмка тикета 4.4) -----
+  # В отличие от agent-install-test (тестирует ВНУТРИ docker run ubuntu:24.04
+  # — вложенный контейнер БЕЗ настоящего systemd), эта джоба проверяет
+  # РЕАЛЬНОЕ поведение systemd (автозапуск + рестарт при сбое, FR C5) и
+  # поэтому запускается напрямую на хосте раннера ubuntu-latest: это
+  # полноценная VM с systemd как PID 1 и passwordless sudo для runner.
+  agent-service-test:
+    name: agent-service-test
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build (нативно, без GoReleaser — кросс-таргет для этого теста не нужен)
+        run: go build -o ./agentify-agent-ci ./agent
+      # Неинтерактивная настройка конфига через уже готовый механизм тикета
+      # 4.3 (AGENTIFY_SETUP_* env + AGENTIFY_CONFIG_PATH). URL оркестратора
+      # заведомо недостижим — это ок: тест проверяет рестарт по kill, а не
+      # успешное WS-подключение (wsclient реконнектится сам внутри процесса,
+      # процесс из-за недостижимого адреса не падает; а даже если бы упал —
+      # это тоже штатно покрывается Restart=on-failure).
+      - name: agentify-agent setup (неинтерактивно, AGENTIFY_SETUP_*)
+        run: |
+          set -euo pipefail
+          export AGENTIFY_CONFIG_PATH="$HOME/.agentify/agent.env"
+          export AGENTIFY_SETUP_ORCHESTRATOR_URL="wss://orch.invalid.example.com/machine/ws"
+          export AGENTIFY_SETUP_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          export AGENTIFY_SETUP_PROVIDERS="claude"
+          export AGENTIFY_SETUP_CLAUDE_API_KEY="sk-ci-test"
+          ./agentify-agent-ci setup
+      - name: sudo agentify-agent service-install
+        run: sudo ./agentify-agent-ci service-install
+      - name: Проверить, что сервис активен
+        run: |
+          set -euo pipefail
+          if [ "$(sudo systemctl is-active agentify-agent.service)" != "active" ]; then
+            echo "FAIL: agentify-agent.service не active после service-install" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          echo "OK: agentify-agent.service active после service-install"
+      # Приёмка тикета 4.4 (docs/MVP_TICKETS.md): «после kill процесс
+      # поднимается» — kill -9 текущего MainPID, ждём RestartSec=2 (+запас),
+      # проверяем, что сервис снова active И MainPID изменился (доказывает
+      # именно перезапуск, а не то, что процесс просто не был убит).
+      - name: kill -9 MainPID и проверить рестарт
+        run: |
+          set -euo pipefail
+          pid_before="$(sudo systemctl show -p MainPID --value agentify-agent.service)"
+          echo "PID до kill: ${pid_before}"
+          sudo kill -9 "${pid_before}"
+          sleep 5
+          if [ "$(sudo systemctl is-active agentify-agent.service)" != "active" ]; then
+            echo "FAIL: agentify-agent.service не active после kill -9" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          pid_after="$(sudo systemctl show -p MainPID --value agentify-agent.service)"
+          echo "PID после рестарта: ${pid_after}"
+          if [ "${pid_after}" = "${pid_before}" ] || [ "${pid_after}" = "0" ]; then
+            echo "FAIL: MainPID не изменился (${pid_before} -> ${pid_after}) — процесс не перезапустился" >&2
+            sudo systemctl status agentify-agent.service --no-pager || true
+            sudo journalctl -u agentify-agent.service --no-pager || true
+            exit 1
+          fi
+          echo "OK: agentify-agent.service перезапущен systemd после kill -9 (PID ${pid_before} -> ${pid_after})"
+      - name: Teardown (всегда)
+        if: always()
+        run: |
+          sudo systemctl disable --now agentify-agent.service || true
+          sudo rm -f /etc/systemd/system/agentify-agent.service
+          sudo systemctl daemon-reload
+
+  # --- Web: typecheck + генерация TS-схемы из контракта ----------------------
+  # Минимально (без полного Vite — тикет 9.1): ставим зависимости, регенерим
+  # TS-типы из openapi.yaml и проверяем типы (tsc --noEmit).
+  web:
+    name: web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: npm ci
+      - name: gen:api (TS-схема из контракта)
+        run: npm run gen:api
+      # Полноценного tsconfig пока нет (Vite-приложение — тикет 9.1), поэтому
+      # типизируем сгенерированную из контракта схему напрямую с явными опциями.
+      # Это реальный гейт: битая TS-схема из openapi.yaml уронит джобу.
+      - name: tsc typecheck (generated API schema)
+        run: npx tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler src/api/schema.ts

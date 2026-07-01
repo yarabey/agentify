@@ -1,0 +1,14 @@
+{
+  "name": "@agentify/web",
+  "private": true,
+  "version": "0.1.0-mvp",
+  "description": "Web PWA оркестратора. В тикете 0.2 присутствует только генерация TS-типов из контракта api/openapi.yaml; полноценное Vite-приложение — тикет 9.1.",
+  "type": "module",
+  "scripts": {
+    "gen:api": "openapi-typescript ../api/openapi.yaml -o src/api/schema.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
+  }
+}

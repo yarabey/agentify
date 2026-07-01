@@ -1,9 +1,132 @@
-# docker-compose.yml — ЗАГЛУШКА тикета 0.1.
+# docker-compose.yml — локальный запуск всего стека agentify (тикет 0.3).
 #
-# Реальный compose (Postgres + Redpanda + orchestrator + bot + Caddy + web,
-# применение goose-миграций на старте) реализуется в тикете 0.3.
-# Здесь зафиксирован лишь каркас файла, чтобы структура монорепо была полной.
+# Назначение (бизнес): одной командой (`make run-local`) поднять инфраструктуру
+# (Postgres + Redpanda) и наши сервисы (orchestrator + bot + web за Caddy), чтобы
+# /healthz всех отвечал (приёмка 0.3). Оркестратор на старте сам применяет
+# goose-миграции к Postgres (см. orchestrator/internal/migrate) — отдельного
+# шага/образа миграций нет.
 #
-# См. docs/01_tech_stack_and_architecture.md §5.
-services: {}
-# TODO(0.3): описать сервисы postgres, redpanda, orchestrator, bot, caddy, web.
+# Раскладка — из 01_tech_stack §1 (карта системы) и §5. Секреты только через
+# .env (рядом с этим файлом; шаблон — deploy/.env.example), реальный .env НЕ
+# коммитится (.gitignore). Имена env-переменных сервисов совпадают с
+# platform.Config (префиксы ORCH_/BOT_): ENV, LOG_LEVEL, HEALTH_ADDR и т.п.
+#
+# Запуск/гашение: см. deploy/README.md.
+
+name: agentify
+
+services:
+  # --- Инфраструктура -------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agentify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен — задайте в deploy/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-agentify}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Готовность принимать подключения — гейт для миграций оркестратора.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agentify} -d ${POSTGRES_DB:-agentify}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
+    # Single-node dev-режим: один брокер, без репликации, фиксированная память.
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      # Кластер собран и брокер здоров — гейт для сервисов-консьюмеров (EPIC 3+).
+      test: ["CMD-SHELL", "rpk cluster health -X brokers=redpanda:9092 | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # --- Наши сервисы ---------------------------------------------------------
+
+  orchestrator:
+    build:
+      # Контекст — корень монорепо (нужны go.mod, internal/platform, orchestrator/*).
+      context: ..
+      dockerfile: orchestrator/Dockerfile
+    restart: unless-stopped
+    environment:
+      ORCH_ENV: ${ORCH_ENV:-dev}
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-info}
+      ORCH_LOG_FORMAT: ${ORCH_LOG_FORMAT:-json}
+      ORCH_HEALTH_ADDR: ":8080"
+      # DSN Postgres для миграций-на-старте (и будущих бизнес-запросов, EPIC 1+).
+      ORCH_DATABASE_URL: postgres://${POSTGRES_USER:-agentify}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentify}?sslmode=disable
+      # Seed-брокер Redpanda для моста machine.commands → WS (тикет 3.4, ADR 0001).
+      ORCH_REDPANDA_SEEDS: redpanda:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
+  bot:
+    build:
+      context: ..
+      dockerfile: bot/Dockerfile
+    restart: unless-stopped
+    environment:
+      BOT_ENV: ${BOT_ENV:-dev}
+      BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-info}
+      BOT_LOG_FORMAT: ${BOT_LOG_FORMAT:-json}
+      BOT_HEALTH_ADDR: ":8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      # Внутренний web-Caddy отдаёт /healthz (см. web/Caddyfile).
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/caddy.Dockerfile
+    restart: unless-stopped
+    ports:
+      # Единственный публикуемый наружу порт: фронт раздаёт статику и проксирует
+      # /api → orchestrator, /bot → bot. Переопределяемо через HTTP_PORT.
+      - "${HTTP_PORT:-8080}:8080"
+    depends_on:
+      orchestrator:
+        condition: service_started
+      bot:
+        condition: service_started
+      web:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redpanda_data:

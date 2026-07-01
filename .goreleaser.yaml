@@ -1,0 +1,69 @@
+# .goreleaser.yaml — тикет 4.1 (deps: 0.4, 3.3), GoReleaser v2.5.1 (schema version: 2).
+#
+# Назначение (бизнес): агент — единственный компонент монорепо, который
+# распространяется НЕ через Docker/GHCR (см. .github/workflows/deploy.yml), а
+# как самостоятельный статический бинарь через GitHub Releases (FR C1;
+# docs/01_tech_stack_and_architecture.md §2 [РЕШЕНИЕ 5] и §3 «Агент
+# (Go-демон)»: «Сборка/релиз: GoReleaser → бинарь в GitHub Releases;
+# install.sh его выкачивает»). Пользователь ставит агента на свою
+# macOS/Ubuntu-машину одной командой (install.sh, тикет 4.2) без Docker и без
+# рантайма — отсюда кросс-компиляция под конкретные ОС/архитектуры конечных
+# пользователей и статическая линковка (CGO_ENABLED=0).
+#
+# Как устроено (тех): собираем ТОЛЬКО agent/ (main: ./agent) — единственный
+# main-пакет, относящийся к этому тикету; orchestrator/bot/web в объём 4.1 не
+# входят (они деплоятся по commit SHA через deploy.yml, без git-тегов и без
+# GoReleaser). Версия пробрасывается в agent/main.go:version через
+# `-X main.version={{.Version}}` (см. комментарий над этой переменной в
+# agent/main.go — она явно ссылается на тикеты 4.1/4.7 как источник
+# полноценного версионирования сборки); `-s -w` уменьшает размер
+# распространяемого бинаря. Публикует релизы workflow
+# .github/workflows/release-agent.yml по git-тегу `v*`; CI-гейт
+# `agent-release-build` в .github/workflows/ci.yml гоняет
+# `goreleaser build --snapshot` на каждый PR/push, чтобы кросс-сборка не
+# ломалась незамеченной (snapshot-версия ниже нужна именно для
+# детерминированности этого прогона без реального тега).
+version: 2
+
+project_name: agentify-agent
+
+builds:
+  - id: agentify-agent
+    main: ./agent
+    binary: agentify-agent
+    # Статический бинарь без cgo — «установка одной командой» без рантайма на
+    # машине пользователя (docs/01_tech_stack_and_architecture.md §2
+    # [РЕШЕНИЕ 2]: «Один статический бинарь»).
+    env:
+      - CGO_ENABLED=0
+    # Ровно таргеты из тикета 4.1: macOS (arm64+amd64) и Ubuntu/Linux
+    # (amd64+arm64). Никаких windows/386/прочего.
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+archives:
+  - id: agentify-agent
+    builds:
+      - agentify-agent
+    format: tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: yarabey
+    name: agentify
+
+# Нужна для `goreleaser build --snapshot` в CI-гейте agent-release-build
+# (ci.yml): без реального git-тега версия детерминирована и не зависит от
+# состояния тегов в чекауте.
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"

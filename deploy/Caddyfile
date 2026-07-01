@@ -1,7 +1,44 @@
-# Caddyfile — ЗАГЛУШКА тикета 0.1.
+# deploy/Caddyfile — фронтовый reverse proxy + раздача статики web (тикет 0.3).
 #
-# Реальная конфигурация (авто-TLS Let's Encrypt, reverse proxy на оркестратор,
-# раздача статики web) реализуется в тикетах 0.3/0.5.
-# См. docs/01_tech_stack_and_architecture.md §2 [РЕШЕНИЕ 5], §3 «Инфраструктура».
+# Назначение (бизнес): единая точка входа инфраструктуры (01_tech_stack §2
+# [РЕШЕНИЕ 5], §3). Локально (0.3) — без TLS, слушаем :8080 и маршрутизируем:
+#   - /healthz        → собственный 200 (liveness фронта для smoke);
+#   - /api/*          → оркестратор (REST+WS ядра, FR E*/A*/F*);
+#   - /bot/*          → Telegram-бот (webhook, EPIC 10);
+#   - всё остальное   → статика web (через внутренний web-Caddy).
+# Авто-TLS Let's Encrypt для прод-домена включается в тикете 0.5 (отдельный
+# Caddyfile/сайт-блок), здесь его НЕ настраиваем, чтобы локальный запуск не
+# требовал публичного домена.
+#
+# Адреса сервисов — это имена сервисов из docker-compose.yml (DNS compose-сети).
+# Каждый внутренний сервис слушает свой *_HEALTH_ADDR (по умолчанию :8080).
 
-# TODO(0.3): reverse_proxy на orchestrator, file_server для статики web.
+{
+	# Локально админ-API и авто-TLS не нужны; отключаем, чтобы Caddy не пытался
+	# получать сертификаты и стартовал мгновенно.
+	auto_https off
+	admin off
+}
+
+:8080 {
+	# liveness самого фронта (приёмка 0.3 «/healthz всех сервисов отвечает»).
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# REST/WS оркестратора. /api снимается перед проксированием — ядро отдаёт
+	# /healthz и (в следующих тикетах) бизнес-маршруты без префикса.
+	handle_path /api/* {
+		reverse_proxy orchestrator:8080
+	}
+
+	# Telegram-webhook бота (EPIC 10). Префикс /bot снимается аналогично.
+	handle_path /bot/* {
+		reverse_proxy bot:8080
+	}
+
+	# Всё остальное — статика web (внутренний web-Caddy раздаёт /srv).
+	handle {
+		reverse_proxy web:8080
+	}
+}
