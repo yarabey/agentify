@@ -1365,3 +1365,145 @@ func TestPostTasksIdApprove_CommandNotPublishedBeforeApprove(t *testing.T) {
 		t.Fatalf("после успешного approve команда должна быть опубликована ровно 1 раз, а не %d", len(publisher.calls))
 	}
 }
+
+// doPostTasksIdConfirm прогоняет POST /tasks/{id}/confirm через роутер,
+// собранный из postTasksServer, с Bearer-токеном userID, и возвращает
+// записанный ответ. В отличие от doPostTasksIdApprove/doPostTasksIdAnswer —
+// без тела запроса: контракт (api/openapi.yaml) не описывает requestBody для
+// confirm (тикет 8.2).
+func doPostTasksIdConfirm(t *testing.T, cfg postTasksServer, userID, taskID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+
+	s := newTestServer(cfg.q)
+	s.SetTransitioner(cfg.transitioner)
+	s.SetCommandPublisher(cfg.publisher)
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+taskID.String()+"/confirm", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, userID, time.Now()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPostTasksIdConfirm_RequiresBearerToken — без Authorization-заголовка
+// auth-middleware отвечает 401, не доходя до PostTasksIdConfirm (тикет 1.4).
+func TestPostTasksIdConfirm_RequiresBearerToken(t *testing.T) {
+	s := newTestServer(fakeQuerier{})
+	s.SetTransitioner(&fakeTransitioner{})
+	router := NewRouter(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/tasks/"+uuid.New().String()+"/confirm", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("статус = %d (%s), ожидался 401", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdConfirm_TaskNotFound — чужая/несуществующая задача
+// (GetTaskByIDAndUser → pgx.ErrNoRows) → 404 (FR A4, I3).
+func TestPostTasksIdConfirm_TaskNotFound(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdConfirm(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: pgx.ErrNoRows},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("статус = %d (%s), ожидался 404", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdConfirm_TaskLookupInternalError — неожиданная ошибка при
+// проверке владения задачей → 500.
+func TestPostTasksIdConfirm_TaskLookupInternalError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdConfirm(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserErr: context.DeadlineExceeded},
+		transitioner: &fakeTransitioner{},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdConfirm_NoTransitionerConfigured — transitioner не установлен
+// (nil) → 500.
+func TestPostTasksIdConfirm_NoTransitionerConfigured(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdConfirm(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: nil,
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdConfirm_TransitionError — Transition вернул ошибку. Это
+// покрывает в т.ч. приёмку «confirm запрещён из статусов, отличных от
+// awaiting_confirm»: сама проверка недопустимости перехода — на уровне
+// task.NextStatus (уже протестирована в fsm_test.go тикета 5.2); здесь
+// проверяется только то, что HTTP-обработчик корректно транслирует ошибку
+// Transition в 500 — тот же паттерн, что и
+// TestPostTasksIdApprove_TransitionError/TestPostTasksIdAnswer_TransitionError,
+// отдельной ветки/статуса для недопустимого перехода в проекте не заведено.
+func TestPostTasksIdConfirm_TransitionError(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	rec := doPostTasksIdConfirm(t, postTasksServer{
+		q:            fakeQuerier{getTaskByIDAndUserResult: db.Task{ID: pgtype.UUID{Bytes: taskID, Valid: true}}},
+		transitioner: &fakeTransitioner{err: context.DeadlineExceeded},
+	}, userID, taskID)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("статус = %d (%s), ожидался 500", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostTasksIdConfirm_HappyPath — успешное подтверждение завершения (FR
+// E2, Gherkin §7 «Пользователь подтверждает завершение»): Transition вызван с
+// (taskID, task.TriggerUserConfirmed), 200, тело ответа содержит
+// status="completed".
+func TestPostTasksIdConfirm_HappyPath(t *testing.T) {
+	userID := uuid.New()
+	taskID := uuid.New()
+	integrationID := uuid.New()
+
+	transitioner := &fakeTransitioner{to: task.StatusCompleted}
+	rec := doPostTasksIdConfirm(t, postTasksServer{
+		q: fakeQuerier{
+			getTaskByIDAndUserResult: db.Task{
+				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
+				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
+			},
+		},
+		transitioner: transitioner,
+	}, userID, taskID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("статус = %d (%s), ожидался 200", rec.Code, rec.Body.String())
+	}
+
+	if transitioner.lastTaskID.Bytes != taskID {
+		t.Fatalf("Transition вызван с taskID = %s, ожидался %s", uuid.UUID(transitioner.lastTaskID.Bytes), taskID)
+	}
+	if transitioner.lastTrigger != task.TriggerUserConfirmed {
+		t.Fatalf("Transition вызван с trigger = %q, ожидался %q", transitioner.lastTrigger, task.TriggerUserConfirmed)
+	}
+
+	var respTask Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &respTask); err != nil {
+		t.Fatalf("unmarshal тела: %v", err)
+	}
+	if respTask.Status == nil || *respTask.Status != TaskStatus(task.StatusCompleted) {
+		t.Fatalf("status = %v, ожидался %q", respTask.Status, task.StatusCompleted)
+	}
+}

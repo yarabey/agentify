@@ -3,9 +3,11 @@ package api
 // tasks.go — постановка задачи в очередь к машине (тикет 5.3, FR E1, E4, §4
 // «Постановка задачи из канала» (web/telegram)), ответ пользователя на
 // вопрос агента (тикет 6.1, FR F1, F2, PostTasksIdAnswer, Gherkin §5 «Агент
-// задаёт вопрос и получает ответ») и согласование команды вне allowlist
+// задаёт вопрос и получает ответ»), согласование команды вне allowlist
 // (тикет 6.4, FR F3, PostTasksIdApprove, Gherkin §5 «Команда вне allowlist
-// требует согласования»).
+// требует согласования») и подтверждение пользователем завершения задачи
+// (тикет 8.2, FR E2, PostTasksIdConfirm, Gherkin §7 «Пользователь
+// подтверждает завершение»).
 //
 // Назначение (бизнес): владелец интеграции ставит задачу своей машине текстом
 // (POST /tasks + заголовок Idempotency-Key, FR E7 — сам дедуп по ключу вне
@@ -487,6 +489,89 @@ func (s *Server) PostTasksIdApprove(w http.ResponseWriter, r *http.Request, id I
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// PostTasksIdConfirm реализует POST /tasks/{id}/confirm — явное подтверждение
+// пользователем завершения задачи (тикет 8.2, FR E2, Gherkin §7 «Пользователь
+// подтверждает завершение»: Дано задача в статусе "ожидает подтверждения",
+// Когда я явно подтверждаю завершение, Тогда задача переходит в статус
+// "завершена"). Это ЕДИНСТВЕННОЕ действие, которое закрывает задачу — сама
+// задача уже фактически выполнена агентом и переведена в awaiting_confirm
+// (тикет 8.1), но статус completed выставляется только явным подтверждением
+// человека, не автоматически.
+//
+// Алгоритм: авторизация (JWT, тот же путь, что и PostTasksIdApprove/
+// PostTasksIdAnswer) → проверить владение задачей (id пути, owner-scoped,
+// единый 404 — как и в PostTasksIdApprove/PostTasksIdAnswer) → перевести
+// задачу awaiting_confirm→completed через task.Transitioner.Transition с
+// триггером task.TriggerUserConfirmed (единственная точка смены tasks.status
+// и записи task_events(status_change), тикет 5.2; edge
+// {StatusAwaitingConfirm, TriggerUserConfirmed}: StatusCompleted уже заведён в
+// fsm.go тикетом 5.2 специально под этот тикет) → 200 с обновлённым Task.
+//
+// В отличие от PostTasksIdAnswer/PostTasksIdApprove здесь НЕТ requestBody:
+// контракт (api/openapi.yaml) не описывает тело для /tasks/{id}/confirm —
+// подтверждение не сопоставляется ни с каким конкретным событием задачи
+// (нет question_id/request_id, которые нужно было бы найти среди
+// task_events), поэтому и не нужен generated JSONBody-тип для декодирования.
+//
+// В отличие от PostTasksIdAnswer/PostTasksIdApprove здесь НЕТ публикации
+// через CommandPublisher/PublishKeyed: подтверждение — чисто orchestrator-side
+// переход статуса, агент ни во что не вовлечён и уведомлять его не о чем —
+// задача с его точки зрения уже завершена (тикет 8.1, awaiting_confirm
+// достигается именно сообщением агента о завершении). В internal/bus/
+// messages.go нет и не должно быть MessageType для confirm/reject: этот
+// переход не порождает никакой команды machine.commands.
+//
+// Недопустимый переход (задача не в awaiting_confirm) — ошибка от
+// task.NextStatus внутри transitioner.Transition, транслируется в 500 общей
+// веткой ниже, тем же паттерном, что и TransitionError в
+// PostTasksIdApprove/PostTasksIdAnswer — отдельного статуса/ветки для этого
+// случая в проекте не заведено.
+func (s *Server) PostTasksIdConfirm(w http.ResponseWriter, r *http.Request, id IdPath) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	taskUUID := uuid.UUID(id)
+	taskID := pgtype.UUID{Bytes: taskUUID, Valid: true}
+
+	// Владение задачей — owner-scoped прямо в SQL (FR A4, I3), как и владение
+	// задачей в PostTasksIdAnswer/PostTasksIdApprove: чужая/несуществующая
+	// задача неотличимы, единый 404.
+	row, err := s.queries.GetTaskByIDAndUser(ctx, db.GetTaskByIDAndUserParams{
+		ID:     taskID,
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeTaskNotFound(w)
+			return
+		}
+		s.logError("GetTaskByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	transitioner := s.getTransitioner()
+	if transitioner == nil {
+		s.logError("PostTasksIdConfirm", errors.New("transitioner не настроен"))
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	_, to, err := transitioner.Transition(ctx, taskID, task.TriggerUserConfirmed)
+	if err != nil {
+		s.logError("Transition(user_confirmed)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toTask(row, to))
 }
 
 // toTask конвертирует строку БД (уже после Transition) в контрактный Task.
