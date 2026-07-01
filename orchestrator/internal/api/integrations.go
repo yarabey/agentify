@@ -36,14 +36,17 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
 // PostIntegrations реализует POST /integrations — создание интеграции с
@@ -274,7 +277,9 @@ func (s *Server) PatchIntegrationsId(w http.ResponseWriter, r *http.Request, id 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Между GetIntegrationByIDAndUser и UpdateIntegration интеграцию
-			// успели удалить (тикет 2.6, вне скоупа здесь) — тот же 404.
+			// успели (мягко, ADR 0004) удалить через DeleteIntegrationsId
+			// (тикет 2.6) — тот же 404: UpdateIntegration тоже фильтрует
+			// deleted_at IS NULL.
 			writeIntegrationNotFound(w)
 			return
 		}
@@ -284,6 +289,133 @@ func (s *Server) PatchIntegrationsId(w http.ResponseWriter, r *http.Request, id 
 	}
 
 	writeJSON(w, http.StatusOK, toIntegration(updated))
+}
+
+// DeleteIntegrationsId реализует DELETE /integrations/{id}?confirm=true —
+// удаление интеграции с корректной отменой активных задач (тикет 2.6, FR B5,
+// Gherkin §2 «Удаление интеграции с активной задачей требует подтверждения»).
+//
+// Бизнес-логика:
+//   - интеграция ищется owner-scoped (GetIntegrationByIDAndUser) — чужая или
+//     несуществующая (в т.ч. уже мягко удалённая, см. ниже) неотличимы,
+//     единый 404, тот же приём, что и в остальных обработчиках этого файла;
+//   - активные задачи интеграции (ListActiveTaskIDsByIntegration —
+//     'queued'/'running'/'waiting_user'/'awaiting_confirm'/'stale', см. годок
+//     запроса в orchestrator/queries/tasks.sql) без confirm=true → 409, не
+//     удаляя интеграцию — вызывающий должен явно подтвердить, что понимает
+//     последствия (Gherkin §2);
+//   - с confirm=true каждая активная задача переводится в cancelled через
+//     единственную точку смены статуса (task.Transitioner.Transition(...,
+//     TriggerCancelRequested)) и агенту публикуется команда cancel
+//     (тот же паттерн, что и в PostTasksIdCancel, tasks.go, тикет 8.4) — это
+//     и есть «корректное завершение/отмена» из требования тикета;
+//   - затем интеграция мягко удаляется (SoftDeleteIntegration, ADR 0004,
+//     docs/adr/0004-integration-soft-delete.md) — НЕ физический DELETE:
+//     tasks.integration_id объявлен ON DELETE RESTRICT (migrations/00003), а
+//     история задач хранится бессрочно (FR I2), поэтому физический DELETE
+//     упал бы на FK у любой интеграции, у которой хоть раз была задача (не
+//     только активная сейчас) — см. ADR 0004 для полного обоснования;
+//   - успех — 204 без тела (контракт: DELETE /integrations/{id} → 204).
+//
+// Без активных задач (activeIDs пуст) confirm не требуется и не проверяется —
+// сразу переходим к SoftDeleteIntegration, как и требует контракт («Успешное
+// удаление без активных задач»).
+//
+// Если между ListActiveTaskIDsByIntegration и SoftDeleteIntegration
+// интеграцию успели удалить повторно (гонка параллельных DELETE-запросов),
+// SoftDeleteIntegration (owner-scoped, deleted_at IS NULL) не найдёт строку
+// (pgx.ErrNoRows) — обработчик отвечает тем же единым 404, не 204 повторно.
+func (s *Server) DeleteIntegrationsId(w http.ResponseWriter, r *http.Request, id IdPath, params DeleteIntegrationsIdParams) {
+	ctx := r.Context()
+
+	userID, ok := UserIDFromContext(ctx)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+
+	row, err := s.queries.GetIntegrationByIDAndUser(ctx, db.GetIntegrationByIDAndUserParams{
+		ID:     pgtype.UUID{Bytes: id, Valid: true},
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeIntegrationNotFound(w)
+			return
+		}
+		s.logError("GetIntegrationByIDAndUser", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	activeIDs, err := s.queries.ListActiveTaskIDsByIntegration(ctx, row.ID)
+	if err != nil {
+		s.logError("ListActiveTaskIDsByIntegration", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	confirm := params.Confirm != nil && *params.Confirm
+	if len(activeIDs) > 0 && !confirm {
+		writeError(w, http.StatusConflict, "active_tasks", "у интеграции есть активные задачи — повторите запрос с confirm=true")
+		return
+	}
+
+	if len(activeIDs) > 0 {
+		transitioner := s.getTransitioner()
+		if transitioner == nil {
+			s.logError("DeleteIntegrationsId", errors.New("transitioner не настроен"))
+			writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+			return
+		}
+		publisher := s.getCommandPublisher()
+		if publisher == nil {
+			s.logError("DeleteIntegrationsId", errors.New("CommandPublisher не настроен"))
+			writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+			return
+		}
+
+		integrationIDStr := uuid.UUID(id).String()
+		for _, taskID := range activeIDs {
+			if _, _, err := transitioner.Transition(ctx, taskID, task.TriggerCancelRequested); err != nil {
+				s.logError("Transition(cancel_requested)", err)
+				writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+				return
+			}
+
+			taskIDStr := uuid.UUID(taskID.Bytes).String()
+			env := bus.Envelope{
+				MessageID:       bus.NewMessageID(),
+				TaskID:          &taskIDStr,
+				IntegrationID:   integrationIDStr,
+				Type:            bus.MessageTypeCancel,
+				Seq:             1,
+				Ts:              time.Now().UTC().Format(time.RFC3339),
+				ProtocolVersion: bus.ProtocolVersion,
+				Payload:         json.RawMessage("{}"),
+			}
+			if err := publisher.PublishKeyed(ctx, bus.TopicMachineCommands, bus.PartitionKeyIntegrationID, env); err != nil {
+				s.logError("PublishKeyed(cancel)", err)
+				writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+				return
+			}
+		}
+	}
+
+	if _, err := s.queries.SoftDeleteIntegration(ctx, db.SoftDeleteIntegrationParams{
+		ID:     pgtype.UUID{Bytes: id, Valid: true},
+		UserID: pgtype.UUID{Bytes: userID, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeIntegrationNotFound(w)
+			return
+		}
+		s.logError("SoftDeleteIntegration", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // writeIntegrationNotFound отвечает единым 404 (схема NotFound = Error

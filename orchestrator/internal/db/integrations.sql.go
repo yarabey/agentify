@@ -15,7 +15,7 @@ const createIntegration = `-- name: CreateIntegration :one
 
 INSERT INTO integrations (user_id, name, ip_hint, uuid_hmac, uuid_enc, status)
 VALUES ($1, $2, $3, $4, $5, 'offline')
-RETURNING id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at
+RETURNING id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at, deleted_at
 `
 
 type CreateIntegrationParams struct {
@@ -59,13 +59,14 @@ func (q *Queries) CreateIntegration(ctx context.Context, arg CreateIntegrationPa
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
 
 const getIntegrationByIDAndUser = `-- name: GetIntegrationByIDAndUser :one
-SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at FROM integrations
-WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at, deleted_at FROM integrations
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
 `
 
 type GetIntegrationByIDAndUserParams struct {
@@ -76,6 +77,9 @@ type GetIntegrationByIDAndUserParams struct {
 // Интеграция по id, owner-scoped прямо в SQL: чужая интеграция не найдётся
 // (pgx.ErrNoRows), что отдаёт владельцу единый 404 — не давая атакующему
 // сигнал о существовании чужого id (тот же принцип, что и в auth).
+// deleted_at IS NULL (ADR 0004, тикет 2.6): мягко удалённая интеграция
+// неотличима от несуществующей — единый 404 для GET/PATCH /integrations/{id}
+// и для POST /tasks (GetIntegrationByIDAndUser переиспользуется в tasks.go).
 func (q *Queries) GetIntegrationByIDAndUser(ctx context.Context, arg GetIntegrationByIDAndUserParams) (Integration, error) {
 	row := q.db.QueryRow(ctx, getIntegrationByIDAndUser, arg.ID, arg.UserID)
 	var i Integration
@@ -90,13 +94,14 @@ func (q *Queries) GetIntegrationByIDAndUser(ctx context.Context, arg GetIntegrat
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
 
 const getIntegrationByUUIDHMAC = `-- name: GetIntegrationByUUIDHMAC :one
-SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at FROM integrations
-WHERE uuid_hmac = $1
+SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at, deleted_at FROM integrations
+WHERE uuid_hmac = $1 AND deleted_at IS NULL
 `
 
 // Назначение (бизнес): аутентификация машины на WS-handshake /machine/ws
@@ -109,6 +114,9 @@ WHERE uuid_hmac = $1
 // см. orchestrator/internal/api/auth.go). Не находит — pgx.ErrNoRows;
 // сервисный слой схлопывает это с несовпадением ip_hint в единый отказ
 // WS-аутентификации (close 4401), без утечки причины.
+// deleted_at IS NULL (ADR 0004, тикет 2.6): критично для безопасности —
+// мягко удалённая интеграция не должна иметь возможность повторно
+// аутентифицировать машину предъявлением старого UUID-секрета.
 func (q *Queries) GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (Integration, error) {
 	row := q.db.QueryRow(ctx, getIntegrationByUUIDHMAC, uuidHmac)
 	var i Integration
@@ -123,19 +131,22 @@ func (q *Queries) GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string)
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
 
 const listIntegrationsByUser = `-- name: ListIntegrationsByUser :many
-SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at FROM integrations
-WHERE user_id = $1
+SELECT id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at, deleted_at FROM integrations
+WHERE user_id = $1 AND deleted_at IS NULL
 ORDER BY created_at
 `
 
 // Список интеграций владельца — только свои (FR A4, I3, Gherkin §2). Без
 // секрета (uuid_enc) в результате сознательно НЕ ограничиваем: вызывающая
 // сторона (Server.GetIntegrations) просто не кладёт его в ответ.
+// deleted_at IS NULL (ADR 0004, тикет 2.6): мягко удалённая интеграция не
+// должна появляться в списке владельца — для него она перестала существовать.
 func (q *Queries) ListIntegrationsByUser(ctx context.Context, userID pgtype.UUID) ([]Integration, error) {
 	rows, err := q.db.Query(ctx, listIntegrationsByUser, userID)
 	if err != nil {
@@ -156,6 +167,7 @@ func (q *Queries) ListIntegrationsByUser(ctx context.Context, userID pgtype.UUID
 			&i.LastSeenAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -197,11 +209,40 @@ func (q *Queries) MarkStaleIntegrationsOffline(ctx context.Context, lastSeenAt p
 	return err
 }
 
+const softDeleteIntegration = `-- name: SoftDeleteIntegration :one
+UPDATE integrations
+SET deleted_at = now(), updated_at = now()
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+RETURNING id
+`
+
+type SoftDeleteIntegrationParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Мягкое удаление интеграции (DELETE /integrations/{id}, тикет 2.6, FR B5,
+// ADR 0004, docs/adr/0004-integration-soft-delete.md): физический DELETE
+// невозможен для интеграции, у которой хоть раз была создана задача —
+// tasks.integration_id объявлен ON DELETE RESTRICT (migrations/00003), а
+// история задач хранится бессрочно (FR I2). Вместо этого выставляем
+// deleted_at = now(); owner-scoped WHERE — как у Get/Update. Условие
+// deleted_at IS NULL делает вызов идемпотентным относительно повторного
+// удаления уже удалённой строки: повторный вызов не найдёт строку
+// (pgx.ErrNoRows), обработчик трактует это как 404, а не как повторный
+// успешный 204.
+func (q *Queries) SoftDeleteIntegration(ctx context.Context, arg SoftDeleteIntegrationParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, softDeleteIntegration, arg.ID, arg.UserID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const updateIntegration = `-- name: UpdateIntegration :one
 UPDATE integrations
 SET name = $3, ip_hint = $4, updated_at = now()
-WHERE id = $1 AND user_id = $2
-RETURNING id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at
+WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+RETURNING id, user_id, name, ip_hint, uuid_hmac, uuid_enc, status, last_seen_at, created_at, updated_at, deleted_at
 `
 
 type UpdateIntegrationParams struct {
@@ -215,6 +256,8 @@ type UpdateIntegrationParams struct {
 // значения для записи считает сервисный слой (берёт текущие там, где поле
 // не пришло в теле запроса), здесь — безусловная перезапись + updated_at.
 // owner-scoped WHERE — как и у Get, не находит чужую строку.
+// deleted_at IS NULL (ADR 0004, тикет 2.6): удалённую интеграцию нельзя
+// «оживить» повторным PATCH — pgx.ErrNoRows, единый 404.
 func (q *Queries) UpdateIntegration(ctx context.Context, arg UpdateIntegrationParams) (Integration, error) {
 	row := q.db.QueryRow(ctx, updateIntegration,
 		arg.ID,
@@ -234,6 +277,7 @@ func (q *Queries) UpdateIntegration(ctx context.Context, arg UpdateIntegrationPa
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }

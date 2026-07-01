@@ -79,6 +79,12 @@ type fakeQuerier struct {
 
 	listCommandApprovalRequestEventsByTaskResult []db.TaskEvent
 	listCommandApprovalRequestEventsByTaskErr    error
+
+	listActiveTaskIDsByIntegrationResult []pgtype.UUID
+	listActiveTaskIDsByIntegrationErr    error
+
+	softDeleteIntegrationResult pgtype.UUID
+	softDeleteIntegrationErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -209,6 +215,20 @@ func (f fakeQuerier) ListCommandApprovalRequestEventsByTask(context.Context, pgt
 		return nil, f.listCommandApprovalRequestEventsByTaskErr
 	}
 	return f.listCommandApprovalRequestEventsByTaskResult, nil
+}
+
+func (f fakeQuerier) ListActiveTaskIDsByIntegration(context.Context, pgtype.UUID) ([]pgtype.UUID, error) {
+	if f.listActiveTaskIDsByIntegrationErr != nil {
+		return nil, f.listActiveTaskIDsByIntegrationErr
+	}
+	return f.listActiveTaskIDsByIntegrationResult, nil
+}
+
+func (f fakeQuerier) SoftDeleteIntegration(context.Context, db.SoftDeleteIntegrationParams) (pgtype.UUID, error) {
+	if f.softDeleteIntegrationErr != nil {
+		return pgtype.UUID{}, f.softDeleteIntegrationErr
+	}
+	return f.softDeleteIntegrationResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api

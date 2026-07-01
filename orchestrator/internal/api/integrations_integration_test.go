@@ -35,12 +35,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/auth"
 	"github.com/yarabey/agentify/orchestrator/internal/api"
@@ -440,4 +443,336 @@ func TestIntegration_Integrations_PatchDuringRunningTaskDoesNotBreakTask(t *test
 	}
 
 	t.Logf("OK: PATCH интеграции во время running-задачи меняет name+ip_hint (200), не трогает tasks.status/task_events, задача продолжает штатно переходить по FSM")
+}
+
+// createTaskInStatus создаёт задачу интеграции и доводит её реальным
+// task.Transitioner до статуса status — общий шаг предусловия для тестов
+// DeleteIntegrationsId (тикет 2.6). idempotencyKey ДОЛЖЕН быть уникален
+// внутри теста (uq_tasks_idempotency, тикет 5.5) — вызывающий передаёт
+// заведомо разные значения для нескольких задач одного пользователя.
+func createTaskInStatus(ctx context.Context, t *testing.T, q *db.Queries, tr *task.Transitioner, userID, integrationID pgtype.UUID, idempotencyKey string, status task.Status) db.Task {
+	t.Helper()
+	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
+		UserID:         userID,
+		IntegrationID:  integrationID,
+		TextEnc:        []byte("задача для теста удаления интеграции"),
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (%s): %v", idempotencyKey, err)
+	}
+
+	// Путь created→queued→running→(waiting_user|stale) — общими Trigger'ами,
+	// без прохождения через HTTP (это только подготовка состояния, не предмет
+	// проверки самих тестов DeleteIntegrationsId).
+	triggers := []task.Trigger{task.TriggerEnqueued}
+	switch status {
+	case task.StatusQueued:
+		// уже достаточно TriggerEnqueued выше.
+	case task.StatusRunning:
+		triggers = append(triggers, task.TriggerTaskAccepted)
+	case task.StatusWaitingUser:
+		triggers = append(triggers, task.TriggerTaskAccepted, task.TriggerAgentQuestion)
+	case task.StatusAwaitingConfirm:
+		triggers = append(triggers, task.TriggerTaskAccepted, task.TriggerAgentCompleted)
+	case task.StatusStale:
+		triggers = append(triggers, task.TriggerTaskAccepted, task.TriggerTimeout)
+	default:
+		t.Fatalf("createTaskInStatus: не поддерживаемый целевой статус %s", status)
+	}
+	for _, trigger := range triggers {
+		if _, _, terr := tr.Transition(ctx, taskRow.ID, trigger); terr != nil {
+			t.Fatalf("подготовка (%s → %s): %v", idempotencyKey, trigger, terr)
+		}
+	}
+	return taskRow
+}
+
+// TestIntegration_DeleteIntegrationsId_NoActiveTasks_DeletesImmediately —
+// приёмка тикета 2.6 (FR B5): DELETE /integrations/{id} БЕЗ активных задач
+// удаляет сразу (204), confirm не требуется. После удаления интеграция
+// неотличима от несуществующей — GET/PATCH тоже отвечают 404 (ADR 0004,
+// deleted_at IS NULL во всех owner-scoped запросах).
+func TestIntegration_DeleteIntegrationsId_NoActiveTasks_DeletesImmediately(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	_, token := createTestUserWithToken(ctx, t, q, "alice-delete-no-tasks")
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	createRec := doIntegrationsRequest(t, router, http.MethodPost, "/integrations", token, api.IntegrationCreate{Name: "no-tasks-machine"})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("создание: статус = %d (%s)", createRec.Code, createRec.Body.String())
+	}
+	var created api.IntegrationWithSecret
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+
+	// БЕЗ ?confirm=true — активных задач нет, подтверждение не требуется.
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+created.Id.String(), token, nil)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE без активных задач: статус = %d (%s), ожидался 204", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	getRec := doIntegrationsRequest(t, router, http.MethodGet, "/integrations/"+created.Id.String(), token, nil)
+	if getRec.Code != http.StatusNotFound {
+		t.Fatalf("GET после удаления: статус = %d (%s), ожидался 404", getRec.Code, getRec.Body.String())
+	}
+
+	listRec := doIntegrationsRequest(t, router, http.MethodGet, "/integrations", token, nil)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("GET /integrations после удаления: статус = %d (%s)", listRec.Code, listRec.Body.String())
+	}
+	var list []api.Integration
+	if err := json.Unmarshal(listRec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("список после удаления = %+v, ожидался пустой", list)
+	}
+	t.Logf("OK: без активных задач DELETE удаляет сразу (204), интеграция после этого неотличима от несуществующей (404, не в списке)")
+}
+
+// TestIntegration_DeleteIntegrationsId_ActiveTaskWithoutConfirm_Returns409 —
+// приёмка тикета 2.6, Gherkin §2 «Удаление интеграции с активной задачей
+// требует подтверждения»: с активной задачей и БЕЗ confirm=true DELETE
+// отвечает 409 и НЕ трогает ни интеграцию, ни задачу.
+func TestIntegration_DeleteIntegrationsId_ActiveTaskWithoutConfirm_Returns409(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-delete-409")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-409")
+
+	tr := task.NewTransitioner(pool)
+	taskRow := createTaskInStatus(ctx, t, q, tr, user.ID, integration.ID, "delete-409-key-1", task.StatusRunning)
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	integrationID := uuid.UUID(integration.ID.Bytes)
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+integrationID.String(), token, nil)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("DELETE без confirm при активной задаче: статус = %d (%s), ожидался 409", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	// Интеграция НЕ удалена — прямой SQL-чек deleted_at IS NULL. Намеренно не
+	// через GET /integrations/{id}: тот расшифровывает uuid_enc
+	// (crypto.Decrypt), а createTestIntegration (tasks_integration_test.go)
+	// кладёт туда сырые байты секрета, а не настоящий AEAD-шифротекст — GET
+	// упал бы 500 по причине, не относящейся к тому, что здесь проверяется
+	// (тому, что реализует и проверяет TestIntegration_Integrations_Get*).
+	var deletedAt pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `SELECT deleted_at FROM integrations WHERE id = $1`, integration.ID).Scan(&deletedAt); err != nil {
+		t.Fatalf("SELECT deleted_at после 409: %v", err)
+	}
+	if deletedAt.Valid {
+		t.Fatalf("integrations.deleted_at после 409 = %v, ожидался NULL (интеграция не должна быть удалена)", deletedAt)
+	}
+
+	// Задача НЕ тронута — по-прежнему running, не cancelled.
+	if status := getTaskRowStatus(ctx, t, pool, taskRow.ID); status != string(task.StatusRunning) {
+		t.Fatalf("tasks.status после 409 = %s, ожидался running (задача не должна быть отменена без confirm)", status)
+	}
+	t.Logf("OK: активная задача без confirm=true → 409, интеграция и задача не тронуты")
+}
+
+// TestIntegration_DeleteIntegrationsId_ActiveTaskWithConfirm_CancelsAndDeletes —
+// приёмка тикета 2.6 (FR B5, Gherkin §2): с confirm=true задача корректно
+// отменяется через FSM (Transition → cancelled), затем интеграция мягко
+// удаляется (ADR 0004) — единственный физический эффект: deleted_at,
+// tasks/task_events не удаляются (FR I2).
+func TestIntegration_DeleteIntegrationsId_ActiveTaskWithConfirm_CancelsAndDeletes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-delete-confirm")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-confirm")
+
+	tr := task.NewTransitioner(pool)
+	taskRow := createTaskInStatus(ctx, t, q, tr, user.ID, integration.ID, "delete-confirm-key-1", task.StatusRunning)
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	server.SetTransitioner(tr)
+	server.SetCommandPublisher(noopCommandPublisher{})
+	router := api.NewRouter(server)
+
+	integrationID := uuid.UUID(integration.ID.Bytes)
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+integrationID.String()+"?confirm=true", token, nil)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE с confirm=true: статус = %d (%s), ожидался 204", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	if status := getTaskRowStatus(ctx, t, pool, taskRow.ID); status != string(task.StatusCancelled) {
+		t.Fatalf("tasks.status после DELETE?confirm=true = %s, ожидался cancelled", status)
+	}
+
+	// tasks-строка сохранена (FR I2, история бессрочна) — не удалена, не
+	// осиротела (integration_id по-прежнему указывает на исходную интеграцию).
+	var stillIntegrationID pgtype.UUID
+	if err := pool.QueryRow(ctx, `SELECT integration_id FROM tasks WHERE id = $1`, taskRow.ID).Scan(&stillIntegrationID); err != nil {
+		t.Fatalf("SELECT tasks.integration_id после удаления интеграции: %v", err)
+	}
+	if stillIntegrationID != integration.ID {
+		t.Fatalf("tasks.integration_id после удаления интеграции = %v, ожидался неизменным %v (FK ON DELETE RESTRICT/ADR 0004 — строка не должна осиротеть)", stillIntegrationID, integration.ID)
+	}
+
+	getRec := doIntegrationsRequest(t, router, http.MethodGet, "/integrations/"+integrationID.String(), token, nil)
+	if getRec.Code != http.StatusNotFound {
+		t.Fatalf("GET после удаления: статус = %d (%s), ожидался 404", getRec.Code, getRec.Body.String())
+	}
+	t.Logf("OK: confirm=true отменяет активную задачу (cancelled) и мягко удаляет интеграцию (204, затем 404); история задачи (tasks-строка) сохранена")
+}
+
+// TestIntegration_DeleteIntegrationsId_MultipleActiveTasks_AllCancelled —
+// приёмка тикета 2.6: несколько активных задач интеграции в РАЗНЫХ активных
+// статусах (queued/running/waiting_user) — confirm=true отменяет КАЖДУЮ из
+// них, ни одна не остаётся в промежуточном статусе.
+func TestIntegration_DeleteIntegrationsId_MultipleActiveTasks_AllCancelled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-delete-multi")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-multi")
+
+	tr := task.NewTransitioner(pool)
+	queuedTask := createTaskInStatus(ctx, t, q, tr, user.ID, integration.ID, "delete-multi-key-queued", task.StatusQueued)
+	runningTask := createTaskInStatus(ctx, t, q, tr, user.ID, integration.ID, "delete-multi-key-running", task.StatusRunning)
+	waitingTask := createTaskInStatus(ctx, t, q, tr, user.ID, integration.ID, "delete-multi-key-waiting", task.StatusWaitingUser)
+
+	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
+	server.SetTransitioner(tr)
+	server.SetCommandPublisher(noopCommandPublisher{})
+	router := api.NewRouter(server)
+
+	integrationID := uuid.UUID(integration.ID.Bytes)
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+integrationID.String()+"?confirm=true", token, nil)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE с confirm=true (3 активные задачи): статус = %d (%s), ожидался 204", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	for name, taskRow := range map[string]db.Task{"queued": queuedTask, "running": runningTask, "waiting_user": waitingTask} {
+		if status := getTaskRowStatus(ctx, t, pool, taskRow.ID); status != string(task.StatusCancelled) {
+			t.Fatalf("tasks.status задачи %s после DELETE?confirm=true = %s, ожидался cancelled", name, status)
+		}
+	}
+	t.Logf("OK: DELETE?confirm=true отменяет ВСЕ активные задачи интеграции (queued, running, waiting_user → cancelled)")
+}
+
+// TestIntegration_DeleteIntegrationsId_OtherUsersIntegration_404 — DELETE
+// чужой интеграции → 404 (не 403, owner isolation, FR A4, I3, тот же приём,
+// что и у GET/PATCH). Чужая интеграция не удаляется.
+func TestIntegration_DeleteIntegrationsId_OtherUsersIntegration_404(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	_, aliceToken := createTestUserWithToken(ctx, t, q, "alice-delete-owner")
+	_, bobToken := createTestUserWithToken(ctx, t, q, "bob-delete-other")
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	createRec := doIntegrationsRequest(t, router, http.MethodPost, "/integrations", aliceToken, api.IntegrationCreate{Name: "alice-protected-machine"})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("создание: статус = %d (%s)", createRec.Code, createRec.Body.String())
+	}
+	var created api.IntegrationWithSecret
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+
+	// Боб пытается удалить интеграцию Алисы.
+	bobDelete := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+created.Id.String()+"?confirm=true", bobToken, nil)
+	if bobDelete.Code != http.StatusNotFound {
+		t.Fatalf("DELETE чужой интеграции: статус = %d (%s), ожидался 404", bobDelete.Code, bobDelete.Body.String())
+	}
+
+	// Интеграция Алисы по-прежнему существует.
+	aliceGet := doIntegrationsRequest(t, router, http.MethodGet, "/integrations/"+created.Id.String(), aliceToken, nil)
+	if aliceGet.Code != http.StatusOK {
+		t.Fatalf("GET владельцем после чужой попытки DELETE: статус = %d (%s), ожидался 200", aliceGet.Code, aliceGet.Body.String())
+	}
+	t.Logf("OK: DELETE чужой интеграции → 404, сама интеграция не удаляется")
+}
+
+// TestIntegration_DeleteIntegrationsId_NotFound_404 — DELETE несуществующего
+// id → 404 (тот же единый ответ, что и для чужой интеграции).
+func TestIntegration_DeleteIntegrationsId_NotFound_404(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	_, token := createTestUserWithToken(ctx, t, q, "alice-delete-notfound")
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+uuid.New().String(), token, nil)
+	if deleteRec.Code != http.StatusNotFound {
+		t.Fatalf("DELETE несуществующей интеграции: статус = %d (%s), ожидался 404", deleteRec.Code, deleteRec.Body.String())
+	}
+	t.Logf("OK: DELETE несуществующего id → 404")
+}
+
+// TestIntegration_DeleteIntegrationsId_DeletedIntegrationCannotAuthenticateMachine —
+// критичный для безопасности сценарий ADR 0004
+// (docs/adr/0004-integration-soft-delete.md): после мягкого удаления
+// интеграция не может пройти WS-аутентификацию машины повторным
+// предъявлением своего UUID-секрета — GetIntegrationByUUIDHMAC (путь
+// machine_ws.go, тикет 2.3) тоже фильтрует deleted_at IS NULL и после
+// удаления не находит строку (pgx.ErrNoRows), как для несуществующей
+// интеграции.
+func TestIntegration_DeleteIntegrationsId_DeletedIntegrationCannotAuthenticateMachine(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pool, done := setupDB(ctx, t)
+	defer done()
+	q := db.New(pool)
+
+	user, token := createTestUserWithToken(ctx, t, q, "alice-delete-ws-auth")
+	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-ws-auth")
+
+	// Предусловие: ДО удаления интеграция аутентифицируется по своему
+	// uuid_hmac (тот же путь, что GetMachineWs на WS-handshake).
+	if _, err := q.GetIntegrationByUUIDHMAC(ctx, integration.UuidHmac); err != nil {
+		t.Fatalf("GetIntegrationByUUIDHMAC ДО удаления: %v, ожидался успех", err)
+	}
+
+	router := api.NewRouter(api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32)))
+
+	integrationID := uuid.UUID(integration.ID.Bytes)
+	deleteRec := doIntegrationsRequest(t, router, http.MethodDelete, "/integrations/"+integrationID.String(), token, nil)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: статус = %d (%s), ожидался 204", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	// ПОСЛЕ удаления тот же uuid_hmac больше не находится — машина не может
+	// «воскресить» удалённую интеграцию повторным hello.
+	if _, err := q.GetIntegrationByUUIDHMAC(ctx, integration.UuidHmac); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("GetIntegrationByUUIDHMAC ПОСЛЕ удаления: err=%v, ожидался pgx.ErrNoRows (удалённая интеграция не должна аутентифицировать машину)", err)
+	}
+	t.Logf("OK: удалённая интеграция не проходит GetIntegrationByUUIDHMAC — не может повторно аутентифицировать машину на WS-handshake")
 }

@@ -211,6 +211,55 @@ func (q *Queries) InsertNextTaskEvent(ctx context.Context, arg InsertNextTaskEve
 	return i, err
 }
 
+const listActiveTaskIDsByIntegration = `-- name: ListActiveTaskIDsByIntegration :many
+SELECT id FROM tasks
+WHERE integration_id = $1
+  AND status IN ('queued', 'running', 'waiting_user', 'awaiting_confirm', 'stale')
+`
+
+// Возвращает id активных (не терминальных) задач интеграции — используется
+// DeleteIntegrationsId (тикет 2.6, FR B5) для решения о 409 (без
+// confirm=true) и, при confirm=true, как список задач для отмены через
+// task.Transitioner.Transition(..., TriggerCancelRequested).
+//
+// Аллоу-лист статусов ('queued', 'running', 'waiting_user',
+// 'awaiting_confirm', 'stale'), а не «всё кроме терминальных» (тот же приём,
+// что у ListRunningTasksWithStaleMachine/ListStaleTasksWithRecoveredMachine
+// ниже) — явный список читается безопаснее: новый нетерминальный статус,
+// добавленный в будущем в CHECK-constraint (migrations/00003) и в
+// task.Status, не подхватится сюда молча, а потребует осознанного решения.
+//
+// 'created' НАМЕРЕННО исключён: {StatusCreated, TriggerCancelRequested} не
+// определён в transitions (orchestrator/internal/task/fsm.go) — отменить
+// задачу в статусе 'created' через этот триггер нельзя. На практике это не
+// проблема: POST /tasks (тикет 5.3) синхронно переводит created → queued в
+// рамках одного запроса (task.Transitioner.Transition(..., TriggerEnqueued)
+// сразу после CreateTask), так что снаружи этого обработчика задача в
+// статусе 'created' не наблюдается.
+//
+// Без фильтра по user_id: владение интеграцией уже проверено вызывающей
+// стороной через GetIntegrationByIDAndUser (owner-scoped) до вызова этого
+// запроса — здесь достаточно integration_id.
+func (q *Queries) ListActiveTaskIDsByIntegration(ctx context.Context, integrationID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listActiveTaskIDsByIntegration, integrationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAgentQuestionEventsByTask = `-- name: ListAgentQuestionEventsByTask :many
 SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER BY seq DESC
 `

@@ -94,6 +94,34 @@ SELECT * FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER B
 -- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
 SELECT * FROM task_events WHERE task_id = $1 AND type = 'command_approval_request' ORDER BY seq DESC;
 
+-- name: ListActiveTaskIDsByIntegration :many
+-- Возвращает id активных (не терминальных) задач интеграции — используется
+-- DeleteIntegrationsId (тикет 2.6, FR B5) для решения о 409 (без
+-- confirm=true) и, при confirm=true, как список задач для отмены через
+-- task.Transitioner.Transition(..., TriggerCancelRequested).
+--
+-- Аллоу-лист статусов ('queued', 'running', 'waiting_user',
+-- 'awaiting_confirm', 'stale'), а не «всё кроме терминальных» (тот же приём,
+-- что у ListRunningTasksWithStaleMachine/ListStaleTasksWithRecoveredMachine
+-- ниже) — явный список читается безопаснее: новый нетерминальный статус,
+-- добавленный в будущем в CHECK-constraint (migrations/00003) и в
+-- task.Status, не подхватится сюда молча, а потребует осознанного решения.
+--
+-- 'created' НАМЕРЕННО исключён: {StatusCreated, TriggerCancelRequested} не
+-- определён в transitions (orchestrator/internal/task/fsm.go) — отменить
+-- задачу в статусе 'created' через этот триггер нельзя. На практике это не
+-- проблема: POST /tasks (тикет 5.3) синхронно переводит created → queued в
+-- рамках одного запроса (task.Transitioner.Transition(..., TriggerEnqueued)
+-- сразу после CreateTask), так что снаружи этого обработчика задача в
+-- статусе 'created' не наблюдается.
+--
+-- Без фильтра по user_id: владение интеграцией уже проверено вызывающей
+-- стороной через GetIntegrationByIDAndUser (owner-scoped) до вызова этого
+-- запроса — здесь достаточно integration_id.
+SELECT id FROM tasks
+WHERE integration_id = $1
+  AND status IN ('queued', 'running', 'waiting_user', 'awaiting_confirm', 'stale');
+
 -- name: ListRunningTasksWithStaleMachine :many
 -- «Зависание» машины (тикет 5.7, FR E5, protocol.md §6: STALE_THRESHOLD):
 -- находит активные (running/waiting_user) задачи, чья интеграция не подавала
