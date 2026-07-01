@@ -17,6 +17,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.35.0
 	github.com/twmb/franz-go v1.20.7
 	github.com/twmb/franz-go/pkg/kadm v1.17.0
+	go.etcd.io/bbolt v1.3.7
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.19.0
 )
