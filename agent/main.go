@@ -7,16 +7,21 @@
 // GoReleaser. В тикете 0.6 здесь реализован общий операционный каркас (конфиг
 // из env, slog, /healthz, graceful shutdown); тикет 3.3 добавляет WS-транспорт
 // к оркестратору (agent/internal/wsclient) — dial, hello-аутентификация,
-// авто-реконнект с backoff (docs/protocol.md §1, §4, бизнес-ТЗ §124, §126).
-// Outbox и провайдеры — EPIC 3.5/4. /healthz и graceful shutdown нужны агенту
-// уже сейчас для демонизации (systemd/launchd, FR C5) и проверок живости.
+// авто-реконнект с backoff (docs/protocol.md §1, §4, бизнес-ТЗ §124, §126);
+// тикет 3.5 добавляет локальный durable outbox (agent/internal/outbox, bbolt)
+// — durability исходящих событий агент→оркестратор переживает и рестарт
+// агента, и временную недоступность оркестратора (docs/protocol.md §5).
+// Провайдеры — EPIC 4. /healthz и graceful shutdown нужны агенту уже сейчас
+// для демонизации (systemd/launchd, FR C5) и проверок живости.
 //
 // Как устроено (тех): main — тонкий: грузит конфиг под префиксом AGENT_ через
 // общий пакет platform, поднимает каркас сервиса (slog + chi /healthz) и
-// (если задан AGENT_ORCHESTRATOR_WS_URL) WS-клиент к оркестратору, запускает
-// оба конкурентно на общем сигнал-чувствительном ctx через errgroup и
+// (если задан AGENT_ORCHESTRATOR_WS_URL) открывает outbox.Store по пути
+// AGENT_OUTBOX_PATH и WS-клиент к оркестратору поверх него, запускает оба
+// конкурентно на общем сигнал-чувствительном ctx через errgroup и
 // блокируется до SIGTERM/SIGINT, после чего оба гасятся: HTTP-сервер —
-// gracefully (как и раньше), WS-клиент — по отмене ctx (см. wsclient.Run).
+// gracefully (как и раньше), WS-клиент — по отмене ctx (см. wsclient.Run);
+// outbox.Store закрывается defer'ом ПОСЛЕ остановки обеих горутин (см. run).
 package main
 
 import (
@@ -29,6 +34,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/yarabey/agentify/agent/internal/outbox"
 	"github.com/yarabey/agentify/agent/internal/wsclient"
 	"github.com/yarabey/agentify/internal/platform"
 )
@@ -73,6 +79,16 @@ type config struct {
 	// comma-separated (например "claude,claude-code"). Пустой список
 	// допустим (агент ещё не настроил ни одного провайдера).
 	Providers []string `env:"PROVIDERS" envSeparator:","`
+
+	// OutboxPath — путь к файлу локального durable outbox (тикет 3.5,
+	// agent/internal/outbox, docs/protocol.md §1/§5). Переменная
+	// AGENT_OUTBOX_PATH. Дефолт "agent-outbox.db" — файл в рабочей
+	// директории процесса; для прод-эксплуатации (systemd/launchd, FR C5)
+	// стоит указывать абсолютный путь в персистентную директорию данных
+	// агента. Открывается ТОЛЬКО если задан OrchestratorWSURL (см. run) — при
+	// выключенном WS-транспорте outbox’у нечего доставлять, поэтому нет
+	// смысла заводить файл на диске.
+	OutboxPath string `env:"OUTBOX_PATH" envDefault:"agent-outbox.db"`
 }
 
 func main() {
@@ -111,21 +127,34 @@ func run() error {
 		return svc.Run(gctx)
 	})
 
-	// WS-транспорт (тикет 3.3): опционален. Пустой AGENT_ORCHESTRATOR_WS_URL —
-	// тихо пропускаем фичу (агент работает как в тикете 0.6, только /healthz),
-	// тот же паттерн, что в orchestrator/main.go для ORCH_DATABASE_URL. Если
-	// URL задан, IntegrationUUID становится обязательным — wsclient.New сам
-	// валидирует его непустоту и формат UUID (FR B3); провал валидации здесь —
+	// WS-транспорт (тикет 3.3) + его durable outbox (тикет 3.5): опциональны
+	// вместе. Пустой AGENT_ORCHESTRATOR_WS_URL — тихо пропускаем обе фичи
+	// (агент работает как в тикете 0.6, только /healthz; открывать файл
+	// outbox’а незачем — доставлять всё равно некуда), тот же паттерн, что в
+	// orchestrator/main.go для ORCH_DATABASE_URL. Если URL задан,
+	// IntegrationUUID становится обязательным — wsclient.New сам валидирует
+	// его непустоту и формат UUID (FR B3); провал валидации здесь —
 	// фатальная ошибка старта, а не тихий запуск без аутентификации.
 	if cfg.OrchestratorWSURL == "" {
 		svc.Logger().Warn("WS-транспорт отключён: AGENT_ORCHESTRATOR_WS_URL не задан")
 	} else {
+		// outbox.Open — ДО конструирования wsclient (durability исходящих
+		// событий обязательна конструктору wsclient.New, см. её godoc).
+		// defer store.Close() исполнится при возврате из run(), то есть уже
+		// ПОСЛЕ g.Wait() ниже — оба конкурентных цикла (HTTP-сервер,
+		// WS-клиент) успевают полностью остановиться до закрытия файла.
+		store, err := outbox.Open(cfg.OutboxPath)
+		if err != nil {
+			return fmt.Errorf("agent: не удалось открыть outbox по AGENT_OUTBOX_PATH=%q: %w", cfg.OutboxPath, err)
+		}
+		defer func() { _ = store.Close() }()
+
 		wsClient, err := wsclient.New(wsclient.Config{
 			OrchestratorWSURL: cfg.OrchestratorWSURL,
 			IntegrationUUID:   cfg.IntegrationUUID,
 			AgentVersion:      version,
 			Providers:         cfg.Providers,
-		}, wsclient.WithLogger(svc.Logger()))
+		}, store, wsclient.WithLogger(svc.Logger()))
 		if err != nil {
 			return fmt.Errorf("agent: AGENT_ORCHESTRATOR_WS_URL задан, но конфиг WS-клиента невалиден — задайте корректный AGENT_INTEGRATION_UUID (UUID, выданный при создании интеграции, см. docs/MANUAL_STEPS.md и POST /integrations, тикет 2.2): %w", err)
 		}

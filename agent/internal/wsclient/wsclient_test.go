@@ -3,7 +3,9 @@ package wsclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,14 +42,20 @@ type helloFrame struct {
 // fakeServer — минимальный сервер /machine/ws для тестов клиента: на каждое
 // входящее соединение читает первый кадр (ожидается hello), складывает его в
 // канал hellos, затем либо сразу закрывает соединение (closeAfterHello),
-// либо блокируется на чтении (имитируя устойчивое соединение) до отмены ctx
-// теста/закрытия сервера.
+// либо продолжает читать дальнейшие кадры (имитируя устойчивое соединение) —
+// каждый разбирается как конверт события (см. handleEventFrame) и
+// складывается в events; если ackEvents==true, на каждое такое событие
+// сервер сразу отвечает ack-кадром (protocol.md §5) с тем же message_id
+// (имитация оркестратора, подтверждающего событие агента).
 type fakeServer struct {
 	t               *testing.T
 	closeAfterHello bool
+	ackEvents       bool
 
 	mu     sync.Mutex
 	hellos []helloFrame
+	events []bus.Envelope
+	conns  []*websocket.Conn
 }
 
 func newFakeServer(t *testing.T, closeAfterHello bool) *fakeServer {
@@ -61,6 +69,10 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = conn.CloseNow() }()
+
+	f.mu.Lock()
+	f.conns = append(f.conns, conn)
+	f.mu.Unlock()
 
 	ctx := r.Context()
 	_, data, err := conn.Read(ctx)
@@ -88,13 +100,54 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Соединение держим живым (минимальный read-loop), пока клиент/тест не
-	// разорвёт его сам.
+	// Соединение держим живым: читаем дальнейшие кадры (события агента,
+	// тикет 3.5) до отмены ctx/разрыва соединения тестом.
 	for {
-		if _, _, err := conn.Read(ctx); err != nil {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
 			return
 		}
+		f.handleEventFrame(ctx, conn, data)
 	}
+}
+
+// handleEventFrame разбирает кадр, пришедший ПОСЛЕ hello, как конверт
+// события (тикет 3.5, wsclient.Client.SendEvent), складывает его в events и,
+// если ackEvents включён, отвечает ack-кадром с тем же message_id.
+func (f *fakeServer) handleEventFrame(ctx context.Context, conn *websocket.Conn, data []byte) {
+	var env bus.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		f.t.Errorf("fakeServer: кадр события не парсится как bus.Envelope: %v", err)
+		return
+	}
+
+	f.mu.Lock()
+	f.events = append(f.events, env)
+	f.mu.Unlock()
+
+	if !f.ackEvents {
+		return
+	}
+
+	ackPayload, err := json.Marshal(bus.AckPayload{AckMessageID: env.MessageID})
+	if err != nil {
+		f.t.Errorf("fakeServer: маршалинг ack payload: %v", err)
+		return
+	}
+	ackEnv := bus.Envelope{
+		MessageID:       bus.NewMessageID(),
+		IntegrationID:   env.IntegrationID,
+		Type:            bus.MessageTypeAck,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         ackPayload,
+	}
+	ackData, err := ackEnv.Marshal()
+	if err != nil {
+		f.t.Errorf("fakeServer: маршалинг ack-конверта: %v", err)
+		return
+	}
+	_ = conn.Write(ctx, websocket.MessageText, ackData)
 }
 
 func (f *fakeServer) helloCount() int {
@@ -107,6 +160,124 @@ func (f *fakeServer) lastHello() helloFrame {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.hellos[len(f.hellos)-1]
+}
+
+func (f *fakeServer) eventCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.events)
+}
+
+func (f *fakeServer) eventsSnapshot() []bus.Envelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]bus.Envelope, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+// closeAllConns принудительно рвёт ВСЕ WS-соединения, принятые этим
+// сервером — имитация падения оркестратора "на живую" (клиент ещё держит
+// сокет открытым). httptest.Server.CloseClientConnections/Close тут не
+// годятся: websocket.Accept хиджекает http.Conn (см. coder/websocket), а
+// net/http/httptest.Server при переходе в http.StateHijacked снимает
+// соединение со своего внутреннего учёта (net/http/httptest/server.go,
+// case http.StateHijacked) — то есть оба метода становятся no-op именно
+// для уже захваченных WS-сокетов. Закрывать их приходится самим, храня
+// ссылки на *websocket.Conn (см. ServeHTTP).
+func (f *fakeServer) closeAllConns() {
+	f.mu.Lock()
+	conns := make([]*websocket.Conn, len(f.conns))
+	copy(conns, f.conns)
+	f.mu.Unlock()
+	for _, c := range conns {
+		_ = c.CloseNow()
+	}
+}
+
+// fakeOutbox — потокобезопасная in-memory реализация wsclient.Outbox для
+// тестов (без bbolt/файловой системы — durability проверяется отдельно,
+// agent/internal/outbox/outbox_test.go; здесь важен только контракт
+// Enqueue/Pending/Delete, который и использует Client). Порядок Pending —
+// порядок Enqueue (FIFO), как и требует контракт Outbox.
+type fakeOutbox struct {
+	mu    sync.Mutex
+	order []string
+	byID  map[string]bus.Envelope
+}
+
+func newFakeOutbox() *fakeOutbox {
+	return &fakeOutbox{byID: make(map[string]bus.Envelope)}
+}
+
+func (f *fakeOutbox) Enqueue(env bus.Envelope) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.byID[env.MessageID]; !exists {
+		f.order = append(f.order, env.MessageID)
+	}
+	f.byID[env.MessageID] = env
+	return nil
+}
+
+func (f *fakeOutbox) Pending() ([]bus.Envelope, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]bus.Envelope, 0, len(f.order))
+	for _, id := range f.order {
+		if env, ok := f.byID[id]; ok {
+			out = append(out, env)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeOutbox) Delete(messageID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.byID, messageID)
+	return nil
+}
+
+func (f *fakeOutbox) len() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.byID)
+}
+
+// testEventEnvelope собирает минимальный валидный конверт события для
+// тестов SendEvent (message_id намеренно оставлен пустым — SendEvent должен
+// сгенерировать его сам, см. godoc SendEvent).
+func testEventEnvelope(integrationID string) bus.Envelope {
+	return bus.Envelope{
+		IntegrationID:   integrationID,
+		Type:            bus.MessageTypeAgentProgress,
+		Ts:              time.Now().UTC().Format(time.RFC3339),
+		ProtocolVersion: bus.ProtocolVersion,
+		Payload:         []byte(`{"text":"test progress"}`),
+	}
+}
+
+// listenOn резервирует свободный TCP-порт и сразу отдаёт связанный слушатель
+// — нужен тесту приёмки тикета 3.5 (TestSendEventSurvivesOrchestratorRestart),
+// которому нужно поднять ВТОРОЙ fake-сервер на ТОМ ЖЕ адресе после того, как
+// первый "упал" (имитация восстановления оркестратора на прежнем адресе).
+func listenOn(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("net.Listen(%s): %v", addr, err)
+	}
+	return ln
+}
+
+// newFakeServerAt поднимает httptest.Server на заранее выбранном слушателе
+// (см. listenOn) вместо случайного порта.
+func newFakeServerAt(ln net.Listener, handler http.Handler) *httptest.Server {
+	ts := httptest.NewUnstartedServer(handler)
+	ts.Listener = ln
+	ts.Start()
+	return ts
 }
 
 // wsURL преобразует http://-адрес httptest.NewServer в ws://-адрес для
@@ -142,7 +313,7 @@ func TestHelloFrameFieldsAndPayload(t *testing.T) {
 		AgentVersion:      "test-agent/1.2.3",
 		Providers:         []string{"claude", "claude-code"},
 	}
-	client, err := New(cfg, WithLogger(testLogger()), WithBackoff(5*time.Millisecond, 20*time.Millisecond))
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(5*time.Millisecond, 20*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -205,7 +376,7 @@ func TestReconnectsAfterServerCloses(t *testing.T) {
 		AgentVersion:      "test-agent/0.0.0",
 		Providers:         []string{"claude"},
 	}
-	client, err := New(cfg, WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -243,7 +414,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		AgentVersion:      "test-agent/0.0.0",
 		Providers:         []string{"claude"},
 	}
-	client, err := New(cfg, WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	client, err := New(cfg, newFakeOutbox(), WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -280,21 +451,28 @@ func TestNewValidatesConfig(t *testing.T) {
 	validUUID := uuid.NewString()
 
 	t.Run("empty url", func(t *testing.T) {
-		_, err := New(Config{OrchestratorWSURL: "", IntegrationUUID: validUUID})
+		_, err := New(Config{OrchestratorWSURL: "", IntegrationUUID: validUUID}, newFakeOutbox())
 		if err == nil {
 			t.Fatal("ожидалась ошибка на пустом OrchestratorWSURL")
 		}
 	})
 
 	t.Run("invalid uuid", func(t *testing.T) {
-		_, err := New(Config{OrchestratorWSURL: "ws://example.invalid/machine/ws", IntegrationUUID: "not-a-uuid"})
+		_, err := New(Config{OrchestratorWSURL: "ws://example.invalid/machine/ws", IntegrationUUID: "not-a-uuid"}, newFakeOutbox())
 		if err == nil {
 			t.Fatal("ожидалась ошибка на невалидном IntegrationUUID")
 		}
 	})
 
+	t.Run("nil outbox", func(t *testing.T) {
+		_, err := New(Config{OrchestratorWSURL: "ws://example.invalid/machine/ws", IntegrationUUID: validUUID}, nil)
+		if !errors.Is(err, ErrNilOutbox) {
+			t.Fatalf("ошибка = %v, want ErrNilOutbox", err)
+		}
+	})
+
 	t.Run("valid", func(t *testing.T) {
-		c, err := New(Config{OrchestratorWSURL: "ws://example.invalid/machine/ws", IntegrationUUID: validUUID})
+		c, err := New(Config{OrchestratorWSURL: "ws://example.invalid/machine/ws", IntegrationUUID: validUUID}, newFakeOutbox())
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -317,4 +495,240 @@ func waitForHellos(t *testing.T, srv *fakeServer, n int, timeout time.Duration) 
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("не дождались %d hello-кадров за %s (получено %d)", n, timeout, srv.helloCount())
+}
+
+// waitForEvents ждёт, пока fake-сервер не увидит минимум n кадров событий
+// (см. fakeServer.handleEventFrame), опрашивая eventCount с коротким
+// интервалом — тот же приём, что waitForHellos.
+func waitForEvents(t *testing.T, srv *fakeServer, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if srv.eventCount() >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("не дождались %d событий за %s (получено %d)", n, timeout, srv.eventCount())
+}
+
+// waitForOutboxEmpty ждёт, пока outbox не опустеет (Pending() == 0),
+// опрашивая с коротким интервалом — тот же приём, что waitForHellos.
+func waitForOutboxEmpty(t *testing.T, out *fakeOutbox, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if out.len() == 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("outbox не опустел за %s (осталось %d)", timeout, out.len())
+}
+
+// TestSendEventDeliversToConnectedServer проверяет базовый happy-path
+// SendEvent: пока клиент подключён, событие durable-записывается в outbox и
+// доставляется fake-серверу по WS (тикет 3.5, protocol.md §5, шаг 1
+// "кладёт событие в локальный outbox → шлёт по WS").
+func TestSendEventDeliversToConnectedServer(t *testing.T) {
+	srv := newFakeServer(t, false /* держим соединение живым, не подтверждаем ack */)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: wsURL(ts),
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude"},
+	}
+	out := newFakeOutbox()
+	client, err := New(cfg, out, WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv, 1, 3*time.Second)
+
+	env := testEventEnvelope(integrationUUID)
+	if err := client.SendEvent(context.Background(), env); err != nil {
+		t.Fatalf("SendEvent: %v", err)
+	}
+
+	waitForEvents(t, srv, 1, 3*time.Second)
+
+	got := srv.eventsSnapshot()[0]
+	if got.Type != bus.MessageTypeAgentProgress {
+		t.Fatalf("type = %q, want %q", got.Type, bus.MessageTypeAgentProgress)
+	}
+	if got.IntegrationID != integrationUUID {
+		t.Fatalf("integration_id = %q, want %q", got.IntegrationID, integrationUUID)
+	}
+	if got.MessageID == "" {
+		t.Fatal("SendEvent должен был сгенерировать message_id (был пуст в исходном конверте)")
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestSendEventBeforeConnectStaysInOutbox проверяет, что SendEvent,
+// вызванный когда серверу физически некуда доставить событие (сервер ещё не
+// поднят/недоступен), не блокируется навечно и не паникует — событие
+// остаётся в outbox (Pending непуст), как и требует контракт SendEvent
+// (durable-запись ДО сети, см. её godoc).
+func TestSendEventBeforeConnectStaysInOutbox(t *testing.T) {
+	// Резервируем адрес, но сервер на нём не поднимаем — dial будет
+	// стабильно проваливаться (connection refused).
+	ln := listenOn(t, "127.0.0.1:0")
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("ln.Close: %v", err)
+	}
+
+	out := newFakeOutbox()
+	cfg := Config{
+		OrchestratorWSURL: "ws://" + addr + "/machine/ws",
+		IntegrationUUID:   uuid.NewString(),
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude"},
+	}
+	client, err := New(cfg, out, WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	env := testEventEnvelope(cfg.IntegrationUUID)
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), time.Second)
+	defer sendCancel()
+	if err := client.SendEvent(sendCtx, env); err != nil {
+		t.Fatalf("SendEvent: %v", err)
+	}
+
+	// Durable-запись в outbox синхронна внутри SendEvent (см. её godoc) —
+	// сразу после возврата событие уже должно быть видно в Pending,
+	// независимо от состояния сети.
+	pending, err := out.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("len(pending) = %d, want 1 (событие должно остаться в outbox, сервер недоступен)", len(pending))
+	}
+	// env передавался в SendEvent по значению с пустым MessageID (см.
+	// testEventEnvelope) — SendEvent сам сгенерировал id для durable-записи,
+	// поэтому здесь просто проверяем, что в outbox лежит непустой message_id.
+	if pending[0].MessageID == "" {
+		t.Fatal("message_id в outbox пуст")
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client.Run не завершился после отмены ctx (завис)")
+	}
+}
+
+// TestSendEventSurvivesOrchestratorRestart — ключевой тест приёмки тикета
+// 3.5 (docs/MVP_TICKETS.md 3.5 "убить оркестратор на время → события агента
+// не потеряны"): клиент подключается к первому fake-серверу, SendEvent
+// кладёт событие в outbox и отправляет его по WS; сервер получает конверт,
+// но НЕ отвечает ack — затем тест обрывает это соединение (имитация падения
+// оркестратора ДО ack). Клиент должен обнаружить разрыв и уйти в
+// backoff/реконнект, не потеряв событие (оно остаётся в outbox, т.к. ack не
+// был получен). Когда на ТОМ ЖЕ адресе поднимается второй fake-сервер
+// (имитация восстановления оркестратора) и уже отвечает ack, клиент должен
+// переподключиться, переотправить событие (redelivery "при следующем
+// коннекте", protocol.md §5) и получить ack — после чего outbox должен
+// опустеть.
+func TestSendEventSurvivesOrchestratorRestart(t *testing.T) {
+	ln1 := listenOn(t, "127.0.0.1:0")
+	addr := ln1.Addr().String()
+
+	srv1 := newFakeServer(t, false /* держим соединение живым, ack НЕ шлём */)
+	ts1 := newFakeServerAt(ln1, srv1)
+
+	integrationUUID := uuid.NewString()
+	cfg := Config{
+		OrchestratorWSURL: "ws://" + addr + "/machine/ws",
+		IntegrationUUID:   integrationUUID,
+		AgentVersion:      "test-agent/0.0.0",
+		Providers:         []string{"claude"},
+	}
+	out := newFakeOutbox()
+	client, err := New(cfg, out, WithLogger(testLogger()), WithBackoff(2*time.Millisecond, 20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(ctx) }()
+
+	waitForHellos(t, srv1, 1, 5*time.Second)
+
+	env := testEventEnvelope(integrationUUID)
+	if err := client.SendEvent(context.Background(), env); err != nil {
+		t.Fatalf("SendEvent: %v", err)
+	}
+
+	// Сервер №1 получил конверт, но ack не пришлёт — событие должно
+	// остаться в outbox (ack ещё не было).
+	waitForEvents(t, srv1, 1, 5*time.Second)
+	if out.len() != 1 {
+		t.Fatalf("outbox.len() = %d, want 1 (событие ещё не подтверждено)", out.len())
+	}
+
+	// "Убиваем" оркестратор: разрываем соединение и останавливаем сервер №1
+	// ДО получения ack. closeAllConns принудительно рвёт открытый WS-сокет
+	// (см. её godoc — httptest.Server.CloseClientConnections/Close тут не
+	// годятся, они не видят уже хиджекнутые соединения); только после этого
+	// ts1.Close() не виснет, ожидая завершения хендлера.
+	srv1.closeAllConns()
+	ts1.Close()
+
+	// Поднимаем сервер №2 на ТОМ ЖЕ адресе (имитация восстановления
+	// оркестратора) — на этот раз он отвечает ack на полученные события.
+	ln2 := listenOn(t, addr)
+	srv2 := newFakeServer(t, false)
+	srv2.ackEvents = true
+	ts2 := newFakeServerAt(ln2, srv2)
+	defer ts2.Close()
+
+	// Клиент должен переподключиться (backoff — миллисекунды, см. New выше)
+	// и переотправить неподтверждённое событие серверу №2.
+	waitForHellos(t, srv2, 1, 10*time.Second)
+	waitForEvents(t, srv2, 1, 10*time.Second)
+
+	got := srv2.eventsSnapshot()[0]
+	if got.IntegrationID != integrationUUID {
+		t.Fatalf("integration_id = %q, want %q", got.IntegrationID, integrationUUID)
+	}
+
+	// Ack от сервера №2 должен опустошить outbox — "ничего не потеряно"
+	// доказано: событие пережило обрыв соединения и было доставлено после
+	// восстановления.
+	waitForOutboxEmpty(t, out, 10*time.Second)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client.Run не завершился после отмены ctx (завис)")
+	}
 }
