@@ -93,6 +93,15 @@ services:
       BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-info}
       BOT_LOG_FORMAT: ${BOT_LOG_FORMAT:-json}
       BOT_HEALTH_ADDR: ":8080"
+      # Telegram-webhook (тикет 10.1, FR D1). Все три — из deploy/.env; пустые в
+      # dev (тогда бот поднимает только /healthz и не падает без токена).
+      # Секреты (BOT_TOKEN, BOT_WEBHOOK_SECRET) НЕ коммитятся — в проде их пишет
+      # deploy-workflow в deploy/.env из GitHub Secrets (см. MANUAL_STEPS.md §3).
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET:-}
+      # Публичный адрес бота за Caddy (https://bot.<домен>); задан → на старте
+      # регистрируется webhook в Telegram. Пусто в dev.
+      BOT_PUBLIC_URL: ${BOT_PUBLIC_URL:-}
     depends_on:
       redpanda:
         condition: service_healthy
