@@ -389,10 +389,10 @@ func run() error {
 			// пользователя ПЕРЕД публикацией (см. годок пакета) — бот (тикет
 			// 10.4) получает уже готовый chat_id/текст. Регистрируется ЗАМЕНОЙ
 			// notifier'а, установленного выше (server.SetNotifier(server.
-			// ClientConnHub())): multiNotifier рассылает КАЖДОМУ активному
-			// каналу безусловно (наивный fan-out до появления тикета 7.4
-			// «Маршрутизация каналов» — см. notify_fanout.go), поэтому web
-			// продолжает получать уведомления ровно как раньше.
+			// ClientConnHub())): multiNotifier применяет политику маршрутизации
+			// тикета 7.4 (FR G2, см. годок notify_fanout.go) — ДУБЛИРОВАТЬ в
+			// КАЖДЫЙ активный канал безусловно, поэтому web продолжает получать
+			// уведомления ровно как раньше.
 			telegramNotifier, err := telegram.NewNotifier(producer, db.New(pool))
 			if err != nil {
 				return fmt.Errorf("orchestrator: сборка telegram.Notifier: %w", err)
