@@ -18,7 +18,7 @@ Telegram-агностиком (FR D1, D4, G2).
 
 Бот деплоится на наш VPS в составе `docker compose` за Caddy (`bot.<домен>`).
 
-## Что реализовано сейчас (тикеты 0.6, 10.1)
+## Что реализовано сейчас (тикеты 0.6, 10.1, 10.2)
 
 **Общий операционный каркас** из пакета
 [`internal/platform`](../internal/platform): загрузка конфига из env, slog,
@@ -32,9 +32,30 @@ chi-роутер, что и `/healthz`, по **секретному пути** �
 сверяет заголовок `X-Telegram-Bot-Api-Secret-Token`, декодирует апдейт, логирует
 факт приёма и передаёт его в маршрутизатор telebot (`bot.ProcessUpdate`). При
 старте, если задан публичный URL, webhook регистрируется в Telegram
-(`SetWebhook`). Команды `/start`, привязка аккаунта и действия — тикеты
-10.2/10.3; consumer уведомлений — тикет 10.4. Пока ни одного хендлера не
-зарегистрировано: апдейт логируется и маршрутизация — no-op.
+(`SetWebhook`).
+
+**Привязка Telegram-аккаунта — `/start <code>`** (тикет 10.2, FR D3
+«привязка канала к аккаунту описана явно», Gherkin §6 «Уведомления»,
+предусловие сценария «Уведомление в Telegram») — первый реальный хендлер, зарегистрированный
+через `bot.Handle("/start", ...)` (см. [`bot/start.go`](start.go)). Пользователь
+генерирует одноразовый код привязки в web (тикет 9.6, `POST
+/channels/telegram/link-code` — **пока не реализован**, код для локальной
+проверки нужно вставить в БД напрямую, см. «Запуск локально» ниже) и
+пересылает его боту как deep-link (`t.me/<bot>?start=<code>`) либо вручную
+(`/start <code>`) — Telegram доставляет оба варианта одинаково текстом команды
+с payload после пробела. Обработчик вызывает единый API оркестратора —
+[`bot/internal/orchestrator`](internal/orchestrator).`Client.LinkTelegram` →
+`POST /channels/telegram/link` (без Bearer: код — единственное доказательство
+права на привязку, та же модель доверия, что у `registration_token` в `POST
+/auth/register`) — и отвечает пользователю понятным текстом: успех, либо
+конкретная причина отказа (код не найден / истёк / уже использован /
+telegram-аккаунт уже привязан к другому пользователю). Вся бизнес-логика
+(проверка кода, атомарная запись `channel_links`) — в оркестраторе
+(`orchestrator/internal/channel.Linker`, см. `orchestrator/README.md`), бот
+только адаптирует HTTP↔Telegram (принцип «единый API»).
+
+Постановка/отмена задачи и ответ на вопрос агента из Telegram — тикет 10.3;
+consumer уведомлений — тикет 10.4. Хендлеры для них пока не зарегистрированы.
 
 `GET /healthz` отвечает `200` и телом `{"status":"ok","service":"bot"}` — нужно
 `docker compose` и Caddy для проверки живости (приёмка тикета 0.3).
@@ -55,6 +76,7 @@ chi-роутер, что и `/healthz`, по **секретному пути** �
 | `BOT_TOKEN` | *(пусто)* | **Секрет.** Токен бота от @BotFather (FR D1). Пусто → Telegram-часть отключена, только `/healthz`. НЕ коммитить. |
 | `BOT_WEBHOOK_SECRET` | *(пусто)* | **Секрет.** Секрет в пути `/webhook/<secret>` и как `secret_token` Telegram. Обязателен при заданном `BOT_PUBLIC_URL` (иначе фатальная ошибка старта). НЕ коммитить. |
 | `BOT_PUBLIC_URL` | *(пусто)* | Внешний базовый URL бота за Caddy (например `https://bot.<домен>`). Задан → webhook регистрируется в Telegram (`SetWebhook`). Пусто → webhook не регистрируется (dev). |
+| `BOT_ORCHESTRATOR_URL` | *(пусто)* | Базовый URL API оркестратора (тикет 10.2, FR D3), нужен `/start <code>` для обмена кода привязки. Внутри `docker compose` — `http://orchestrator:8080` (внутренний DNS, напрямую, минуя Caddy). Пусто → `/start <code>` отвечает «функция недоступна» вместо обращения к оркестратору (dev/CI без БД). |
 
 > **Секреты** (`BOT_TOKEN`, `BOT_WEBHOOK_SECRET`) в репозиторий не коммитятся:
 > задаются через окружение хоста / GitHub Secrets. `BOT_TOKEN` — это
@@ -76,6 +98,15 @@ BOT_TOKEN=123:ABC BOT_WEBHOOK_SECRET=devsecret go run ./bot
 curl -s -XPOST localhost:8080/webhook/devsecret \
   -H 'X-Telegram-Bot-Api-Secret-Token: devsecret' \
   -d '{"update_id":1,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"text":"/start"}}'
+
+# С привязкой аккаунта (тикет 10.2) — нужен ещё и запущенный оркестратор:
+BOT_TOKEN=123:ABC BOT_WEBHOOK_SECRET=devsecret BOT_ORCHESTRATOR_URL=http://localhost:8081 go run ./bot
+# Код привязки в MVP пока создаётся напрямую в БД (POST /channels/telegram/link-code — тикет 9.6):
+#   INSERT INTO channel_link_codes (code, user_id, channel, expires_at)
+#   VALUES ('devcode', '<user_id>', 'telegram', now() + interval '1 hour');
+curl -s -XPOST localhost:8080/webhook/devsecret \
+  -H 'X-Telegram-Bot-Api-Secret-Token: devsecret' \
+  -d '{"update_id":2,"message":{"message_id":2,"from":{"id":999,"first_name":"U"},"chat":{"id":999,"type":"private"},"text":"/start devcode"}}'
 ```
 
 Остановка — `Ctrl+C` (SIGINT) или `kill -TERM <pid>`: сервис гасится gracefully.

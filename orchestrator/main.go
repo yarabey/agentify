@@ -42,6 +42,7 @@ import (
 	"github.com/yarabey/agentify/internal/platform"
 	"github.com/yarabey/agentify/orchestrator/internal/api"
 	"github.com/yarabey/agentify/orchestrator/internal/bridge"
+	"github.com/yarabey/agentify/orchestrator/internal/channel"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
 	"github.com/yarabey/agentify/orchestrator/internal/presence"
@@ -252,6 +253,10 @@ func run() error {
 		// под общим подключом (task.EventPayloadKeyPurpose). Ключи обязаны
 		// совпадать, иначе GCM-тег не сойдётся.
 		server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)))
+		// Обмен кода привязки Telegram-аккаунта (тикет 10.2, FR D3): не зависит
+		// от Redpanda, только от БД — регистрируется здесь же безусловно, тем
+		// же принципом, что и SetTransitioner/SetNotifier ниже.
+		server.SetChannelLinker(channel.NewLinker(pool))
 		// Web-канал доставки уведомлений (тикет 7.2, FR G1): ClientConnHub —
 		// реестр активных WS-соединений браузера (server.ClientConnHub(),
 		// заведён в NewServer безусловно, в отличие от опциональных

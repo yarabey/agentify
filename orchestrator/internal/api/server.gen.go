@@ -29,6 +29,9 @@ type ServerInterface interface {
 	// Регистрация по токену регистрации
 	// (POST /auth/register)
 	PostAuthRegister(w http.ResponseWriter, r *http.Request)
+	// Обменять код привязки на привязку Telegram-аккаунта
+	// (POST /channels/telegram/link)
+	PostChannelsTelegramLink(w http.ResponseWriter, r *http.Request)
 	// Сгенерировать код привязки Telegram
 	// (POST /channels/telegram/link-code)
 	PostChannelsTelegramLinkCode(w http.ResponseWriter, r *http.Request)
@@ -116,6 +119,12 @@ func (_ Unimplemented) PostAuthRefresh(w http.ResponseWriter, r *http.Request) {
 // Регистрация по токену регистрации
 // (POST /auth/register)
 func (_ Unimplemented) PostAuthRegister(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Обменять код привязки на привязку Telegram-аккаунта
+// (POST /channels/telegram/link)
+func (_ Unimplemented) PostChannelsTelegramLink(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -309,6 +318,20 @@ func (siw *ServerInterfaceWrapper) PostAuthRegister(w http.ResponseWriter, r *ht
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PostAuthRegister(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostChannelsTelegramLink operation middleware
+func (siw *ServerInterfaceWrapper) PostChannelsTelegramLink(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostChannelsTelegramLink(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -959,6 +982,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/auth/register", wrapper.PostAuthRegister)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/channels/telegram/link", wrapper.PostChannelsTelegramLink)
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/channels/telegram/link-code", wrapper.PostChannelsTelegramLinkCode)

@@ -271,6 +271,15 @@ type Server struct {
 	// SetCommandPublisher.
 	commandPublisher   CommandPublisher
 	commandPublisherMu sync.RWMutex
+
+	// channelLinker — обмен одноразового кода привязки канала на запись
+	// channel_links (тикет 10.2, FR D3, см. ChannelLinker). nil по умолчанию
+	// — штатно, если БД не настроена (каркасные прогоны/тесты без
+	// ORCH_DATABASE_URL, как у ackSink/eventSink/notifier); тогда
+	// PostChannelsTelegramLink отвечает 500, а не паникует. Регистрируется
+	// один раз при старте через SetChannelLinker.
+	channelLinker   ChannelLinker
+	channelLinkerMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -358,6 +367,17 @@ type taskTransitioner interface {
 	// RecordEvent — см. task.Transitioner.RecordEvent (тикет 8.5): атомарно
 	// пишет событие БЕЗ смены статуса (agent_progress, FR E6).
 	RecordEvent(ctx context.Context, taskID pgtype.UUID, eventType string, refEventID pgtype.UUID, eventPayload []byte) (seq int64, err error)
+}
+
+// ChannelLinker — узкий интерфейс на *channel.Linker.Exchange (тикет 10.2, FR
+// D3), нужный PostChannelsTelegramLink (channels.go) для обмена одноразового
+// кода привязки на запись channel_links. Та же граница между
+// транспортным/API-слоем и бизнес-подсистемой, что и у taskTransitioner —
+// сужение до одного метода упрощает юнит-тесты обработчика (фейк вместо
+// реального *pgxpool.Pool, который требует channel.Linker). *channel.Linker
+// удовлетворяет этому интерфейсу структурно.
+type ChannelLinker interface {
+	Exchange(ctx context.Context, channelName, code, externalID string) (link db.ChannelLink, err error)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -556,6 +576,25 @@ func (s *Server) getCommandPublisher() CommandPublisher {
 	s.commandPublisherMu.RLock()
 	defer s.commandPublisherMu.RUnlock()
 	return s.commandPublisher
+}
+
+// SetChannelLinker регистрирует обменник кода привязки канала (тикет 10.2,
+// см. ChannelLinker). Вызывается ОДИН раз при старте (orchestrator/main.go),
+// сразу после NewServer, до начала обслуживания HTTP-трафика; nil —
+// допустимое значение (в т.ч. явный сброс) — тогда PostChannelsTelegramLink
+// отвечает 500 (см. godoc поля channelLinker).
+func (s *Server) SetChannelLinker(l ChannelLinker) {
+	s.channelLinkerMu.Lock()
+	defer s.channelLinkerMu.Unlock()
+	s.channelLinker = l
+}
+
+// getChannelLinker читает текущий ChannelLinker под channelLinkerMu (см.
+// godoc полей Server).
+func (s *Server) getChannelLinker() ChannelLinker {
+	s.channelLinkerMu.RLock()
+	defer s.channelLinkerMu.RUnlock()
+	return s.channelLinker
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

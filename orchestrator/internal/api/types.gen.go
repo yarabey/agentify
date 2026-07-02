@@ -13,6 +13,11 @@ const (
 	BearerAuthScopes = "bearerAuth.Scopes"
 )
 
+// Defines values for ChannelLinkChannel.
+const (
+	Telegram ChannelLinkChannel = "telegram"
+)
+
 // Defines values for IntegrationStatus.
 const (
 	IntegrationStatusOffline IntegrationStatus = "offline"
@@ -55,6 +60,27 @@ const (
 	Approve PostTasksIdApproveJSONBodyDecision = "approve"
 	Reject  PostTasksIdApproveJSONBodyDecision = "reject"
 )
+
+// ChannelLink Привязка внешнего канала к аккаунту (FR D3).
+type ChannelLink struct {
+	Channel   *ChannelLinkChannel `json:"channel,omitempty"`
+	CreatedAt *time.Time          `json:"created_at,omitempty"`
+
+	// ExternalId telegram_user_id привязанного Telegram-аккаунта
+	ExternalId *string `json:"external_id,omitempty"`
+}
+
+// ChannelLinkChannel defines model for ChannelLink.Channel.
+type ChannelLinkChannel string
+
+// ChannelLinkRequest Тело POST /channels/telegram/link (FR D3, тикет 10.2).
+type ChannelLinkRequest struct {
+	// Code Одноразовый код привязки из POST /channels/telegram/link-code (тикет 9.6).
+	Code string `json:"code"`
+
+	// TelegramUserId Telegram user id отправителя /start <code> (числовой id Telegram, передаётся строкой — channel_links.external_id хранит идентификатор как TEXT, канало-агностично).
+	TelegramUserId string `json:"telegram_user_id"`
+}
 
 // Error defines model for Error.
 type Error struct {
@@ -242,6 +268,9 @@ type PostAuthRefreshJSONRequestBody PostAuthRefreshJSONBody
 
 // PostAuthRegisterJSONRequestBody defines body for PostAuthRegister for application/json ContentType.
 type PostAuthRegisterJSONRequestBody = RegisterRequest
+
+// PostChannelsTelegramLinkJSONRequestBody defines body for PostChannelsTelegramLink for application/json ContentType.
+type PostChannelsTelegramLinkJSONRequestBody = ChannelLinkRequest
 
 // PostIntegrationsJSONRequestBody defines body for PostIntegrations for application/json ContentType.
 type PostIntegrationsJSONRequestBody = IntegrationCreate
