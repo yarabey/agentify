@@ -16,12 +16,13 @@ openssl rand -base64 48   # JWT_SIGNING_KEY
 openssl rand -base64 32   # APP_ENCRYPTION_KEY
 openssl rand -base64 24   # POSTGRES_PASSWORD
 openssl rand -hex 16      # INITIAL_REGISTRATION_TOKEN
+openssl rand -hex 16      # BOT_WEBHOOK_SECRET (секрет пути webhook бота, тикет 10.1)
 openssl rand -base64 18   # BOOTSTRAP_ADMIN_PASSWORD (пароль первого администратора)
 ```
 `BOOTSTRAP_ADMIN_USERNAME` — не секрет, просто логин первого администратора (например, `admin`), придумать самому.
 
 ## 3. Положить в GitHub → Settings → Secrets (Actions, окружение `prod`)
-`SSH_DEPLOY_KEY`, `SSH_HOST`, `SSH_USER`, `JWT_SIGNING_KEY`, `APP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `INITIAL_REGISTRATION_TOKEN`, `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`.
+`SSH_DEPLOY_KEY`, `SSH_HOST`, `SSH_USER`, `JWT_SIGNING_KEY`, `APP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN` (→ `BOT_TOKEN`), `BOT_WEBHOOK_SECRET`, `INITIAL_REGISTRATION_TOKEN`, `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`.
 - [ ] Создать окружение **`prod`** с **required reviewer = ты** (защита деплоя).
 - [ ] Включить **GHCR** (Actions: `packages: write`) и **Releases** (`contents: write`).
 - [ ] Branch protection на `main`: PR + зелёный CI + ≥1 ревью.
@@ -35,7 +36,7 @@ openssl rand -base64 18   # BOOTSTRAP_ADMIN_PASSWORD (пароль первог�
 - [ ] **«Критическая операция»** при отмене — какие операции агент доводит до конца ради сохранности данных.
 
 ## 5. Разово в процессе
-- [ ] После первого деплоя бота — выставить webhook бота на `https://bot.<домен>/...` (агент даст точный путь).
+- [ ] Webhook бота регистрируется **автоматически** при старте, если задан `BOT_PUBLIC_URL` (тикет 10.1): бот сам вызывает `SetWebhook` на адрес `https://bot.<домен>/webhook/<BOT_WEBHOOK_SECRET>`. Руками ничего выставлять не нужно — достаточно положить `BOT_TOKEN`, `BOT_WEBHOOK_SECRET`, `BOT_PUBLIC_URL` в окружение (см. `bot/README.md`).
 - [ ] Иметь **чистую тестовую macOS/Ubuntu** для проверки установки агента «одной командой» (EPIC 4).
 
 Всё. Дальше — запускаешь агента промптом из ответа.
