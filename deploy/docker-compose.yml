@@ -122,6 +122,11 @@ services:
       # сервиса orchestrator выше (см. комментарий там про гарантированное
       # совпадение значений).
       BOT_SERVICE_SECRET: ${BOT_SERVICE_SECRET:-}
+      # Seed-брокер Redpanda для consumer'а notifications.telegram (тикет
+      # 10.4, FR G1, ADR 0001, consumer group "telegram-bot") — та же
+      # переменная compose-сети, что и ORCH_REDPANDA_SEEDS у orchestrator
+      # выше (публикует оркестратор, тикет 7.3, см. orchestrator/README.md).
+      BOT_REDPANDA_SEEDS: redpanda:9092
     depends_on:
       orchestrator:
         condition: service_started

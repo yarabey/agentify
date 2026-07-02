@@ -123,6 +123,41 @@ func (q *Queries) GetChannelLinkByChannelAndExternalID(ctx context.Context, arg 
 	return i, err
 }
 
+const getChannelLinkByUserAndChannel = `-- name: GetChannelLinkByUserAndChannel :one
+SELECT id, user_id, channel, external_id, created_at FROM channel_links WHERE user_id = $1 AND channel = $2 ORDER BY created_at DESC LIMIT 1
+`
+
+type GetChannelLinkByUserAndChannelParams struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	Channel string      `json:"channel"`
+}
+
+// Резолвит external_id (напр. telegram_user_id) по (user_id, channel) —
+// ПРЯМОЕ направление по отношению к GetChannelLinkByChannelAndExternalID выше
+// (user_id → external_id, а не наоборот). Нужен тикету 7.3 (публикация
+// уведомления в notifications.telegram, orchestrator/internal/notify/telegram):
+// при формировании уведомления для user_id оркестратор проверяет, есть ли у
+// него активная привязка Telegram, и если да — публикует уведомление сразу с
+// telegram_chat_id внутри payload (простой путь без резолва на стороне бота,
+// принцип «единый API» — оркестратор единственный владелец channel_links).
+// Схема НЕ гарантирует UNIQUE(user_id, channel) (только UNIQUE(channel,
+// external_id), см. миграцию 00004) — теоретически один пользователь мог бы
+// привязать несколько разных Telegram-аккаунтов последовательными кодами;
+// берём САМУЮ СВЕЖУЮ привязку (ORDER BY created_at DESC). Нет привязки →
+// pgx.ErrNoRows (штатно — Telegram-канал для этого user_id просто не активен).
+func (q *Queries) GetChannelLinkByUserAndChannel(ctx context.Context, arg GetChannelLinkByUserAndChannelParams) (ChannelLink, error) {
+	row := q.db.QueryRow(ctx, getChannelLinkByUserAndChannel, arg.UserID, arg.Channel)
+	var i ChannelLink
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Channel,
+		&i.ExternalID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getChannelLinkCode = `-- name: GetChannelLinkCode :one
 SELECT code, user_id, channel, expires_at, used_at, created_at FROM channel_link_codes WHERE code = $1
 `
