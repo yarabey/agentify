@@ -27,9 +27,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
+
+// staleWorkerTestMasterKey — тестовый мастер-ключ шифрования (ровно 32 байта),
+// которым StaleWorker.Transitioner шифрует payload_enc событий status_change
+// (FR I1, тикет 11.1); lastStatusChangePayload расшифровывает тем же подключом.
+var staleWorkerTestMasterKey = []byte("0123456789abcdef0123456789abcdef")
 
 // setIntegrationLastSeenAt — прямой UPDATE integrations.last_seen_at, минуя
 // heartbeat-consumer/MarkIntegrationOnline (эмуляция ухода/возврата машины,
@@ -70,8 +76,14 @@ func lastStatusChangePayload(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	if err != nil {
 		t.Fatalf("прочитать последний status_change: %v", err)
 	}
+	// payload_enc зашифрован at-rest (FR I1, тикет 11.1) — расшифровываем тем же
+	// подключом, что и Transitioner при записи.
+	plaintext, derr := crypto.Decrypt(crypto.DeriveKey(staleWorkerTestMasterKey, task.EventPayloadKeyPurpose), raw)
+	if derr != nil {
+		t.Fatalf("расшифровать payload_enc status_change: %v", derr)
+	}
 	var payload statusChangeEventPayload
-	if uerr := json.Unmarshal(raw, &payload); uerr != nil {
+	if uerr := json.Unmarshal(plaintext, &payload); uerr != nil {
 		t.Fatalf("разобрать payload_enc status_change: %v", uerr)
 	}
 	return payload
@@ -126,7 +138,7 @@ func TestIntegration_StaleWorker_StaleThenRecovered(t *testing.T) {
 	q := db.New(pool)
 	taskID := seedTask(ctx, t, pool, q, "stale-worker-owner")
 
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey(staleWorkerTestMasterKey))
 	// Довести задачу до running (стартовый статус created).
 	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
 		if _, _, err := tr.Transition(ctx, taskID, trigger); err != nil {

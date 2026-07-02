@@ -181,11 +181,17 @@ func (f fakeQuerier) GetIntegrationByUUIDHMAC(context.Context, string) (db.Integ
 	return f.getIntegrationByUUIDHMACResult, nil
 }
 
-func (f fakeQuerier) CreateTask(context.Context, db.CreateTaskParams) (db.Task, error) {
+func (f fakeQuerier) CreateTask(_ context.Context, arg db.CreateTaskParams) (db.Task, error) {
 	if f.createTaskErr != nil {
 		return db.Task{}, f.createTaskErr
 	}
-	return f.createTaskResult, nil
+	// Эхо-семантика RETURNING: реальный INSERT возвращает вставленный
+	// (уже зашифрованный, FR I1, тикет 11.1) text_enc, а не пресет фикстуры —
+	// так toTask на выходе PostTasks расшифровывает ровно то, что зашифровал
+	// обработчик, и тест получает исходный текст обратно.
+	res := f.createTaskResult
+	res.TextEnc = arg.TextEnc
+	return res, nil
 }
 
 func (f fakeQuerier) GetTaskByUserAndIdempotencyKey(context.Context, db.GetTaskByUserAndIdempotencyKeyParams) (db.Task, error) {

@@ -75,6 +75,18 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
 
+// mustEncTaskTextForTasks шифрует text_enc тем же подключом, что и рабочий
+// Server (testEncryptionKey32), чтобы засеянная напрямую в БД задача читалась
+// через API с расшифровкой обратно в исходный текст (FR I1, тикет 11.1).
+func mustEncTaskTextForTasks(t *testing.T, text string) []byte {
+	t.Helper()
+	enc, err := api.EncryptTaskTextForTest([]byte(testEncryptionKey32), text)
+	if err != nil {
+		t.Fatalf("EncryptTaskTextForTest: %v", err)
+	}
+	return enc
+}
+
 // startRedpandaForTasks поднимает одиночный брокер Redpanda в контейнере —
 // копия помощника bridge_integration_test.go (пакеты не шарят неэкспортированные
 // тестовые хелперы, см. godoc файла).
@@ -220,8 +232,14 @@ func findAgentQuestionEventID(ctx context.Context, t *testing.T, q *db.Queries, 
 	}
 	wanted := questionID.String()
 	for _, e := range events {
+		// payload_enc зашифрован at-rest (FR I1, тикет 11.1) — расшифровываем
+		// тем же подключом, что и рабочий Server, перед разбором.
+		plaintext, derr := api.DecryptEventPayloadForTest([]byte(testEncryptionKey32), e.PayloadEnc)
+		if derr != nil {
+			continue
+		}
 		var payload bus.AgentQuestionPayload
-		if uerr := json.Unmarshal(e.PayloadEnc, &payload); uerr != nil {
+		if uerr := json.Unmarshal(plaintext, &payload); uerr != nil {
 			continue
 		}
 		if payload.QuestionID == wanted {
@@ -258,7 +276,7 @@ func TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding(t *testing.T) 
 	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         user.ID,
 		IntegrationID:  integration.ID,
-		TextEnc:        []byte("сделай две вещи по очереди"),
+		TextEnc:        mustEncTaskTextForTasks(t, "сделай две вещи по очереди"),
 		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
@@ -266,7 +284,7 @@ func TestIntegration_PostTasksIdAnswer_TwoQuestionsCorrectBinding(t *testing.T) 
 	}
 	taskID := taskRow.ID
 
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32)))
 
 	// Довести задачу до running обычным Transition (created→queued→running).
 	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
@@ -409,7 +427,7 @@ func TestIntegration_PostTasks_HappyPath(t *testing.T) {
 	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine")
 
 	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
-	server.SetTransitioner(task.NewTransitioner(pool))
+	server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32))))
 	server.SetCommandPublisher(producer)
 	router := api.NewRouter(server)
 
@@ -530,7 +548,7 @@ func TestIntegration_PostTasks_ForeignIntegrationNotFound(t *testing.T) {
 	_, bobToken := createTestUserWithToken(ctx, t, q, "bob-tasks-other")
 
 	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
-	server.SetTransitioner(task.NewTransitioner(pool))
+	server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32))))
 	server.SetCommandPublisher(producer)
 	router := api.NewRouter(server)
 
@@ -609,7 +627,7 @@ func TestIntegration_PostTasks_DuplicateIdempotencyKeyReturnsExisting(t *testing
 	integration := createTestIntegration(ctx, t, q, user.ID, "alice-machine-dup")
 
 	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
-	server.SetTransitioner(task.NewTransitioner(pool))
+	server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32))))
 	server.SetCommandPublisher(producer)
 	router := api.NewRouter(server)
 
@@ -692,7 +710,7 @@ func TestIntegration_PostTasks_DifferentIdempotencyKeysCreateDistinctTasks(t *te
 	integrationID := uuid.UUID(integration.ID.Bytes)
 
 	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
-	server.SetTransitioner(task.NewTransitioner(pool))
+	server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32))))
 	server.SetCommandPublisher(producer)
 	router := api.NewRouter(server)
 
@@ -746,7 +764,7 @@ func TestIntegration_GetTasks_FullCycleAllFieldsPresent(t *testing.T) {
 	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         user.ID,
 		IntegrationID:  integration.ID,
-		TextEnc:        []byte(text),
+		TextEnc:        mustEncTaskTextForTasks(t, text),
 		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
@@ -754,7 +772,7 @@ func TestIntegration_GetTasks_FullCycleAllFieldsPresent(t *testing.T) {
 	}
 	taskID := taskRow.ID
 
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32)))
 
 	// created → queued → running.
 	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
@@ -965,7 +983,7 @@ func TestIntegration_GetTasksId_ForeignAndNonexistentNotFound(t *testing.T) {
 	aliceTask, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         alice.ID,
 		IntegrationID:  aliceIntegration.ID,
-		TextEnc:        []byte("задача алисы"),
+		TextEnc:        mustEncTaskTextForTasks(t, "задача алисы"),
 		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
@@ -1022,7 +1040,7 @@ func TestIntegration_GetTasks_FiltersByIntegrationAndStatus(t *testing.T) {
 	taskA, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         user.ID,
 		IntegrationID:  integrationA.ID,
-		TextEnc:        []byte("задача A"),
+		TextEnc:        mustEncTaskTextForTasks(t, "задача A"),
 		IdempotencyKey: &keyA,
 	})
 	if err != nil {
@@ -1032,14 +1050,14 @@ func TestIntegration_GetTasks_FiltersByIntegrationAndStatus(t *testing.T) {
 	taskB, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         user.ID,
 		IntegrationID:  integrationB.ID,
-		TextEnc:        []byte("задача B"),
+		TextEnc:        mustEncTaskTextForTasks(t, "задача B"),
 		IdempotencyKey: &keyB,
 	})
 	if err != nil {
 		t.Fatalf("CreateTask (B): %v", err)
 	}
 
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32)))
 	if _, _, terr := tr.Transition(ctx, taskB.ID, task.TriggerEnqueued); terr != nil {
 		t.Fatalf("перевести задачу B в queued: %v", terr)
 	}
@@ -1125,7 +1143,7 @@ func TestIntegration_GetTasks_OldTaskStillAccessible(t *testing.T) {
 	taskRow, err := q.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         user.ID,
 		IntegrationID:  integration.ID,
-		TextEnc:        []byte(text),
+		TextEnc:        mustEncTaskTextForTasks(t, text),
 		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
@@ -1133,7 +1151,7 @@ func TestIntegration_GetTasks_OldTaskStillAccessible(t *testing.T) {
 	}
 	taskID := taskRow.ID
 
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32)))
 
 	// Полный цикл до completed: created→queued→running→awaiting_confirm→completed.
 	for _, trigger := range []task.Trigger{task.TriggerEnqueued, task.TriggerTaskAccepted} {
@@ -1297,7 +1315,7 @@ func TestIntegration_PostTasks_ResubmitDoesNotRestartCompletedTask(t *testing.T)
 	integrationUUID := uuid.UUID(integration.ID.Bytes)
 
 	server := api.NewServer(q, nil, []byte(testJWTSigningKey), []byte(testEncryptionKey32))
-	tr := task.NewTransitioner(pool)
+	tr := task.NewTransitioner(pool, task.WithMasterKey([]byte(testEncryptionKey32)))
 	server.SetTransitioner(tr)
 	server.SetCommandPublisher(producer)
 	router := api.NewRouter(server)

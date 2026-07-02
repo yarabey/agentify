@@ -8,12 +8,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
 
 // eventTypeStatusChange — task_events.type для событий, порождённых
 // Transition (значение из CHECK-ограничения migrations/00003).
 const eventTypeStatusChange = "status_change"
+
+// EventPayloadKeyPurpose — purpose (см. crypto.DeriveKey) подключа at-rest
+// шифрования task_events.payload_enc (FR I1, тикет 11.1). Экспортируется,
+// потому что тот же подключ должен вывести и читатель payload_enc на стороне
+// API (orchestrator/internal/api.Server): Transitioner ЕДИНСТВЕННЫЙ пишет
+// payload_enc (шифрует здесь, на записи), а расшифровывает его уже API при
+// показе истории/сопоставлении вопросов (tasks.go) — оба обязаны вывести
+// подключ из одного мастер-ключа под ОДНИМ purpose, иначе GCM-тег не сойдётся.
+// Значение произвольно, но должно быть СТАБИЛЬНО между рестартами (иначе ранее
+// зашифрованные payload_enc перестанут расшифровываться).
+const EventPayloadKeyPurpose = "task-event-payload-aead"
 
 // Transitioner — единственная точка смены статуса задачи в БД (FR E1):
 // проверяет переход через NextStatus и атомарно (одна транзакция) пишет
@@ -26,17 +38,52 @@ const eventTypeStatusChange = "status_change"
 type Transitioner struct {
 	pool    *pgxpool.Pool
 	queries *db.Queries
+
+	// payloadKey — подключ AES-256-GCM для at-rest шифрования
+	// task_events.payload_enc (FR I1, тикет 11.1), выведенный из мастер-ключа
+	// приложения через crypto.DeriveKey под EventPayloadKeyPurpose. Никогда не
+	// nil после NewTransitioner (см. её godoc про фолбэк).
+	payloadKey []byte
 }
 
-// NewTransitioner — конструктор Transitioner.
-func NewTransitioner(pool *pgxpool.Pool) *Transitioner {
-	return &Transitioner{pool: pool, queries: db.New(pool)}
+// TransitionerOption — функциональная опция NewTransitioner (тот же приём, что
+// у NewStaleWorker/NewAnswerTimeoutWorker в этом пакете).
+type TransitionerOption func(*Transitioner)
+
+// WithMasterKey задаёт мастер-ключ шифрования приложения (декодированный
+// APP_ENCRYPTION_KEY, см. orchestrator/main.go и docs/MANUAL_STEPS.md), из
+// которого Transitioner выводит подключ для at-rest шифрования payload_enc
+// (FR I1, тикет 11.1). В проде вызывается ВСЕГДА (main.go) — без неё
+// Transitioner использует детерминированный фолбэк-подключ (см. NewTransitioner),
+// пригодный только для тестов, не читающих payload_enc через API под реальным
+// мастер-ключом.
+func WithMasterKey(masterKey []byte) TransitionerOption {
+	return func(t *Transitioner) {
+		t.payloadKey = crypto.DeriveKey(masterKey, EventPayloadKeyPurpose)
+	}
 }
 
-// statusChangePayload — TODO(11.1): содержимое payload_enc хранится ОТКРЫТЫМ
-// текстом до тикета 11.1 (единый крипто-модуль AEAD для
-// text_enc/payload_enc/uuid_enc, FR I1); тикет 5.2 отвечает только за FR E1
-// (сама FSM), не за шифрование at-rest.
+// NewTransitioner — конструктор Transitioner. Мастер-ключ шифрования
+// payload_enc передаётся через WithMasterKey (FR I1, тикет 11.1); если опция не
+// задана, подключ выводится из пустого мастер-ключа — детерминированный, но
+// НЕсекретный фолбэк, приемлемый лишь для тестов/каркасных прогонов, где
+// payload_enc не читается через API под настоящим ключом (в проде main.go
+// всегда передаёт WithMasterKey).
+func NewTransitioner(pool *pgxpool.Pool, opts ...TransitionerOption) *Transitioner {
+	t := &Transitioner{pool: pool, queries: db.New(pool)}
+	for _, opt := range opts {
+		opt(t)
+	}
+	if t.payloadKey == nil {
+		t.payloadKey = crypto.DeriveKey(nil, EventPayloadKeyPurpose)
+	}
+	return t
+}
+
+// statusChangePayload — содержимое payload_enc события status_change. Само
+// значение шифруется AES-256-GCM at-rest перед записью в БД (FR I1, тикет
+// 11.1, см. transition/encryptPayload); тикет 5.2 отвечает только за FR E1
+// (сама FSM).
 type statusChangePayload struct {
 	From    Status  `json:"from"`
 	To      Status  `json:"to"`
@@ -100,11 +147,16 @@ func (t *Transitioner) RecordEvent(ctx context.Context, taskID pgtype.UUID, even
 		return 0, fmt.Errorf("task: получить текущий статус: %w", err)
 	}
 
+	encPayload, err := encryptPayload(t.payloadKey, eventPayload)
+	if err != nil {
+		return 0, fmt.Errorf("task: зашифровать payload события %s: %w", eventType, err)
+	}
+
 	row, err := q.InsertNextTaskEvent(ctx, db.InsertNextTaskEventParams{
 		TaskID:     taskID,
 		Type:       eventType,
 		RefEventID: refEventID,
-		PayloadEnc: eventPayload,
+		PayloadEnc: encPayload,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("task: записать task_events(%s): %w", eventType, err)
@@ -148,11 +200,15 @@ func (t *Transitioner) transition(ctx context.Context, taskID pgtype.UUID, trigg
 	}
 
 	if eventType != "" {
+		encEventPayload, eerr := encryptPayload(t.payloadKey, eventPayload)
+		if eerr != nil {
+			return from, "", fmt.Errorf("task: зашифровать payload события %s: %w", eventType, eerr)
+		}
 		if _, ierr := q.InsertNextTaskEvent(ctx, db.InsertNextTaskEventParams{
 			TaskID:     taskID,
 			Type:       eventType,
 			RefEventID: refEventID,
-			PayloadEnc: eventPayload,
+			PayloadEnc: encEventPayload,
 		}); ierr != nil {
 			return from, "", fmt.Errorf("task: записать task_events(%s): %w", eventType, ierr)
 		}
@@ -162,12 +218,16 @@ func (t *Transitioner) transition(ctx context.Context, taskID pgtype.UUID, trigg
 	if merr != nil {
 		return from, "", fmt.Errorf("task: сериализовать payload события: %w", merr)
 	}
+	encStatusPayload, eerr := encryptPayload(t.payloadKey, payload)
+	if eerr != nil {
+		return from, "", fmt.Errorf("task: зашифровать payload события status_change: %w", eerr)
+	}
 
 	if _, ierr := q.InsertNextTaskEvent(ctx, db.InsertNextTaskEventParams{
 		TaskID:     taskID,
 		Type:       eventTypeStatusChange,
 		RefEventID: pgtype.UUID{}, // NULL: смена статуса не отвечает на конкретный вопрос/запрос (FR F2)
-		PayloadEnc: payload,
+		PayloadEnc: encStatusPayload,
 	}); ierr != nil {
 		return from, "", fmt.Errorf("task: записать task_events(status_change): %w", ierr)
 	}
@@ -177,4 +237,16 @@ func (t *Transitioner) transition(ctx context.Context, taskID pgtype.UUID, trigg
 	}
 
 	return from, to, nil
+}
+
+// encryptPayload шифрует содержимое task_events.payload_enc at-rest (FR I1,
+// тикет 11.1): plaintext-JSON события никогда не ложится в БД в открытом виде,
+// хранится AES-256-GCM-шифротекстом (nonce||ciphertext+tag) под payloadKey.
+// Пустой/nil payload (например, Transition без бизнес-события не проходит сюда,
+// но RecordEvent теоретически может получить пустой) шифруется как есть —
+// результат всё равно непустой (nonce+tag) и корректно расшифровывается в
+// пустой срез; читателю (api.Server.decryptEventPayload) не нужно различать
+// этот случай.
+func encryptPayload(key, payload []byte) ([]byte, error) {
+	return crypto.Encrypt(key, payload)
 }
