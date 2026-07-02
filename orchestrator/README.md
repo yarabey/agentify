@@ -165,6 +165,52 @@ FR G2 требует, чтобы при одновременно активны�
 пользовательские настройки "куда слать" — FR G3, вне MVP), её добавляют новой
 `routingPolicy`-функцией, не трогая остальной `multiNotifier`.
 
+## Наблюдаемость (тикет 11.4, ТЗ «эксплуатация»)
+
+**Структурные логи с `task_id`.** Все логи — slog (JSON в prod, text в dev,
+см. `internal/platform`). Единственная точка смены статуса задачи —
+`task.Transitioner` (`internal/task/transition.go`) — логирует **каждый**
+успешный переход FSM одной строкой `"task: переход статуса"` с полями
+`task_id`, `from`, `to`, `trigger`, независимо от того, откуда он вызван
+(HTTP-хендлер постановки/ответа/согласования/подтверждения/отмены,
+`StaleWorker`, `AnswerTimeoutWorker`) — это и есть путь задачи «постановка →
+FSM-переходы → Q&A → завершение» одним общим кодом, не продублированным по
+вызывающим местам. Доставка команды до машины (мост `internal/bridge`)
+логирует отдельной строкой `"bridge: команда доставлена на машину"` с
+`task_id`, `integration_id`, `type` — момент, когда команда РЕАЛЬНО дошла до
+агента (не путать с моментом постановки в очередь Redpanda). По `task_id` в
+агрегаторе логов (например `docker compose logs | grep <task_id>` или
+эквивалент в проде) восстанавливается вся история конкретной задачи.
+
+**`GET /metrics`** — Prometheus text exposition format
+(`github.com/prometheus/client_golang`), смонтирован безусловно поверх
+`platform.Service` (см. `internal/platform/metrics.go`) — доступен
+одинаково на всех трёх сервисах (`orchestrator`, `bot`, `agent`), НЕ требует
+отдельной настройки в `main.go`. Экспортируются:
+
+- `agentify_http_requests_total{method,path,status,service}` — счётчик HTTP-
+  запросов (`path` — route pattern chi, например `/tasks/{id}/answer`, а не
+  URL с реальным UUID — иначе кардинальность лейбла росла бы неограниченно);
+- `agentify_http_request_duration_seconds{method,path,service}` — гистограмма
+  латентности тех же запросов;
+- стандартные Go/process-метрики (`go_goroutines`, `process_resident_memory_bytes`
+  и т.п., `prometheus/client_golang/prometheus/collectors`);
+- **специфичные для оркестратора** (`orchestrator/internal/metrics`),
+  зарегистрированы в `main.go` до старта HTTP-сервера:
+  - `agentify_orchestrator_task_transitions_total{from,to,trigger}` — те же
+    переходы FSM, что логируются выше, счётчиком (для дашборда/алерта —
+    например, накопление в `waiting_user` без движения в `running`);
+  - `agentify_orchestrator_machine_ws_connections_active` — gauge активных
+    WS-соединений машин прямо сейчас (не более одного на интеграцию, ADR
+    0002) — падение до 0 при ожидаемо работающих машинах сигнализирует о
+    проблеме на стороне бриджа/сети, а не только конкретной машины;
+  - `agentify_orchestrator_client_ws_connections_active` — gauge активных
+    WS-соединений web-клиентов (несколько на пользователя — по вкладкам).
+
+**Алерт «оффлайн VPS»** — см. `docs/MANUAL_STEPS.md`, раздел «Мониторинг VPS
+снаружи»: сознательно НЕ реализован как код (Alertmanager/аналог) — обоснование
+объёма там же.
+
 ## Конфигурация (env)
 
 Все переменные — с префиксом `ORCH_`. Дефолты рассчитаны на запуск в dev без

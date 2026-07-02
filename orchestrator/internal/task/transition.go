@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/metrics"
 )
 
 // eventTypeStatusChange — task_events.type для событий, порождённых
@@ -42,8 +45,17 @@ type Transitioner struct {
 	// payloadKey — подключ AES-256-GCM для at-rest шифрования
 	// task_events.payload_enc (FR I1, тикет 11.1), выведенный из мастер-ключа
 	// приложения через crypto.DeriveKey под EventPayloadKeyPurpose. Никогда не
-	// nil после NewTransitioner (см. её godoc про фолбэк).
+	// nil после NewTransitioner (см. её годок про фолбэк).
 	payloadKey []byte
+
+	// logger — логгер структурных логов перехода FSM (тикет 11.4, ТЗ
+	// «эксплуатация»). Transitioner — ЕДИНСТВЕННАЯ точка смены tasks.status
+	// (см. годок пакета/типа), поэтому это самое надёжное место логировать
+	// task_id по всему пути постановка→FSM-переходы→завершение ОДНИМ кодом, а
+	// не дублировать вызов логирования в каждом HTTP-хендлере/воркере,
+	// вызывающем Transition/TransitionWithEvent. Никогда не nil после
+	// NewTransitioner (см. её годок про фолбэк на slog.Default()).
+	logger *slog.Logger
 }
 
 // TransitionerOption — функциональная опция NewTransitioner (тот же приём, что
@@ -63,14 +75,26 @@ func WithMasterKey(masterKey []byte) TransitionerOption {
 	}
 }
 
+// WithLogger задаёт логгер структурных логов перехода FSM (тикет 11.4).
+// nil игнорируется (остаётся дефолт из NewTransitioner) — тот же приём, что
+// у WithLogger в остальных пакетах оркестратора (bridge, wsclient).
+func WithLogger(logger *slog.Logger) TransitionerOption {
+	return func(t *Transitioner) {
+		if logger != nil {
+			t.logger = logger
+		}
+	}
+}
+
 // NewTransitioner — конструктор Transitioner. Мастер-ключ шифрования
 // payload_enc передаётся через WithMasterKey (FR I1, тикет 11.1); если опция не
 // задана, подключ выводится из пустого мастер-ключа — детерминированный, но
 // НЕсекретный фолбэк, приемлемый лишь для тестов/каркасных прогонов, где
 // payload_enc не читается через API под настоящим ключом (в проде main.go
-// всегда передаёт WithMasterKey).
+// всегда передаёт WithMasterKey). Логгер (тикет 11.4) задаётся через
+// WithLogger; без неё — slog.Default(), никогда не nil.
 func NewTransitioner(pool *pgxpool.Pool, opts ...TransitionerOption) *Transitioner {
-	t := &Transitioner{pool: pool, queries: db.New(pool)}
+	t := &Transitioner{pool: pool, queries: db.New(pool), logger: slog.Default()}
 	for _, opt := range opts {
 		opt(t)
 	}
@@ -235,6 +259,21 @@ func (t *Transitioner) transition(ctx context.Context, taskID pgtype.UUID, trigg
 	if cerr := tx.Commit(ctx); cerr != nil {
 		return from, "", fmt.Errorf("task: commit tx: %w", cerr)
 	}
+
+	// Структурный лог перехода с task_id (тикет 11.4, ТЗ «эксплуатация»):
+	// ЕДИНАЯ точка, покрывающая ВСЕ переходы FSM независимо от вызывающей
+	// стороны (HTTP-хендлер PostTasks*, StaleWorker, AnswerTimeoutWorker) —
+	// см. годок поля logger. И метрика agentify_orchestrator_task_transitions_total
+	// инкрементируется здесь же, ТОЛЬКО после успешного commit — попытки,
+	// откатившиеся из-за недопустимого перехода (см. NextStatus выше), не
+	// коммитятся и до этой строки не доходят.
+	t.logger.Info("task: переход статуса",
+		slog.String("task_id", uuid.UUID(taskID.Bytes).String()),
+		slog.String("from", string(from)),
+		slog.String("to", string(to)),
+		slog.String("trigger", string(trigger)),
+	)
+	metrics.TaskTransitionsTotal.WithLabelValues(string(from), string(to), string(trigger)).Inc()
 
 	return from, to, nil
 }
