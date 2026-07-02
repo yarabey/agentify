@@ -16,18 +16,21 @@
 // вкл. вытеснение повторного соединения той же интеграции (FR B3, B6,
 // Gherkin §2, ADR 0002, см. machine_ws.go). Доступ в систему закрытый:
 // аккаунт создаётся лишь при предъявлении активного секретного токена
-// регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи)
-// пока отвечают 501 Not Implemented и будут реализованы в своих тикетах, но
-// уже сейчас проходят через auth-middleware наравне с готовыми защищёнными
-// операциями.
+// регистрации; без него — отказ (FR A1). С тикета 9.6 (генерация кода
+// привязки Telegram, PostChannelsTelegramLinkCode, см. channels.go) все
+// операции контракта реализованы — ни одна больше не падает во встроенную
+// заглушку api.Unimplemented; она остаётся смонтированной как страховка на
+// случай будущего расширения контракта операцией без обработчика.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
-// только готовые операции — GetHealthz, PostAuthRegister,
+// все операции контракта — GetHealthz, PostAuthRegister,
 // PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go),
 // GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId/
-// DeleteIntegrationsId (см. integrations.go) и GetMachineWs (см.
+// DeleteIntegrationsId (см. integrations.go), задачи (см. tasks.go),
+// привязку Telegram-канала — PostChannelsTelegramLink/
+// PostChannelsTelegramLinkCode (см. channels.go) — и GetMachineWs (см.
 // machine_ws.go), которая после
 // успешного hello разбирает входящие кадры машины и пересылает ack-кадры
 // зарегистрированному AckSink — мосту оркестратора (machine.commands →
@@ -280,6 +283,16 @@ type Server struct {
 	// один раз при старте через SetChannelLinker.
 	channelLinker   ChannelLinker
 	channelLinkerMu sync.RWMutex
+
+	// channelLinkCodeIssuer — генерация одноразового кода привязки канала
+	// (тикет 9.6, FR A2, D3, см. ChannelLinkCodeIssuer) — обратная операция
+	// по отношению к channelLinker: тот ТРАТИТ уже выпущенный код, этот его
+	// ВЫПУСКАЕТ. nil по умолчанию — тот же принцип, что и у channelLinker:
+	// штатно без БД, тогда PostChannelsTelegramLinkCode отвечает 500, а не
+	// паникует. Регистрируется один раз при старте через
+	// SetChannelLinkCodeIssuer.
+	channelLinkCodeIssuer   ChannelLinkCodeIssuer
+	channelLinkCodeIssuerMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -378,6 +391,17 @@ type taskTransitioner interface {
 // удовлетворяет этому интерфейсу структурно.
 type ChannelLinker interface {
 	Exchange(ctx context.Context, channelName, code, externalID string) (link db.ChannelLink, err error)
+}
+
+// ChannelLinkCodeIssuer — узкий интерфейс на *channel.CodeIssuer.IssueLinkCode
+// (тикет 9.6, FR A2, D3), нужный PostChannelsTelegramLinkCode (channels.go)
+// для генерации одноразового кода привязки канала. Та же граница между
+// транспортным/API-слоем и бизнес-подсистемой, что и у ChannelLinker выше —
+// сужение до одного метода упрощает юнит-тесты обработчика (фейк вместо
+// реального *pgxpool.Pool, который требует channel.CodeIssuer).
+// *channel.CodeIssuer удовлетворяет этому интерфейсу структурно.
+type ChannelLinkCodeIssuer interface {
+	IssueLinkCode(ctx context.Context, userID pgtype.UUID, channelName string) (db.ChannelLinkCode, error)
 }
 
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
@@ -595,6 +619,26 @@ func (s *Server) getChannelLinker() ChannelLinker {
 	s.channelLinkerMu.RLock()
 	defer s.channelLinkerMu.RUnlock()
 	return s.channelLinker
+}
+
+// SetChannelLinkCodeIssuer регистрирует генератор кода привязки канала
+// (тикет 9.6, см. ChannelLinkCodeIssuer). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), сразу после NewServer, до начала обслуживания
+// HTTP-трафика; nil — допустимое значение (в т.ч. явный сброс) — тогда
+// PostChannelsTelegramLinkCode отвечает 500 (см. godoc поля
+// channelLinkCodeIssuer).
+func (s *Server) SetChannelLinkCodeIssuer(i ChannelLinkCodeIssuer) {
+	s.channelLinkCodeIssuerMu.Lock()
+	defer s.channelLinkCodeIssuerMu.Unlock()
+	s.channelLinkCodeIssuer = i
+}
+
+// getChannelLinkCodeIssuer читает текущий ChannelLinkCodeIssuer под
+// channelLinkCodeIssuerMu (см. godoc полей Server).
+func (s *Server) getChannelLinkCodeIssuer() ChannelLinkCodeIssuer {
+	s.channelLinkCodeIssuerMu.RLock()
+	defer s.channelLinkCodeIssuerMu.RUnlock()
+	return s.channelLinkCodeIssuer
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

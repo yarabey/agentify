@@ -64,9 +64,11 @@ type CreateChannelLinkCodeParams struct {
 // orchestrator/internal/channel). Здесь — только SQL; бизнес-логика обмена
 // (проверка срока/одноразовости, атомарная транзакция) — в internal/channel.
 // Схема — orchestrator/migrations/00004_channels.sql (не редактируется).
-// Вставляет новый одноразовый код привязки для user_id (тикет 9.6). В тикете
-// 10.2 используется НАПРЯМУЮ только тестами (создать код-предусловие для
-// проверки обмена) — полноценный HTTP-эндпоинт генерации кода реализует 9.6.
+// Вставляет новый одноразовый код привязки для user_id (тикет 9.6, FR A2, D3).
+// Основной вызывающий в проде — orchestrator/internal/channel.CodeIssuer.IssueLinkCode
+// (HTTP-эндпоинт POST /channels/telegram/link-code, экран «Настройки»); тесты
+// тикета 10.2 (orchestrator/internal/channel/link_integration_test.go)
+// используют запрос напрямую как предусловие для проверки Linker.Exchange.
 func (q *Queries) CreateChannelLinkCode(ctx context.Context, arg CreateChannelLinkCodeParams) (ChannelLinkCode, error) {
 	row := q.db.QueryRow(ctx, createChannelLinkCode,
 		arg.Code,

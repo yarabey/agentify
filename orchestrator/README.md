@@ -50,15 +50,30 @@ API**, в который ходят и web PWA, и Telegram-бот (принци
 атомарная запись `channel_links` — в
 [`internal/channel.Linker.Exchange`](internal/channel/link.go) (одна
 транзакция: код помечается использованным ТОЛЬКО при успешной привязке).
-Код привязки генерирует `POST /channels/telegram/link-code` — **тикет 9.6,
-пока не реализован**; таблицы `channel_link_codes`/`channel_links` — миграция
-`00004_channels.sql`.
+Код привязки генерирует **`POST /channels/telegram/link-code`** (тикет 9.6, FR
+A2, D3, экран «Настройки» в web) — таблицы `channel_link_codes`/`channel_links`
+— миграция `00004_channels.sql`.
 - успех → `200` + `ChannelLink`;
 - код не найден → `404 link_code_not_found`;
 - код истёк → `409 link_code_expired`;
 - код уже использован → `409 link_code_used`;
 - этот `telegram_user_id` уже привязан к другому пользователю →
   `409 channel_already_linked`.
+
+**`POST /channels/telegram/link-code`** — генерация одноразового кода
+привязки (тикет 9.6, FR A2, D3). В отличие от `/channels/telegram/link`
+маршрут **защищён Bearer** (нет `security: []` в `api/openapi.yaml`) — код
+выпускается СТРОГО для вызывающего пользователя (`user_id` из access-токена),
+без параметра «для кого» в теле запроса. Бизнес-логика (генерация
+случайного кода, вставка с TTL) — в
+[`internal/channel.CodeIssuer.IssueLinkCode`](internal/channel/codegen.go);
+HTTP-обёртка — `PostChannelsTelegramLinkCode` в тех же
+[`internal/api/channels.go`](internal/api/channels.go). Успех → `201` +
+`{code, expires_at}`. TTL — `ORCH_TELEGRAM_LINK_CODE_TTL` (дефолт `15m`,
+продуктовое значение не зафиксировано, см.
+[`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) §4). Код показывается
+пользователю на экране «Настройки» (`web/src/pages/SettingsPage.tsx`) вместе
+с инструкцией отправить его боту командой `/start <code>`.
 
 Маршруты монтируются от корня (`/auth/register`, `/healthz`): Caddy в compose
 роутит `/api/*` → orchestrator со стрипом префикса.
@@ -81,6 +96,7 @@ API**, в который ходят и web PWA, и Telegram-бот (принци
 | `ORCH_DATABASE_URL` | — (пусто) | DSN Postgres (`postgres://…`). Без него миграции и API не поднимаются. |
 | `ORCH_JWT_SIGNING_KEY` | — (пусто) | Секрет HMAC для подписи access-JWT (FR A3). При поднятом API обязателен — пустой ключ фатален на старте. |
 | `ORCH_APP_ENCRYPTION_KEY` | — (пусто) | Мастер-ключ шифрования at-rest, base64 → ровно 32 байта (`openssl rand -base64 32`). При поднятом API обязателен и валидируется по длине. См. раздел «Шифрование at-rest» ниже. |
+| `ORCH_TELEGRAM_LINK_CODE_TTL` | `15m` | Срок действия кода привязки Telegram (`POST /channels/telegram/link-code`, тикет 9.6, FR A2/D3). Продуктовое значение не зафиксировано, см. `docs/MANUAL_STEPS.md` §4. |
 
 Специфичные для оркестратора поля (Redpanda и др.) добавляются под тем же
 префиксом `ORCH_` в соответствующих тикетах.
@@ -139,13 +155,16 @@ curl -s -X POST localhost:8080/auth/register \
   -d '{"username":"alice","password":"s3cr3t","registration_token":"<активный токен>"}'
 # 201 — аккаунт создан; 403 — нет/неверный токен; 409 — username занят.
 
-# Привязка Telegram (тикет 10.2) — код в MVP пока создаётся напрямую в БД
-# (генерация — тикет 9.6):
-#   INSERT INTO channel_link_codes (code, user_id, channel, expires_at)
-#   VALUES ('devcode', '<user_id>', 'telegram', now() + interval '1 hour');
+# Генерация кода привязки Telegram (тикет 9.6) — требует Bearer (см. POST
+# /auth/login выше):
+curl -s -X POST localhost:8080/channels/telegram/link-code \
+  -H "Authorization: Bearer <access_token>"
+# 201 — {"code":"...", "expires_at":"..."}
+
+# Обмен кода на привязку (тикет 10.2) — без Bearer, код из ответа выше:
 curl -s -X POST localhost:8080/channels/telegram/link \
   -H 'Content-Type: application/json' \
-  -d '{"code":"devcode","telegram_user_id":"999"}'
+  -d '{"code":"<code из предыдущего ответа>","telegram_user_id":"999"}'
 # 200 — привязано; 404 — код не найден; 409 — истёк/использован/telegram уже привязан.
 ```
 

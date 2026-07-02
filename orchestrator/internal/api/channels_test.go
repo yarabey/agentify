@@ -76,9 +76,9 @@ func doLinkTelegram(t *testing.T, linker ChannelLinker, body any) *httptest.Resp
 // TestPostChannelsTelegramLink_NoAuthRequired — маршрут `security: []`
 // (api/openapi.yaml): запрос без Authorization не получает 401 от
 // auth-middleware (в отличие от /channels/telegram/link-code, см.
-// register_test.go TestUnimplementedRequiresBearerToken) — в этой точке
-// пользователь ещё не аутентифицирован как web-клиент (см. godoc
-// channels.go).
+// channels_link_code_test.go TestPostChannelsTelegramLinkCode_RequiresBearerToken)
+// — в этой точке пользователь ещё не аутентифицирован как web-клиент (см.
+// godoc channels.go).
 func TestPostChannelsTelegramLink_NoAuthRequired(t *testing.T) {
 	linker := &fakeChannelLinker{result: db.ChannelLink{
 		Channel:    channelTelegram,
