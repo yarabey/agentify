@@ -247,7 +247,12 @@ func run() error {
 		defer pool.Close()
 
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
-		server.SetTransitioner(task.NewTransitioner(pool))
+		// Тот же мастер-ключ, что и у api.Server, передаётся Transitioner —
+		// единственному писателю task_events.payload_enc: он шифрует payload
+		// at-rest (FR I1, тикет 11.1), а Server расшифровывает его на чтении, оба
+		// под общим подключом (task.EventPayloadKeyPurpose). Ключи обязаны
+		// совпадать, иначе GCM-тег не сойдётся.
+		server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)))
 		// Обмен кода привязки Telegram-аккаунта (тикет 10.2, FR D3): не зависит
 		// от Redpanda, только от БД — регистрируется здесь же безусловно, тем
 		// же принципом, что и SetTransitioner/SetNotifier ниже.
@@ -272,7 +277,7 @@ func run() error {
 		// (тикет 7.3) добавится сюда же отдельным каналом, когда будет
 		// реализован.
 		answerTimeoutWorker, err := task.NewAnswerTimeoutWorker(
-			task.NewTransitioner(pool), db.New(pool), server.ClientConnHub(),
+			task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)), db.New(pool), server.ClientConnHub(),
 			task.WithAnswerTimeoutThreshold(cfg.AnswerTimeoutThreshold),
 			task.WithAnswerTimeoutBehavior(task.AnswerTimeoutBehavior(cfg.AnswerTimeoutBehavior)),
 		)
@@ -372,7 +377,7 @@ func run() error {
 			// integrations.status — гейтится тем же условием ORCH_REDPANDA_SEEDS,
 			// потому что last_seen_at в принципе обновляется только через
 			// heartbeat-consumer, который сам гейтится этим условием.
-			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
+			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
 			if err != nil {
 				return fmt.Errorf("orchestrator: сборка task.StaleWorker: %w", err)
 			}

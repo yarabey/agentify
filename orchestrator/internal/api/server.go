@@ -186,6 +186,19 @@ type Server struct {
 	integrationUUIDAEADKey []byte
 	integrationUUIDHMACKey []byte
 
+	// taskTextAEADKey/taskEventPayloadAEADKey — подключи at-rest шифрования
+	// tasks.text_enc и task_events.payload_enc (FR I1, тикет 11.1), выведенные
+	// из того же мастер-ключа (encryptionKey параметр NewServer) через
+	// crypto.DeriveKey под разными purpose. text_enc сервер и шифрует (на
+	// записи, PostTasks), и расшифровывает (на чтении, GetTasks/GetTasksId);
+	// payload_enc сервер только РАСШИФРОВЫВАЕТ на чтении (история/сопоставление
+	// вопросов) — пишет его единственный писатель task.Transitioner, поэтому
+	// подключ payload_enc выводится под ОБЩИМ с ним purpose
+	// (task.EventPayloadKeyPurpose), чтобы GCM-тег сошёлся. Как и подключи
+	// UUID-секрета, выводятся из мастер-ключа, а не используют его напрямую.
+	taskTextAEADKey         []byte
+	taskEventPayloadAEADKey []byte
+
 	// machineConns — реестр активных WS-соединений машины по integration_id
 	// (тикет 2.4, FR B6, ADR 0002 "защита от повторного UUID"). Один процесс
 	// оркестратора в MVP (docs/01_tech_stack_and_architecture.md [РЕШЕНИЕ 5]) —
@@ -376,6 +389,12 @@ type ChannelLinker interface {
 const (
 	integrationUUIDAEADKeyPurpose = "integration-uuid-aead"
 	integrationUUIDHMACKeyPurpose = "integration-uuid-hmac"
+	// taskTextAEADKeyPurpose — purpose подключа AEAD для tasks.text_enc (FR I1,
+	// тикет 11.1). Отдельный от purpose payload_enc и UUID-секрета: разные
+	// колонки — разные независимые подключи из одного мастер-ключа (та же
+	// крипто-гигиена, что и у UUID-подключей). Подключ payload_enc выводится
+	// под task.EventPayloadKeyPurpose (общий с писателем task.Transitioner).
+	taskTextAEADKeyPurpose = "task-text-aead"
 )
 
 // NewServer собирает обработчик API оркестратора поверх слоя данных, логгера,
@@ -387,7 +406,9 @@ const (
 // docs/MANUAL_STEPS.md); encryptionKey — мастер-ключ шифрования, РОВНО 32
 // декодированных байта (APP_ENCRYPTION_KEY из окружения, тикет 2.2,
 // internal/crypto) — из него здесь же выводятся независимые подключи под
-// UUID-секрет интеграции (см. поля Server). Как и jwtSigningKey, НЕ
+// UUID-секрет интеграции и под at-rest шифрование tasks.text_enc /
+// task_events.payload_enc (FR I1, тикет 11.1, см. поля Server). Как и
+// jwtSigningKey, НЕ
 // генерируется и не подставляется по умолчанию здесь: вызывающая сторона
 // (orchestrator/main.go) отвечает за то, что оба ключа непусты и корректной
 // длины в проде. Возвращает *Server, готовый к монтированию через NewRouter.
@@ -396,10 +417,12 @@ func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encry
 		queries:                queries,
 		logger:                 logger,
 		jwtSigningKey:          jwtSigningKey,
-		integrationUUIDAEADKey: crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
-		integrationUUIDHMACKey: crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
-		machineConns:           make(map[uuid.UUID]*websocket.Conn),
-		clientHub:              NewClientConnHub(logger),
+		integrationUUIDAEADKey:  crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
+		integrationUUIDHMACKey:  crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
+		taskTextAEADKey:         crypto.DeriveKey(encryptionKey, taskTextAEADKeyPurpose),
+		taskEventPayloadAEADKey: crypto.DeriveKey(encryptionKey, task.EventPayloadKeyPurpose),
+		machineConns:            make(map[uuid.UUID]*websocket.Conn),
+		clientHub:               NewClientConnHub(logger),
 	}
 }
 
