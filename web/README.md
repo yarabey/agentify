@@ -6,7 +6,8 @@
 Статус: с тикета **9.1** здесь полноценное Vite + React 18 + TypeScript
 SPA/PWA-приложение; с тикета **9.6** все экраны каркаса (`/login`,
 `/register`, `/integrations`, `/tasks`, `/settings`) реализованы по-настоящему
-(не заглушки). Стек зафиксирован в
+(не заглушки); с тикета **9.8** — сквозной Playwright E2E поверх реально
+поднятого стека (см. `e2e/README.md`). Стек зафиксирован в
 `docs/01_tech_stack_and_architecture.md` (раздел «Web (React PWA)»).
 
 ## Структура
@@ -22,6 +23,7 @@ SPA/PWA-приложение; с тикета **9.6** все экраны кар
 | `src/pwaManifest.ts` | Манифест installable PWA, используется и в `vite.config.ts` (`VitePWA`), и в юнит-тесте валидности |
 | `src/components/ui/*` | shadcn/ui компоненты (сейчас — `Button`) |
 | `tailwind.config.ts`, `postcss.config.js`, `components.json` | Tailwind CSS v3 + shadcn/ui конфигурация |
+| `e2e/*.spec.ts`, `e2e/support/*` | Сквозной E2E (тикет 9.8, критерий выхода MVP) — Playwright поверх реально поднятого `make run-local`, свой `tsconfig.json`/раннер, НЕ участвует в `tsc -b`/Vitest приложения (см. `e2e/README.md`) |
 
 ## Команды
 
@@ -31,8 +33,10 @@ npm --prefix web run dev      # dev-сервер Vite
 npm --prefix web run build    # tsc -b (typecheck всего приложения) + vite build -> dist/
 npm --prefix web run test     # vitest run (без watch)
 npm --prefix web run gen:api  # ../api/openapi.yaml -> src/api/schema.ts
+npm --prefix web run e2e      # Playwright E2E — требует уже поднятого make run-local, см. e2e/README.md
 # либо из корня:
 make generate                 # включает gen:api вместе с Go-кодогенерацией
+make e2e                      # bootstrap токена регистрации + прогон E2E (см. e2e/README.md)
 ```
 
 `dist/` (Vite output, по умолчанию) — то, что копирует `web/Dockerfile` в

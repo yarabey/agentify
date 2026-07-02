@@ -1,6 +1,6 @@
 /// <reference types="vitest/config" />
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 import { pwaManifest } from "./src/pwaManifest";
@@ -51,6 +51,13 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     css: true,
+    // Тикет 9.8: `web/e2e/**` — Playwright-спеки (`*.spec.ts`), отдельный
+    // раннер (`npm run e2e`, см. web/e2e/README.md), не Vitest. Без явного
+    // исключения дефолтный include-паттерн Vitest (`**/*.{test,spec}.*`)
+    // подхватил бы их тоже и упал на `test()` из `@playwright/test` —
+    // несовместимом test-раннере (см. также web/e2e/tsconfig.json —
+    // отдельный TS-проект, e2e/ намеренно вне tsconfig.app.json/src).
+    exclude: [...configDefaults.exclude, "e2e/**"],
     env: {
       VITE_API_BASE_URL: "http://localhost/api",
     },

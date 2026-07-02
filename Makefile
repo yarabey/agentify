@@ -3,7 +3,8 @@
 # Цели соответствуют AGENTS.md §7. В тикете 0.1 реально работают `lint` и
 # `test`; `tools` ставит инструментарий; `generate`, `docs-check`, `run-local`
 # реализованы тикетами 0.2 / 0.7 / 0.3; `bdd` — тикетом 11.2 (godog-харнесс,
-# см. orchestrator/features/README.md).
+# см. orchestrator/features/README.md); `e2e`/`e2e-install` — тикетом 9.8
+# (Playwright поверх реально поднятого `run-local`, см. web/e2e/README.md).
 
 # --- Зафиксированные версии инструментов (тикет 0.1) ---
 GOLANGCI_LINT_VERSION ?= v2.5.0
@@ -27,7 +28,7 @@ SQLC         ?= $(GOBIN)/sqlc
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools tools-generate tools-generate-go generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke backup restore-check
+.PHONY: help tools tools-generate tools-generate-go generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke backup restore-check e2e e2e-install
 
 # Compose-файл локального стека (тикет 0.3).
 COMPOSE_FILE ?= deploy/docker-compose.yml
@@ -96,6 +97,14 @@ run-local-down: ## Погасить локальный стек и удалит�
 
 smoke: ## Smoke-проверка локального стека: /healthz всех сервисов отвечает 200.
 	deploy/scripts/smoke.sh
+
+e2e-install: ## Установить Playwright + браузер Chromium для сквозного E2E (тикет 9.8).
+	npm --prefix web ci
+	npm --prefix web exec playwright install --with-deps chromium
+
+e2e: ## Сквозной E2E (тикет 9.8, критерий выхода MVP) — требует уже поднятого `make run-local` и установленных браузеров (`make e2e-install`); см. web/e2e/README.md.
+	deploy/scripts/e2e-bootstrap.sh
+	npm --prefix web run e2e
 
 backup: ## Снять разовый бэкап Postgres в том pg_backups (тикет 11.5; postgres должен быть запущен).
 	$(DOCKER_COMPOSE) -f $(BACKUP_COMPOSE_FILE) run --rm backup /usr/local/bin/backup.sh
