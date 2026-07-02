@@ -280,3 +280,20 @@ bootstrap-шаг при каждом деплое) **идемпотентны**:
 уникальности и не создают второго администратора или второго активного
 токена — каждый шаг no-op, если уже выполнен. Подробности — godoc
 [`orchestrator/internal/bootstrap`](internal/bootstrap).
+
+## BDD-приёмка Gherkin-сценариев (тикет 11.2)
+
+Приёмочные сценарии `docs/User_stories_Gherkin.md` §1–§10 (ТЗ §127 «Весь
+функционал покрыт автоматическими тестами») исполняются как `.feature`-файлы
+через [godog](https://github.com/cucumber/godog):
+
+- `.feature`-файлы (Gherkin на русском) — [`orchestrator/features/`](features);
+- степы (Go, поверх настоящего `api.NewRouter` + Postgres в testcontainers) —
+  [`orchestrator/internal/bddsteps/`](internal/bddsteps) (build-тег `bdd`, как
+  `integration` у `*_integration_test.go` — обычный `go build`/`go test` их не
+  видит, Docker не требуется);
+- запуск: `make bdd` из корня репозитория.
+
+Что покрыто, что сознательно нет (install-скрипт/Redpanda-транспорт/allowlist
+агента/ещё не реализованный safe-stop) и как добавлять новые сценарии —
+[`orchestrator/features/README.md`](features/README.md).

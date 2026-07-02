@@ -1,8 +1,9 @@
 # Makefile монорепо agentify.
 #
 # Цели соответствуют AGENTS.md §7. В тикете 0.1 реально работают `lint` и
-# `test`; `tools` ставит инструментарий; `generate`, `bdd`, `docs-check`,
-# `run-local` — заглушки, реализуемые в тикетах 0.2 / 11.2 / 0.7 / 0.3.
+# `test`; `tools` ставит инструментарий; `generate`, `docs-check`, `run-local`
+# реализованы тикетами 0.2 / 0.7 / 0.3; `bdd` — тикетом 11.2 (godog-харнесс,
+# см. orchestrator/features/README.md).
 
 # --- Зафиксированные версии инструментов (тикет 0.1) ---
 GOLANGCI_LINT_VERSION ?= v2.5.0
@@ -81,8 +82,8 @@ lint: ## Запустить golangci-lint (вкл. линтеры докумен
 test: ## Запустить unit-тесты Go.
 	go test ./...
 
-bdd: ## [ЗАГЛУШКА — тикет 11.2] Прогон Gherkin-сценариев (godog).
-	@echo "bdd: implemented in ticket 11.2"
+bdd: ## Прогон Gherkin-сценариев (godog) — тикет 11.2, см. orchestrator/features/README.md.
+	go test -tags=bdd ./orchestrator/internal/bddsteps/... -run TestFeatures -v
 
 docs-check: ## Проверка документации: godoc на экспортируемых символах, маркеры задач с номером, согласованность openapi.yaml (тикет 0.7).
 	GOLANGCI_LINT=$(SYSTEM_GOLANGCI_LINT) deploy/scripts/docs-check.sh
