@@ -131,3 +131,12 @@ lint, build, test, generate-check, docs-check, bdd, integration, agent-release-b
 Дополнительно: [`.editorconfig`](.editorconfig) (единый стиль файлов) и
 [`.pre-commit-config.yaml`](.pre-commit-config.yaml) (gofmt/vet/golangci-lint
 перед коммитом — `pip install pre-commit && pre-commit install`).
+
+## Лицензия
+
+Проект распространяется под лицензией
+[FSL-1.1-ALv2 (Functional Source License)](LICENSE.md): код открыт, его можно
+свободно читать, использовать, модифицировать и распространять для любых целей,
+**кроме создания конкурирующего коммерческого продукта или сервиса**. Каждая
+версия кода автоматически перелицензируется под Apache-2.0 через два года после
+публикации.

@@ -2,6 +2,7 @@
   "name": "@agentify/web",
   "private": true,
   "version": "0.1.0-mvp",
+  "license": "FSL-1.1-ALv2",
   "description": "Web PWA оркестратора (тикет 9.1): Vite + React 18 + TS, роутинг (react-router-dom), TanStack Query, генерённый API-клиент (openapi-fetch + openapi-typescript), vite-plugin-pwa (installable shell), Tailwind CSS + shadcn/ui, WS-хук с реконнектом. Экраны — заглушки; реальная реализация в тикетах 9.2-9.6.",
   "type": "module",
   "scripts": {
