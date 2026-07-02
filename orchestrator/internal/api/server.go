@@ -30,7 +30,9 @@
 // GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId/
 // DeleteIntegrationsId (см. integrations.go), задачи (см. tasks.go),
 // привязку Telegram-канала — PostChannelsTelegramLink/
-// PostChannelsTelegramLinkCode (см. channels.go) — и GetMachineWs (см.
+// PostChannelsTelegramLinkCode (см. channels.go), выдачу acting-токена боту —
+// PostChannelsTelegramToken (тикет 10.3, FR D1, см. channels.go) — и
+// GetMachineWs (см.
 // machine_ws.go), которая после
 // успешного hello разбирает входящие кадры машины и пересылает ack-кадры
 // зарегистрированному AckSink — мосту оркестратора (machine.commands →
@@ -115,6 +117,12 @@ type Querier interface {
 	// user_id: владелец на этом шаге ещё не известен (FR B3, B6, тикет 2.3,
 	// см. machine_ws.go).
 	GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (db.Integration, error)
+	// GetChannelLinkByChannelAndExternalID резолвит user_id по (channel,
+	// external_id) — обратный поиск к CreateChannelLink, нужен
+	// PostChannelsTelegramToken (тикет 10.3, FR D1, см. channels.go):
+	// telegram_user_id входящего апдейта → user_id, от имени которого бот
+	// действует через единый API. Не найдено → pgx.ErrNoRows.
+	GetChannelLinkByChannelAndExternalID(ctx context.Context, arg db.GetChannelLinkByChannelAndExternalIDParams) (db.ChannelLink, error)
 	// ListActiveTaskIDsByIntegration возвращает id активных (не терминальных)
 	// задач интеграции — используется DeleteIntegrationsId (тикет 2.6, FR B5)
 	// для решения о 409 (без confirm=true) и для отмены через FSM при
@@ -293,6 +301,25 @@ type Server struct {
 	// SetChannelLinkCodeIssuer.
 	channelLinkCodeIssuer   ChannelLinkCodeIssuer
 	channelLinkCodeIssuerMu sync.RWMutex
+
+	// botServiceSecret — общий сервисный секрет между ботом и оркестратором
+	// (тикет 10.3, FR D1), проверяемый PostChannelsTelegramToken в заголовке
+	// X-Bot-Service-Secret (ORCH_BOT_SERVICE_SECRET у оркестратора,
+	// BOT_SERVICE_SECRET у бота — одно и то же значение). Это НЕ
+	// пользовательский Bearer (bearerAuth): у бота нет access-JWT
+	// пользователя, только telegram_user_id входящего апдейта, поэтому нужен
+	// отдельный канал доверия именно между двумя сервисами — тот же
+	// доверенный внутренний канал compose-сети, что и у BOT_ORCHESTRATOR_URL
+	// (тикет 10.2, см. godoc PostChannelsTelegramToken в channels.go). nil/
+	// пустое значение по умолчанию — тот же принцип «пустой опциональный
+	// секрет → фича мягко выключена», что и у channelLinker/transitioner:
+	// PostChannelsTelegramToken тогда ВСЕГДА отвечает 401, а не тихо
+	// принимает любой (в т.ч. пустой) заголовок — иначе пустой конфиг на
+	// проде дал бы любому вызывающему возможность получить acting-токен
+	// произвольного привязанного пользователя. Регистрируется один раз при
+	// старте через SetBotServiceSecret.
+	botServiceSecret   []byte
+	botServiceSecretMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -438,9 +465,9 @@ const (
 // длины в проде. Возвращает *Server, готовый к монтированию через NewRouter.
 func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encryptionKey []byte) *Server {
 	return &Server{
-		queries:                queries,
-		logger:                 logger,
-		jwtSigningKey:          jwtSigningKey,
+		queries:                 queries,
+		logger:                  logger,
+		jwtSigningKey:           jwtSigningKey,
 		integrationUUIDAEADKey:  crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
 		integrationUUIDHMACKey:  crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
 		taskTextAEADKey:         crypto.DeriveKey(encryptionKey, taskTextAEADKeyPurpose),
@@ -639,6 +666,28 @@ func (s *Server) getChannelLinkCodeIssuer() ChannelLinkCodeIssuer {
 	s.channelLinkCodeIssuerMu.RLock()
 	defer s.channelLinkCodeIssuerMu.RUnlock()
 	return s.channelLinkCodeIssuer
+}
+
+// SetBotServiceSecret регистрирует сервисный секрет бота (тикет 10.3, см.
+// godoc поля botServiceSecret). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), сразу после NewServer, до начала обслуживания
+// HTTP-трафика; nil/пустой срез — допустимое значение (дефолт) — тогда
+// PostChannelsTelegramToken ВСЕГДА отвечает 401 (фича мягко выключена, тот
+// же принцип, что у остальных опциональных зависимостей Server, но с
+// безопасным по умолчанию поведением «отказ», а не «ошибка сервера»,
+// поскольку эндпоинт — точка входа в систему аутентификации, а не бизнес-CRUD).
+func (s *Server) SetBotServiceSecret(secret []byte) {
+	s.botServiceSecretMu.Lock()
+	defer s.botServiceSecretMu.Unlock()
+	s.botServiceSecret = secret
+}
+
+// getBotServiceSecret читает текущий сервисный секрет бота под
+// botServiceSecretMu (см. godoc поля botServiceSecret).
+func (s *Server) getBotServiceSecret() []byte {
+	s.botServiceSecretMu.RLock()
+	defer s.botServiceSecretMu.RUnlock()
+	return s.botServiceSecret
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

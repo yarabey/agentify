@@ -75,6 +75,34 @@ HTTP-обёртка — `PostChannelsTelegramLinkCode` в тех же
 пользователю на экране «Настройки» (`web/src/pages/SettingsPage.tsx`) вместе
 с инструкцией отправить его боту командой `/start <code>`.
 
+**`POST /channels/telegram/token`** — действия из Telegram от имени
+привязанного пользователя (тикет 10.3, FR D1, §4 «Постановка задачи из
+канала», см. годок [`internal/api/channels.go`](internal/api/channels.go)).
+Вызывается ботом ПЕРЕД каждым действием пользователя в Telegram (постановка
+задачи, отмена, ответ на вопрос — см. `bot/README.md`), чтобы получить право
+действовать от его имени. **Архитектурное решение** (аутентификация бота):
+у бота нет пользовательского access-JWT (только `telegram_user_id` из
+апдейта), поэтому этот эндпоинт **не** защищён Bearer — вместо этого
+аутентифицируется общим **сервисным секретом** между ботом и оркестратором
+(заголовок `X-Bot-Service-Secret`, сверяется constant-time с
+`ORCH_BOT_SERVICE_SECRET`), доверенным ровно тем же способом, что и
+`BOT_ORCHESTRATOR_URL` (тикет 10.2) — прямой вызов внутри compose-сети, минуя
+Caddy/публичный интернет. При валидном секрете `telegram_user_id` резолвится
+в `user_id` через `channel_links` (тот же механизм привязки, что и `/start
+<code>`, тикет 10.2) и выпускается **обычный** access-JWT (`auth.IssueAccessToken`
+— та же функция и TTL, что и `POST /auth/login`). Дальше бот действует как
+ОБЫЧНЫЙ клиент контракта — `POST /tasks`, `POST /tasks/{id}/cancel`,
+`POST /tasks/{id}/answer`, `GET /integrations` с этим токеном как Bearer —
+принцип «единый API»: `tasks.go`/`integrations.go` этим тикетом НЕ меняются
+вообще, никакой Telegram-специфичной бизнес-логики постановки задачи в
+оркестраторе нет.
+- тело `TelegramActingTokenRequest` (`telegram_user_id`);
+- пустой/неверный `X-Bot-Service-Secret`, ЛИБО `ORCH_BOT_SERVICE_SECRET` не
+  настроен на сервере (fail closed — эндпоинт тогда ВСЕГДА отвечает `401`,
+  без исключений для пустого presented-заголовка) → `401`;
+- `telegram_user_id` не привязан ни к одному аккаунту → `404 not_linked`;
+- успех → `200` + `TelegramActingToken` (`access_token`, `expires_at`).
+
 Маршруты монтируются от корня (`/auth/register`, `/healthz`): Caddy в compose
 роутит `/api/*` → orchestrator со стрипом префикса.
 
@@ -97,6 +125,7 @@ HTTP-обёртка — `PostChannelsTelegramLinkCode` в тех же
 | `ORCH_JWT_SIGNING_KEY` | — (пусто) | Секрет HMAC для подписи access-JWT (FR A3). При поднятом API обязателен — пустой ключ фатален на старте. |
 | `ORCH_APP_ENCRYPTION_KEY` | — (пусто) | Мастер-ключ шифрования at-rest, base64 → ровно 32 байта (`openssl rand -base64 32`). При поднятом API обязателен и валидируется по длине. См. раздел «Шифрование at-rest» ниже. |
 | `ORCH_TELEGRAM_LINK_CODE_TTL` | `15m` | Срок действия кода привязки Telegram (`POST /channels/telegram/link-code`, тикет 9.6, FR A2/D3). Продуктовое значение не зафиксировано, см. `docs/MANUAL_STEPS.md` §4. |
+| `ORCH_BOT_SERVICE_SECRET` | — (пусто) | **Секрет.** Общий сервисный секрет между ботом и оркестратором (тикет 10.3, FR D1) для `POST /channels/telegram/token` (заголовок `X-Bot-Service-Secret`). Совпадает со значением `BOT_SERVICE_SECRET` у бота. Пусто (дефолт) → эндпоинт ВСЕГДА отвечает `401` (действия из Telegram отключены) — не фатально для старта, в отличие от `ORCH_JWT_SIGNING_KEY`/`ORCH_APP_ENCRYPTION_KEY`. НЕ коммитится. |
 
 Специфичные для оркестратора поля (Redpanda и др.) добавляются под тем же
 префиксом `ORCH_` в соответствующих тикетах.
@@ -166,6 +195,23 @@ curl -s -X POST localhost:8080/channels/telegram/link \
   -H 'Content-Type: application/json' \
   -d '{"code":"<code из предыдущего ответа>","telegram_user_id":"999"}'
 # 200 — привязано; 404 — код не найден; 409 — истёк/использован/telegram уже привязан.
+
+# Действия из Telegram (тикет 10.3) — сначала acting-токен по сервисному
+# секрету (ORCH_BOT_SERVICE_SECRET), затем ОБЫЧНЫЙ вызов защищённой операции
+# контракта этим токеном как Bearer:
+curl -s -X POST localhost:8080/channels/telegram/token \
+  -H 'Content-Type: application/json' \
+  -H 'X-Bot-Service-Secret: <ORCH_BOT_SERVICE_SECRET>' \
+  -d '{"telegram_user_id":"999"}'
+# 200 — {"access_token":"...", "expires_at":"..."}; 401 — неверный/не настроен
+# секрет; 404 not_linked — telegram_user_id не привязан (см. /start <code> выше).
+curl -s -X POST localhost:8080/tasks \
+  -H "Authorization: Bearer <access_token из предыдущего ответа>" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: tg-999-1' \
+  -d '{"integration_id":"<id интеграции>","text":"Собери проект"}'
+# 201 — задача поставлена; тот же POST /tasks, что и у web (никакой
+# отдельной Telegram-логики).
 ```
 
 Активный токен регистрации создаётся bootstrap-командой (тикет 1.7) или

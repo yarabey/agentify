@@ -55,15 +55,19 @@ type CreateChannelLinkCodeParams struct {
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
-// channels.sql — запросы привязки каналов (FR D3, тикеты 9.6/10.2).
+// channels.sql — запросы привязки каналов (FR D3, D1, тикеты 9.6/10.2/10.3).
 //
 // Назначение (бизнес): пользователь привязывает Telegram-аккаунт к своему
 // аккаунту через одноразовый deep-link код (Gherkin §6). Код генерирует web
 // (тикет 9.6, POST /channels/telegram/link-code), обменивает бот при `/start
 // <code>` (тикет 10.2, POST /channels/telegram/link, см.
-// orchestrator/internal/channel). Здесь — только SQL; бизнес-логика обмена
-// (проверка срока/одноразовости, атомарная транзакция) — в internal/channel.
-// Схема — orchestrator/migrations/00004_channels.sql (не редактируется).
+// orchestrator/internal/channel). Дальше действия из Telegram (постановка/
+// отмена задачи, ответ на вопрос, тикет 10.3, FR D1, §4 «Постановка задачи из
+// канала») резолвят telegram_user_id обратно в user_id этим же (channel,
+// external_id) — см. GetChannelLinkByChannelAndExternalID ниже. Здесь —
+// только SQL; бизнес-логика обмена (проверка срока/одноразовости, атомарная
+// транзакция) — в internal/channel. Схема —
+// orchestrator/migrations/00004_channels.sql (не редактируется).
 // Вставляет новый одноразовый код привязки для user_id (тикет 9.6, FR A2, D3).
 // Основной вызывающий в проде — orchestrator/internal/channel.CodeIssuer.IssueLinkCode
 // (HTTP-эндпоинт POST /channels/telegram/link-code, экран «Настройки»); тесты
@@ -83,6 +87,37 @@ func (q *Queries) CreateChannelLinkCode(ctx context.Context, arg CreateChannelLi
 		&i.Channel,
 		&i.ExpiresAt,
 		&i.UsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getChannelLinkByChannelAndExternalID = `-- name: GetChannelLinkByChannelAndExternalID :one
+SELECT id, user_id, channel, external_id, created_at FROM channel_links WHERE channel = $1 AND external_id = $2
+`
+
+type GetChannelLinkByChannelAndExternalIDParams struct {
+	Channel    string `json:"channel"`
+	ExternalID string `json:"external_id"`
+}
+
+// Резолвит user_id по (channel, external_id) — обратный поиск к
+// CreateChannelLink, нужен тикету 10.3 (POST /channels/telegram/token,
+// orchestrator/internal/api/channels.go): входящий telegram_user_id апдейта
+// превращается в user_id, от имени которого бот дальше действует через
+// ОБЫЧНЫЕ защищённые операции единого API (POST /tasks и т.п.) с выпущенным
+// acting-токеном. Использует тот же UNIQUE(channel, external_id), что и
+// CreateChannelLink (миграция 00004) — поиск по уникальному индексу. Не
+// найдено (внешний аккаунт не привязан ни к одному пользователю) →
+// pgx.ErrNoRows.
+func (q *Queries) GetChannelLinkByChannelAndExternalID(ctx context.Context, arg GetChannelLinkByChannelAndExternalIDParams) (ChannelLink, error) {
+	row := q.db.QueryRow(ctx, getChannelLinkByChannelAndExternalID, arg.Channel, arg.ExternalID)
+	var i ChannelLink
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Channel,
+		&i.ExternalID,
 		&i.CreatedAt,
 	)
 	return i, err
