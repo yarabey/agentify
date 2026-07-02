@@ -18,6 +18,11 @@
 /web/node_modules/
 /web/dist/
 
+# Артефакты прогонов Playwright E2E (тикет 9.8) — отчёты/трейсы/видео, не исходники
+/web/e2e/test-results/
+/web/e2e/playwright-report/
+/web/e2e/.cache/
+
 # Редакторы/ОС
 .DS_Store
 .idea/

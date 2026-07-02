@@ -16,6 +16,7 @@ bot, web за фронтовым Caddy). Прод-деплой через GHCR/S
 | `caddy.Dockerfile` | образ фронтового Caddy с запечённым `Caddyfile` (локальный конфиг; на проде подменяется bind-mount'ом `Caddyfile.prod`) |
 | `.env.example` | шаблон секретов/настроек (скопировать в `.env`) |
 | `scripts/smoke.sh` | smoke-проверка: `/healthz` всех сервисов отвечает 200 |
+| `scripts/e2e-bootstrap.sh` | тикет 9.8: идемпотентный `orchestrator bootstrap` (админ + токен регистрации) перед сквозным E2E (`make e2e`, см. `web/e2e/README.md`) |
 | `docker-compose.backup.yml` | опциональный оверрай: сервис регулярного бэкапа Postgres по cron (тикет 11.5) |
 | `backup/` | образ бэкап-сервиса (`Dockerfile`+`entrypoint.sh`), скрипт `backup.sh` (pg_dump), `restore-check.sh` (проверка восстановления) и Go-тест `pgbackup/` |
 
