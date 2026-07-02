@@ -269,8 +269,8 @@ SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_e
 // конкретной записью task_events (её id становится ref_event_id ответа, тикет
 // 6.1, FR F2). Сопоставление по question_id внутри payload_enc выполняется НА
 // СТОРОНЕ GO (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
-// payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
-// как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+// payload_enc зашифрован at-rest (тикет 11.1, как text_enc), поэтому
+// SQL-side JSON-экстракция по нему в принципе невозможна.
 func (q *Queries) ListAgentQuestionEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]TaskEvent, error) {
 	rows, err := q.db.Query(ctx, listAgentQuestionEventsByTask, taskID)
 	if err != nil {
@@ -309,8 +309,8 @@ SELECT id, task_id, seq, type, ref_event_id, payload_enc, created_at FROM task_e
 // Тот же приём, что и у ListAgentQuestionEventsByTask выше (тикет 6.1):
 // сопоставление по request_id внутри payload_enc выполняется НА СТОРОНЕ GO
 // (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
-// payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
-// как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+// payload_enc зашифрован at-rest (тикет 11.1, как text_enc), поэтому
+// SQL-side JSON-экстракция по нему в принципе невозможна.
 func (q *Queries) ListCommandApprovalRequestEventsByTask(ctx context.Context, taskID pgtype.UUID) ([]TaskEvent, error) {
 	rows, err := q.db.Query(ctx, listCommandApprovalRequestEventsByTask, taskID)
 	if err != nil {

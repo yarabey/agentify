@@ -22,9 +22,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/bus"
+	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
+
+// mustEncTaskText шифрует text под тем же подключом, что и newTestServer
+// (testEncryptionKey32 → taskTextAEADKeyPurpose), — так фикстуры БД содержат
+// шифротекст, который обработчик расшифрует обратно в text (FR I1, тикет 11.1).
+func mustEncTaskText(t *testing.T, text string) []byte {
+	t.Helper()
+	enc, err := crypto.Encrypt(crypto.DeriveKey([]byte(testEncryptionKey32), taskTextAEADKeyPurpose), []byte(text))
+	if err != nil {
+		t.Fatalf("mustEncTaskText: %v", err)
+	}
+	return enc
+}
+
+// mustEncEventPayload шифрует payload под тем же подключом, что и
+// newTestServer/task.Transitioner (testEncryptionKey32 →
+// task.EventPayloadKeyPurpose) — фикстуры task_events.payload_enc должны быть
+// шифротекстом, который обработчик расшифрует перед разбором (FR I1, тикет 11.1).
+func mustEncEventPayload(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	enc, err := crypto.Encrypt(crypto.DeriveKey([]byte(testEncryptionKey32), task.EventPayloadKeyPurpose), payload)
+	if err != nil {
+		t.Fatalf("mustEncEventPayload: %v", err)
+	}
+	return enc
+}
 
 // fakeTransitioner — подменный taskTransitioner для unit-тестов PostTasks/
 // PostTasksIdAnswer: возвращает настраиваемый статус to (или ошибку) и
@@ -114,11 +140,12 @@ func (f *fakePublisher) PublishKeyed(_ context.Context, topic, keyField string, 
 
 // taskCreatedResult — типовая успешная строка db.Task, возвращаемая
 // CreateTask (fakeQuerier.createTaskResult) для happy-path сценариев.
-func taskCreatedResult(id, integrationID uuid.UUID, text string) db.Task {
+func taskCreatedResult(t *testing.T, id, integrationID uuid.UUID, text string) db.Task {
+	t.Helper()
 	return db.Task{
 		ID:            pgtype.UUID{Bytes: id, Valid: true},
 		IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-		TextEnc:       []byte(text),
+		TextEnc:       mustEncTaskText(t, text),
 		Status:        string(task.StatusCreated),
 		CreatedAt:     pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
 		UpdatedAt:     pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
@@ -256,7 +283,7 @@ func TestPostTasks_IdempotencyKeyConflict(t *testing.T) {
 
 	transitioner := &fakeTransitioner{to: task.StatusQueued}
 	publisher := &fakePublisher{}
-	existing := taskCreatedResult(existingTaskID, integrationID, existingText)
+	existing := taskCreatedResult(t, existingTaskID, integrationID, existingText)
 	existing.Status = string(task.StatusQueued)
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
@@ -343,7 +370,7 @@ func TestPostTasks_NoTransitionerConfigured(t *testing.T) {
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
 			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskResult:     taskCreatedResult(taskID, integrationID, "сделай x"),
+			createTaskResult:     taskCreatedResult(t, taskID, integrationID, "сделай x"),
 		},
 		transitioner: nil,
 		publisher:    &fakePublisher{},
@@ -363,7 +390,7 @@ func TestPostTasks_TransitionError(t *testing.T) {
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
 			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskResult:     taskCreatedResult(taskID, integrationID, "сделай x"),
+			createTaskResult:     taskCreatedResult(t, taskID, integrationID, "сделай x"),
 		},
 		transitioner: &fakeTransitioner{err: context.DeadlineExceeded},
 		publisher:    &fakePublisher{},
@@ -383,7 +410,7 @@ func TestPostTasks_NoPublisherConfigured(t *testing.T) {
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
 			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskResult:     taskCreatedResult(taskID, integrationID, "сделай x"),
+			createTaskResult:     taskCreatedResult(t, taskID, integrationID, "сделай x"),
 		},
 		transitioner: &fakeTransitioner{to: task.StatusQueued},
 		publisher:    nil,
@@ -402,7 +429,7 @@ func TestPostTasks_PublishError(t *testing.T) {
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
 			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskResult:     taskCreatedResult(taskID, integrationID, "сделай x"),
+			createTaskResult:     taskCreatedResult(t, taskID, integrationID, "сделай x"),
 		},
 		transitioner: &fakeTransitioner{to: task.StatusQueued},
 		publisher:    &fakePublisher{err: context.DeadlineExceeded},
@@ -427,7 +454,7 @@ func TestPostTasks_HappyPath(t *testing.T) {
 	rec := doPostTasks(t, postTasksServer{
 		q: fakeQuerier{
 			getIntegrationResult: db.Integration{ID: pgtype.UUID{Bytes: integrationID, Valid: true}},
-			createTaskResult:     taskCreatedResult(taskID, integrationID, text),
+			createTaskResult:     taskCreatedResult(t, taskID, integrationID, text),
 		},
 		transitioner: transitioner,
 		publisher:    publisher,
@@ -505,7 +532,7 @@ func agentQuestionEvent(t *testing.T, eventID uuid.UUID, questionID, text string
 	return db.TaskEvent{
 		ID:         pgtype.UUID{Bytes: eventID, Valid: true},
 		Type:       "agent_question",
-		PayloadEnc: payload,
+		PayloadEnc: mustEncEventPayload(t, payload),
 	}
 }
 
@@ -902,7 +929,7 @@ func commandApprovalRequestEvent(t *testing.T, eventID uuid.UUID, requestID, com
 	return db.TaskEvent{
 		ID:         pgtype.UUID{Bytes: eventID, Valid: true},
 		Type:       "command_approval_request",
-		PayloadEnc: payload,
+		PayloadEnc: mustEncEventPayload(t, payload),
 	}
 }
 
@@ -1978,7 +2005,7 @@ func TestGetTasks_HappyPath_NoFilters(t *testing.T) {
 			{
 				ID:            pgtype.UUID{Bytes: taskID, Valid: true},
 				IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-				TextEnc:       []byte("сделай что-нибудь"),
+				TextEnc:       mustEncTaskText(t, "сделай что-нибудь"),
 				Status:        string(task.StatusRunning),
 				CreatedAt:     pgtype.Timestamptz{Time: createdAt, Valid: true},
 				UpdatedAt:     pgtype.Timestamptz{Time: updatedAt, Valid: true},
@@ -2120,7 +2147,7 @@ func TestGetTasksId_HappyPath(t *testing.T) {
 		getTaskByIDAndUserResult: db.Task{
 			ID:            pgtype.UUID{Bytes: taskID, Valid: true},
 			IntegrationID: pgtype.UUID{Bytes: integrationID, Valid: true},
-			TextEnc:       []byte("текст задачи"),
+			TextEnc:       mustEncTaskText(t, "текст задачи"),
 			Status:        string(task.StatusAwaitingConfirm),
 			CreatedAt:     pgtype.Timestamptz{Time: createdAt, Valid: true},
 			UpdatedAt:     pgtype.Timestamptz{Time: updatedAt, Valid: true},
@@ -2236,7 +2263,7 @@ func TestGetTasksIdEvents_HappyPath(t *testing.T) {
 				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
 				Seq:        1,
 				Type:       "status_change",
-				PayloadEnc: []byte(`{"from":"created","to":"queued"}`),
+				PayloadEnc: mustEncEventPayload(t, []byte(`{"from":"created","to":"queued"}`)),
 				CreatedAt:  pgtype.Timestamptz{Time: createdAt1, Valid: true},
 			},
 			{
@@ -2244,7 +2271,7 @@ func TestGetTasksIdEvents_HappyPath(t *testing.T) {
 				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
 				Seq:        2,
 				Type:       "agent_question",
-				PayloadEnc: []byte(`{"question_id":"` + eventID2.String() + `","text":"?"}`),
+				PayloadEnc: mustEncEventPayload(t, []byte(`{"question_id":"`+eventID2.String()+`","text":"?"}`)),
 				CreatedAt:  pgtype.Timestamptz{Time: createdAt2, Valid: true},
 			},
 		},
@@ -2278,10 +2305,10 @@ func TestGetTasksIdEvents_HappyPath(t *testing.T) {
 	}
 }
 
-// TestGetTasksIdEvents_BadPayloadDoesNotDropEvent — событие с невалидным
-// (не-JSON) payload_enc не роняет весь запрос и не выпадает из ответа
-// целиком (см. годок toTaskEvent) — Payload у него просто nil, остальные
-// поля (id/seq/type/created_at) присутствуют.
+// TestGetTasksIdEvents_BadPayloadDoesNotDropEvent — событие, чей payload_enc
+// расшифровывается, но НЕ является валидным JSON, не роняет весь запрос и не
+// выпадает из ответа целиком (см. годок toTaskEvent) — Payload у него просто
+// nil, остальные поля (id/seq/type/created_at) присутствуют.
 func TestGetTasksIdEvents_BadPayloadDoesNotDropEvent(t *testing.T) {
 	userID := uuid.New()
 	taskID := uuid.New()
@@ -2295,7 +2322,7 @@ func TestGetTasksIdEvents_BadPayloadDoesNotDropEvent(t *testing.T) {
 				TaskID:     pgtype.UUID{Bytes: taskID, Valid: true},
 				Seq:        1,
 				Type:       "status_change",
-				PayloadEnc: []byte("не json"),
+				PayloadEnc: mustEncEventPayload(t, []byte("не json")),
 				CreatedAt:  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
 			},
 		},

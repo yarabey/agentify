@@ -59,6 +59,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/yarabey/agentify/internal/bus"
+	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
@@ -119,11 +120,21 @@ func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTa
 		return
 	}
 
+	// text_enc шифруется at-rest (FR I1, тикет 11.1): текст задачи никогда не
+	// ложится в БД в открытом виде — только AES-256-GCM-шифротекстом под
+	// подключом сервера (расшифровывается обратно в toTask/toTaskRow на чтении).
+	textEnc, err := crypto.Encrypt(s.taskTextAEADKey, []byte(req.Text))
+	if err != nil {
+		s.logError("crypto.Encrypt(text_enc)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
 	idempotencyKey := params.IdempotencyKey
 	row, err := s.queries.CreateTask(ctx, db.CreateTaskParams{
 		UserID:         pgtype.UUID{Bytes: userID, Valid: true},
 		IntegrationID:  pgtype.UUID{Bytes: integrationID, Valid: true},
-		TextEnc:        []byte(req.Text), // TODO(11.1): открытым текстом до единого крипто-модуля at-rest
+		TextEnc:        textEnc,
 		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
@@ -147,7 +158,13 @@ func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTa
 				writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
 				return
 			}
-			writeJSON(w, http.StatusOK, toTask(existing, task.Status(existing.Status)))
+			existingTask, convErr := s.toTask(existing, task.Status(existing.Status))
+			if convErr != nil {
+				s.logError("decrypt text_enc (idempotency replay)", convErr)
+				writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+				return
+			}
+			writeJSON(w, http.StatusOK, existingTask)
 			return
 		}
 		s.logError("CreateTask", err)
@@ -198,7 +215,13 @@ func (s *Server) PostTasks(w http.ResponseWriter, r *http.Request, params PostTa
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toTask(row, to))
+	createdTask, err := s.toTask(row, to)
+	if err != nil {
+		s.logError("decrypt text_enc (PostTasks)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+	writeJSON(w, http.StatusCreated, createdTask)
 }
 
 // PostTasksIdAnswer реализует POST /tasks/{id}/answer — ответ пользователя на
@@ -275,10 +298,16 @@ func (s *Server) PostTasksIdAnswer(w http.ResponseWriter, r *http.Request, id Id
 	questionIDStr := uuid.UUID(req.QuestionId).String()
 	var matched *db.TaskEvent
 	for i := range questionEvents {
+		// payload_enc зашифрован at-rest (FR I1, тикет 11.1) — расшифровываем
+		// перед разбором. Сбой расшифровки/разбора конкретной записи не должен
+		// ронять весь поиск — пропускаем её и продолжаем сопоставление
+		// остальных (та же терпимость, что и к битому JSON).
+		plaintext, derr := s.decryptEventPayload(questionEvents[i].PayloadEnc)
+		if derr != nil {
+			continue
+		}
 		var qp bus.AgentQuestionPayload
-		if err := json.Unmarshal(questionEvents[i].PayloadEnc, &qp); err != nil {
-			// Битый/несовместимый payload у конкретной записи не должен ронять
-			// весь поиск — пропускаем её и продолжаем сопоставление остальных.
+		if err := json.Unmarshal(plaintext, &qp); err != nil {
 			continue
 		}
 		if qp.QuestionID == questionIDStr {
@@ -432,10 +461,14 @@ func (s *Server) PostTasksIdApprove(w http.ResponseWriter, r *http.Request, id I
 	requestIDStr := uuid.UUID(req.RequestId).String()
 	var matched *db.TaskEvent
 	for i := range requestEvents {
+		// payload_enc зашифрован at-rest (FR I1, тикет 11.1) — расшифровываем
+		// перед разбором; сбой конкретной записи пропускаем, как и битый JSON.
+		plaintext, derr := s.decryptEventPayload(requestEvents[i].PayloadEnc)
+		if derr != nil {
+			continue
+		}
 		var rp bus.CommandApprovalRequestPayload
-		if err := json.Unmarshal(requestEvents[i].PayloadEnc, &rp); err != nil {
-			// Битый/несовместимый payload у конкретной записи не должен ронять
-			// весь поиск — пропускаем её и продолжаем сопоставление остальных.
+		if err := json.Unmarshal(plaintext, &rp); err != nil {
 			continue
 		}
 		if rp.RequestID == requestIDStr {
@@ -578,7 +611,13 @@ func (s *Server) PostTasksIdConfirm(w http.ResponseWriter, r *http.Request, id I
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toTask(row, to))
+	confirmedTask, err := s.toTask(row, to)
+	if err != nil {
+		s.logError("decrypt text_enc (PostTasksIdConfirm)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+	writeJSON(w, http.StatusOK, confirmedTask)
 }
 
 // PostTasksIdReject реализует POST /tasks/{id}/reject — пользователь отклоняет
@@ -644,7 +683,13 @@ func (s *Server) PostTasksIdReject(w http.ResponseWriter, r *http.Request, id Id
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toTask(row, to))
+	rejectedTask, err := s.toTask(row, to)
+	if err != nil {
+		s.logError("decrypt text_enc (PostTasksIdReject)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+	writeJSON(w, http.StatusOK, rejectedTask)
 }
 
 // PostTasksIdCancel реализует POST /tasks/{id}/cancel — отмена задачи
@@ -803,7 +848,13 @@ func (s *Server) GetTasks(w http.ResponseWriter, r *http.Request, params GetTask
 
 	result := make([]Task, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, toTaskRow(row))
+		item, convErr := s.toTaskRow(row)
+		if convErr != nil {
+			s.logError("decrypt text_enc (GetTasks)", convErr)
+			writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+			return
+		}
+		result = append(result, item)
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -839,7 +890,13 @@ func (s *Server) GetTasksId(w http.ResponseWriter, r *http.Request, id IdPath) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toTaskRow(row))
+	cardTask, err := s.toTaskRow(row)
+	if err != nil {
+		s.logError("decrypt text_enc (GetTasksId)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+	writeJSON(w, http.StatusOK, cardTask)
 }
 
 // GetTasksIdEvents реализует GET /tasks/{id}/events — журнал событий задачи
@@ -888,22 +945,56 @@ func (s *Server) GetTasksIdEvents(w http.ResponseWriter, r *http.Request, id IdP
 
 	result := make([]TaskEvent, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, toTaskEvent(row))
+		result = append(result, s.toTaskEvent(row))
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
-// toTask конвертирует строку БД (уже после Transition) в контрактный Task.
+// decryptTaskText расшифровывает tasks.text_enc обратно в открытый текст
+// задачи (FR I1, тикет 11.1). Пустой/nil вход (нет шифротекста) → пустая
+// строка без ошибки: в проде text_enc всегда непуст (PostTasks шифрует
+// непустой req.Text), пустой встречается только в фикстурах/каркасных строках
+// без текста — их не за что «ронять» ошибкой расшифровки. Непустой, но
+// не расшифровываемый text_enc (порча данных/смена ключа) — ошибка, транслируемая
+// вызывающим в 500.
+func (s *Server) decryptTaskText(enc []byte) (string, error) {
+	if len(enc) == 0 {
+		return "", nil
+	}
+	plaintext, err := crypto.Decrypt(s.taskTextAEADKey, enc)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
+// decryptEventPayload расшифровывает task_events.payload_enc обратно в открытый
+// JSON события (FR I1, тикет 11.1), записанный шифротекстом единственным
+// писателем task.Transitioner под общим подключом (task.EventPayloadKeyPurpose).
+// Пустой/nil вход → nil без ошибки (нечего расшифровывать).
+func (s *Server) decryptEventPayload(enc []byte) ([]byte, error) {
+	if len(enc) == 0 {
+		return nil, nil
+	}
+	return crypto.Decrypt(s.taskEventPayloadAEADKey, enc)
+}
+
+// toTask конвертирует строку БД (уже после Transition) в контрактный Task,
+// расшифровывая text_enc обратно в открытый текст (FR I1, тикет 11.1).
 // status берём из аргумента to (результат Transition), а не row.Status —
 // row получена ДО вызова Transition и содержит ещё 'created'. updated_at
 // приближённо берётся как момент ответа (Transition сам обновляет
 // updated_at=now() в БД, но не возвращает обновлённую строку — перечитывать
 // её отдельным запросом ради одного поля не нужно, точность в пределах
-// одного HTTP-запроса не имеет бизнес-значения).
-func toTask(row db.Task, status task.Status) Task {
+// одного HTTP-запроса не имеет бизнес-значения). Ошибка расшифровки text_enc
+// (порча данных) возвращается вызывающему для 500.
+func (s *Server) toTask(row db.Task, status task.Status) (Task, error) {
 	id := uuid.UUID(row.ID.Bytes)
 	integrationID := uuid.UUID(row.IntegrationID.Bytes)
-	text := string(row.TextEnc)
+	text, err := s.decryptTaskText(row.TextEnc)
+	if err != nil {
+		return Task{}, err
+	}
 	taskStatus := TaskStatus(status)
 	createdAt := row.CreatedAt.Time
 	updatedAt := time.Now().UTC()
@@ -915,19 +1006,22 @@ func toTask(row db.Task, status task.Status) Task {
 		Status:        &taskStatus,
 		CreatedAt:     &createdAt,
 		UpdatedAt:     &updatedAt,
-	}
+	}, nil
 }
 
 // toTaskRow конвертирует строку БД в контрактный Task для read-only путей
-// (GetTasks, GetTasksId, тикет 8.6, FR H1) — в отличие от toTask (используется
-// ТОЛЬКО в write-путях сразу после Transition, где status/updated_at ещё не
-// отражены в уже прочитанной row), здесь Transition в рамках этого запроса не
-// происходил: row уже содержит актуальные status и updated_at, оба берутся
-// прямо из неё.
-func toTaskRow(row db.Task) Task {
+// (GetTasks, GetTasksId, тикет 8.6, FR H1), расшифровывая text_enc (FR I1,
+// тикет 11.1) — в отличие от toTask (используется ТОЛЬКО в write-путях сразу
+// после Transition, где status/updated_at ещё не отражены в уже прочитанной
+// row), здесь Transition в рамках этого запроса не происходил: row уже
+// содержит актуальные status и updated_at, оба берутся прямо из неё.
+func (s *Server) toTaskRow(row db.Task) (Task, error) {
 	id := uuid.UUID(row.ID.Bytes)
 	integrationID := uuid.UUID(row.IntegrationID.Bytes)
-	text := string(row.TextEnc)
+	text, err := s.decryptTaskText(row.TextEnc)
+	if err != nil {
+		return Task{}, err
+	}
 	status := TaskStatus(row.Status)
 	createdAt := row.CreatedAt.Time
 	updatedAt := row.UpdatedAt.Time
@@ -939,19 +1033,19 @@ func toTaskRow(row db.Task) Task {
 		Status:        &status,
 		CreatedAt:     &createdAt,
 		UpdatedAt:     &updatedAt,
-	}
+	}, nil
 }
 
 // toTaskEvent конвертирует строку журнала событий в контрактный TaskEvent
-// (тикет 8.6, FR H1, §10 «Состав записи о задаче»). PayloadEnc сейчас хранит
-// открытый JSON (TODO(11.1) — шифрование at-rest, вне объёма); если
-// Unmarshal вдруг не удался (данные должны быть валидным JSON, т.к. пишутся
-// только через json.Marshal в этом же кодовом пути — падение здесь означало
-// бы порчу данных, не штатный случай), Payload остаётся nil, но остальные
-// поля события (id, seq, type, created_at) всё равно возвращаются — история
-// бессрочна (FR I2) и не должна терять записи целиком из-за одного плохого
-// payload.
-func toTaskEvent(row db.TaskEvent) TaskEvent {
+// (тикет 8.6, FR H1, §10 «Состав записи о задаче»), расшифровывая payload_enc
+// (FR I1, тикет 11.1). Если payload не удалось расшифровать ИЛИ распарсить как
+// JSON (порча данных / смена ключа — не штатный случай, т.к. пишется только
+// через Transitioner в этом же кодовом пути), Payload остаётся nil, но
+// остальные поля события (id, seq, type, created_at) всё равно возвращаются —
+// история бессрочна (FR I2) и не должна терять записи целиком из-за одного
+// плохого payload (та же терпимость, что была и до шифрования, — теперь она
+// покрывает и сбой расшифровки, не только json.Unmarshal).
+func (s *Server) toTaskEvent(row db.TaskEvent) TaskEvent {
 	id := uuid.UUID(row.ID.Bytes)
 	seq := int(row.Seq)
 	eventType := TaskEventType(row.Type)
@@ -963,9 +1057,11 @@ func toTaskEvent(row db.TaskEvent) TaskEvent {
 		Type:      &eventType,
 		CreatedAt: &createdAt,
 	}
-	var payload map[string]interface{}
-	if err := json.Unmarshal(row.PayloadEnc, &payload); err == nil {
-		result.Payload = &payload
+	if plaintext, err := s.decryptEventPayload(row.PayloadEnc); err == nil {
+		var payload map[string]interface{}
+		if err := json.Unmarshal(plaintext, &payload); err == nil {
+			result.Payload = &payload
+		}
 	}
 	return result
 }
