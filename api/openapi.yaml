@@ -381,6 +381,41 @@ paths:
                   code: { type: string }
                   expires_at: { type: string, format: date-time }
 
+  /channels/telegram/link:
+    post:
+      tags: [channels]
+      security: []
+      summary: Обменять код привязки на привязку Telegram-аккаунта
+      description: |
+        Вызывается ботом (тикет 10.2) при обработке `/start <code>`: обменивает
+        одноразовый код (выданный `POST /channels/telegram/link-code`, тикет 9.6) на
+        привязку telegram_user_id ↔ user_id (FR D3, Gherkin §6). Без Bearer — в этой
+        точке пользователь ещё не аутентифицирован в системе как web-клиент; вместо
+        этого доказательством права на привязку служит сам одноразовый код —
+        высокоэнтропийный, одноразовый, с ограниченным сроком жизни (та же модель
+        доверия, что у registration_token в POST /auth/register). Код атомарно
+        помечается использованным ТОЛЬКО при успешной привязке (одна транзакция) —
+        на любой ошибке код остаётся в прежнем состоянии (кроме случаев, когда сама
+        ошибка — «код уже использован» или «код истёк»), т.е. неудачная попытка
+        (например конфликт already-linked) не сжигает код впустую.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChannelLinkRequest" }
+      responses:
+        "200":
+          description: Аккаунт привязан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChannelLink" }
+        "400": { description: Некорректное тело запроса }
+        "404": { description: Код привязки не найден }
+        "409":
+          description: >
+            Код уже использован, истёк, либо этот telegram_user_id уже привязан к
+            другому аккаунту — см. поле code в теле ошибки.
+
   # ---------- MACHINE (WebSocket, auth по UUID) ----------
   /machine/ws:
     get:
@@ -554,4 +589,26 @@ components:
           type: string
           enum: [status_change, agent_question, user_answer, command_approval_request, user_decision, agent_progress, agent_completed, error]
         payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+
+    ChannelLinkRequest:
+      type: object
+      description: Тело POST /channels/telegram/link (FR D3, тикет 10.2).
+      required: [code, telegram_user_id]
+      properties:
+        code:
+          type: string
+          description: Одноразовый код привязки из POST /channels/telegram/link-code (тикет 9.6).
+        telegram_user_id:
+          type: string
+          description: >
+            Telegram user id отправителя /start <code> (числовой id Telegram, передаётся
+            строкой — channel_links.external_id хранит идентификатор как TEXT, канало-агностично).
+
+    ChannelLink:
+      type: object
+      description: Привязка внешнего канала к аккаунту (FR D3).
+      properties:
+        channel: { type: string, enum: [telegram] }
+        external_id: { type: string, description: telegram_user_id привязанного Telegram-аккаунта }
         created_at: { type: string, format: date-time }

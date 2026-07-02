@@ -1,18 +1,24 @@
 // Package main — точка входа Telegram-бота.
 //
-// Назначение (бизнес): бот — тонкий адаптер канала Telegram (FR D1, D4, G2):
-// webhook на входящие и доставка уведомлений из топика notifications.telegram.
-// Вся бизнес-логика остаётся в оркестраторе (принцип «единый API»). В тикете
-// 0.6 здесь был реализован общий операционный каркас (конфиг из env, slog,
-// /healthz, graceful shutdown); тикет 10.1 (эпик 10) добавляет каркас приёма
-// апдейтов через webhook за Caddy (`bot.<домен>`): telebot v3, секретный путь
-// `/webhook/<secret>`, регистрация webhook при старте (SetWebhook) и базовое
-// логирование апдейта. Команды `/start`, привязка аккаунта и действия — тикеты
-// 10.2/10.3, consumer уведомлений — тикет 10.4.
+// Назначение (бизнес): бот — тонкий адаптер канала Telegram (FR D1, D3, D4,
+// G2): webhook на входящие, привязка аккаунта и доставка уведомлений из
+// топика notifications.telegram. Вся бизнес-логика остаётся в оркестраторе
+// (принцип «единый API»). В тикете 0.6 здесь был реализован общий
+// операционный каркас (конфиг из env, slog, /healthz, graceful shutdown);
+// тикет 10.1 (эпик 10) добавляет каркас приёма апдейтов через webhook за
+// Caddy (`bot.<домен>`): telebot v3, секретный путь `/webhook/<secret>`,
+// регистрация webhook при старте (SetWebhook) и базовое логирование апдейта;
+// тикет 10.2 добавляет первый реальный хендлер — `/start <code>` (обмен
+// одноразового кода на привязку telegram_user_id ↔ user_id, FR D3, см.
+// bot/start.go и bot/internal/orchestrator). Действия из Telegram
+// (постановка/отмена задачи, ответ на вопрос) — тикет 10.3, consumer
+// уведомлений — тикет 10.4.
 //
 // Как устроено (тех): main — тонкий: грузит конфиг под префиксом BOT_ через
 // общий пакет platform, поднимает каркас сервиса (slog + chi /healthz). Если
-// задан BOT_TOKEN, создаётся *tele.Bot и на общий chi-роутер монтируется
+// задан BOT_TOKEN, создаётся *tele.Bot, регистрируется хендлер `/start`
+// (newStartHandler, bot/start.go — работает и без BOT_ORCHESTRATOR_URL,
+// см. его godoc про мягкую деградацию) и на общий chi-роутер монтируется
 // webhook.Handler по секретному пути (bot/internal/webhook). Если дополнительно
 // задан BOT_PUBLIC_URL, webhook регистрируется в Telegram (SetWebhook) при
 // старте; без него (dev) сервис поднимается, но webhook не регистрируется — так
@@ -28,6 +34,7 @@ import (
 
 	tele "gopkg.in/telebot.v3"
 
+	"github.com/yarabey/agentify/bot/internal/orchestrator"
 	"github.com/yarabey/agentify/bot/internal/webhook"
 	"github.com/yarabey/agentify/internal/platform"
 )
@@ -69,6 +76,17 @@ type config struct {
 	// требует доступной публичной сети (см. run). В prod задаётся обязательно,
 	// иначе Telegram не будет слать апдейты.
 	PublicURL string `env:"PUBLIC_URL"`
+
+	// OrchestratorURL — базовый URL API оркестратора (напр.
+	// `http://orchestrator:8080` внутри docker compose или `https://api.<домен>`
+	// в проде), нужен /start <code> для обмена кода привязки (тикет 10.2, FR D3,
+	// см. bot/internal/orchestrator и bot/start.go). Переменная
+	// BOT_ORCHESTRATOR_URL. Пустое значение (дефолт) означает «привязка через
+	// /start отключена» — обработчик регистрируется всё равно (см.
+	// newStartHandler), но отвечает пользователю "функция недоступна" вместо
+	// обращения к оркестратору; удобно для dev/CI без поднятого оркестратора,
+	// тот же принцип, что у Token/PublicURL выше.
+	OrchestratorURL string `env:"ORCHESTRATOR_URL"`
 }
 
 func main() {
@@ -136,9 +154,24 @@ func setupWebhook(svc *platform.Service, cfg config) error {
 		return fmt.Errorf("bot: не удалось создать telebot-бота (проверьте BOT_TOKEN): %w", err)
 	}
 
-	// Базовые хендлеры (команды /start, привязка, действия) добавят тикеты
-	// 10.2/10.3 через bot.Handle(...). Здесь только каркас приёма: сам факт
-	// апдейта логируется в webhook.Handler до ProcessUpdate.
+	// /start <code> — обмен кода привязки Telegram-аккаунта (тикет 10.2, FR
+	// D3, см. bot/start.go). Клиент к оркестратору nil, если
+	// BOT_ORCHESTRATOR_URL не задан — обработчик регистрируется всё равно
+	// (см. godoc newStartHandler про мягкую деградацию). Действия из Telegram
+	// (постановка/отмена задачи, ответ на вопрос) — тикет 10.3, здесь не
+	// регистрируются.
+	// ВАЖНО: orchClient объявлена именно типом telegramLinker (интерфейс,
+	// bot/start.go), а не *orchestrator.Client — иначе неприсвоенный
+	// typed-nil-указатель внутри интерфейсного параметра newStartHandler не
+	// был бы равен nil (классическая ловушка Go), и проверка client == nil в
+	// startReplyText молча перестала бы работать.
+	var orchClient telegramLinker
+	if cfg.OrchestratorURL != "" {
+		orchClient = orchestrator.NewClient(cfg.OrchestratorURL)
+	} else {
+		svc.Logger().Warn("привязка аккаунта (/start) отключена: BOT_ORCHESTRATOR_URL не задан")
+	}
+	bot.Handle("/start", newStartHandler(orchClient, svc.Logger()))
 
 	path := webhook.Path(cfg.WebhookSecret)
 	svc.Router().Post(path, webhook.NewHandler(bot, cfg.WebhookSecret, svc.Logger()).ServeHTTP)

@@ -102,7 +102,14 @@ services:
       # Публичный адрес бота за Caddy (https://bot.<домен>); задан → на старте
       # регистрируется webhook в Telegram. Пусто в dev.
       BOT_PUBLIC_URL: ${BOT_PUBLIC_URL:-}
+      # Адрес API оркестратора внутри compose-сети (тикет 10.2, FR D3) — нужен
+      # /start <code> для обмена кода привязки (см. bot/internal/orchestrator).
+      # Внутренний DNS compose (сервис orchestrator слушает :8080), не публичный
+      # https://api.<домен> — бот ходит к оркестратору напрямую, минуя Caddy.
+      BOT_ORCHESTRATOR_URL: http://orchestrator:8080
     depends_on:
+      orchestrator:
+        condition: service_started
       redpanda:
         condition: service_healthy
 

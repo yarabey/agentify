@@ -37,6 +37,29 @@ API**, в который ходят и web PWA, и Telegram-бот (принци
   интеграции/задачи — позже) пока отвечают `501 Not Implemented` (встроенная
   заглушка `api.Unimplemented`) и реализуются в своих тикетах.
 
+**`POST /channels/telegram/link`** — обмен одноразового кода привязки на
+привязку Telegram-аккаунта (тикет 10.2, FR D3 «привязка канала к аккаунту
+описана явно», Gherkin §6 «Уведомления», см. годок
+[`internal/api/channels.go`](internal/api/channels.go)).
+Вызывается ботом при обработке `/start <code>` (см. `bot/README.md`).
+Маршрут **без Bearer** (`security: []`) — в этой точке пользователь ещё не
+аутентифицирован как web-клиент, единственное доказательство права на
+привязку — сам одноразовый код (та же модель доверия, что у
+`registration_token` в `POST /auth/register`). Тело `ChannelLinkRequest`
+(`code`, `telegram_user_id`); вся проверка (не найден/истёк/уже использован) и
+атомарная запись `channel_links` — в
+[`internal/channel.Linker.Exchange`](internal/channel/link.go) (одна
+транзакция: код помечается использованным ТОЛЬКО при успешной привязке).
+Код привязки генерирует `POST /channels/telegram/link-code` — **тикет 9.6,
+пока не реализован**; таблицы `channel_link_codes`/`channel_links` — миграция
+`00004_channels.sql`.
+- успех → `200` + `ChannelLink`;
+- код не найден → `404 link_code_not_found`;
+- код истёк → `409 link_code_expired`;
+- код уже использован → `409 link_code_used`;
+- этот `telegram_user_id` уже привязан к другому пользователю →
+  `409 channel_already_linked`.
+
 Маршруты монтируются от корня (`/auth/register`, `/healthz`): Caddy в compose
 роутит `/api/*` → orchestrator со стрипом префикса.
 
@@ -82,6 +105,15 @@ curl -s -X POST localhost:8080/auth/register \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"s3cr3t","registration_token":"<активный токен>"}'
 # 201 — аккаунт создан; 403 — нет/неверный токен; 409 — username занят.
+
+# Привязка Telegram (тикет 10.2) — код в MVP пока создаётся напрямую в БД
+# (генерация — тикет 9.6):
+#   INSERT INTO channel_link_codes (code, user_id, channel, expires_at)
+#   VALUES ('devcode', '<user_id>', 'telegram', now() + interval '1 hour');
+curl -s -X POST localhost:8080/channels/telegram/link \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"devcode","telegram_user_id":"999"}'
+# 200 — привязано; 404 — код не найден; 409 — истёк/использован/telegram уже привязан.
 ```
 
 Активный токен регистрации создаётся bootstrap-командой (тикет 1.7) или

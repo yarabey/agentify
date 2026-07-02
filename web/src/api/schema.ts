@@ -876,6 +876,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channels/telegram/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Обменять код привязки на привязку Telegram-аккаунта
+         * @description Вызывается ботом (тикет 10.2) при обработке `/start <code>`: обменивает
+         *     одноразовый код (выданный `POST /channels/telegram/link-code`, тикет 9.6) на
+         *     привязку telegram_user_id ↔ user_id (FR D3, Gherkin §6). Без Bearer — в этой
+         *     точке пользователь ещё не аутентифицирован в системе как web-клиент; вместо
+         *     этого доказательством права на привязку служит сам одноразовый код —
+         *     высокоэнтропийный, одноразовый, с ограниченным сроком жизни (та же модель
+         *     доверия, что у registration_token в POST /auth/register). Код атомарно
+         *     помечается использованным ТОЛЬКО при успешной привязке (одна транзакция) —
+         *     на любой ошибке код остаётся в прежнем состоянии (кроме случаев, когда сама
+         *     ошибка — «код уже использован» или «код истёк»), т.е. неудачная попытка
+         *     (например конфликт already-linked) не сжигает код впустую.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["ChannelLinkRequest"];
+                };
+            };
+            responses: {
+                /** @description Аккаунт привязан */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ChannelLink"];
+                    };
+                };
+                /** @description Некорректное тело запроса */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Код привязки не найден */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Код уже использован, истёк, либо этот telegram_user_id уже привязан к другому аккаунту — см. поле code в теле ошибки. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/machine/ws": {
         parameters: {
             query?: never;
@@ -1050,6 +1124,22 @@ export interface components {
             payload?: {
                 [key: string]: unknown;
             };
+            /** Format: date-time */
+            created_at?: string;
+        };
+        /** @description Тело POST /channels/telegram/link (FR D3, тикет 10.2). */
+        ChannelLinkRequest: {
+            /** @description Одноразовый код привязки из POST /channels/telegram/link-code (тикет 9.6). */
+            code: string;
+            /** @description Telegram user id отправителя /start <code> (числовой id Telegram, передаётся строкой — channel_links.external_id хранит идентификатор как TEXT, канало-агностично). */
+            telegram_user_id: string;
+        };
+        /** @description Привязка внешнего канала к аккаунту (FR D3). */
+        ChannelLink: {
+            /** @enum {string} */
+            channel?: "telegram";
+            /** @description telegram_user_id привязанного Telegram-аккаунта */
+            external_id?: string;
             /** Format: date-time */
             created_at?: string;
         };
