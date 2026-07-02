@@ -26,10 +26,11 @@ import (
 // переданного контекста; на любом из событий гасит http.Server через Shutdown
 // с дедлайном Config.ShutdownTimeout.
 type Service struct {
-	name   string
-	logger *slog.Logger
-	cfg    Config
-	router chi.Router
+	name    string
+	logger  *slog.Logger
+	cfg     Config
+	router  chi.Router
+	metrics *Metrics
 }
 
 // NewService собирает каркас сервиса: валидирует базовый конфиг, строит логгер
@@ -44,10 +45,11 @@ func NewService(name string, cfg Config) (*Service, error) {
 	}
 	logger := NewLogger(cfg, name)
 	return &Service{
-		name:   name,
-		logger: logger,
-		cfg:    cfg,
-		router: NewHealthRouter(name, logger),
+		name:    name,
+		logger:  logger,
+		cfg:     cfg,
+		router:  NewHealthRouter(name, logger),
+		metrics: NewMetrics(name),
 	}, nil
 }
 
@@ -61,6 +63,17 @@ func (s *Service) Logger() *slog.Logger {
 // последующие тикеты могли навешивать на него свои маршруты до вызова Run.
 func (s *Service) Router() chi.Router {
 	return s.router
+}
+
+// Metrics возвращает Prometheus-метрики сервиса (тикет 11.4, ТЗ
+// «эксплуатация»): GET /metrics уже смонтирован безусловно поверх любого
+// router'а (см. Run/Metrics.wrapRouter) — сервису не нужно монтировать его
+// самому. Metrics() нужен, чтобы main.go зарегистрировал в том же реестре
+// (Metrics().Registry()) свои специфичные метрики (например,
+// orchestrator/internal/metrics: переходы FSM задачи, активные
+// WS-соединения машин) — они попадут в тот же общий эндпоинт.
+func (s *Service) Metrics() *Metrics {
+	return s.metrics
 }
 
 // SetHandler заменяет HTTP-роутер сервиса на переданный handler перед вызовом
@@ -102,8 +115,12 @@ func (s *Service) Run(ctx context.Context) error {
 	defer stop()
 
 	srv := &http.Server{
-		Addr:              s.cfg.HealthAddr,
-		Handler:           s.router,
+		Addr: s.cfg.HealthAddr,
+		// wrapRouter (тикет 11.4) оборачивает текущий s.router: инструментирует
+		// каждый запрос HTTP-метриками и безусловно добавляет GET /metrics —
+		// независимо от того, был ли router заменён через SetHandler ДО этого
+		// вызова (обычный порядок: SetHandler вызывается до Run, см. её годок).
+		Handler:           s.metrics.wrapRouter(s.router),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

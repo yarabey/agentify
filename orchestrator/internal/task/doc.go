@@ -36,5 +36,10 @@
 //     (AES-256-GCM, FR I1, тикет 11.1) прямо перед записью, под подключом из
 //     мастер-ключа приложения (WithMasterKey / EventPayloadKeyPurpose);
 //     расшифровывает payload_enc уже читатель на стороне API (см.
-//     orchestrator/internal/api, tasks.go).
+//     orchestrator/internal/api, tasks.go). Тикет 11.4 (ТЗ «эксплуатация»)
+//     добавляет сюда же наблюдаемость перехода: структурный лог с task_id
+//     (единственная точка смены статуса — самое надёжное место логировать
+//     ВЕСЬ путь задачи одним кодом) и метрику
+//     orchestrator/internal/metrics.TaskTransitionsTotal, оба — ПОСЛЕ
+//     успешного commit транзакции перехода.
 package task

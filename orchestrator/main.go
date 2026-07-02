@@ -22,7 +22,15 @@
 // `orchestrator bootstrap` (тикет 1.7, см. cmd_bootstrap.go): без аргументов
 // запускается обычный сервис (как раньше), с аргументом "bootstrap" —
 // идемпотентно создаёт первого администратора и стартовый токен регистрации и
-// завершается, не поднимая HTTP.
+// завершается, не поднимая HTTP. Тикет 11.4 (ТЗ «эксплуатация») добавляет
+// наблюдаемость: GET /metrics (platform.Metrics, смонтирован безусловно
+// каркасом) плюс бизнес-метрики оркестратора (orchestrator/internal/metrics
+// — переходы FSM задачи, активные WS-соединения машин/web-клиентов),
+// зарегистрированные здесь в run() ДО старта HTTP-сервера, и структурные
+// логи с task_id по ключевым точкам пути задачи (task.Transitioner —
+// единственная точка смены статуса, поэтому и единственная точка,
+// логирующая переход; orchestrator/internal/bridge — факт доставки команды
+// машине).
 package main
 
 import (
@@ -44,6 +52,7 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/bridge"
 	"github.com/yarabey/agentify/orchestrator/internal/channel"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	orchmetrics "github.com/yarabey/agentify/orchestrator/internal/metrics"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
 	"github.com/yarabey/agentify/orchestrator/internal/notify/telegram"
 	"github.com/yarabey/agentify/orchestrator/internal/presence"
@@ -208,6 +217,16 @@ func run() error {
 		return err
 	}
 
+	// Метрики оркестратора (тикет 11.4, ТЗ «эксплуатация»): регистрируем
+	// ДО запуска svc.Run (то есть ДО того, как GET /metrics и вообще
+	// HTTP-сервер начинают обслуживать трафик, см. platform.Metrics.
+	// wrapRouter) — иначе окно между стартом сервера и регистрацией дало бы
+	// GET /metrics шанс ответить БЕЗ бизнес-метрик оркестратора (только
+	// базовые HTTP-метрики платформы). Метрики этого пакета — package-level
+	// переменные (см. её годок про обоснование), Register нужно вызвать
+	// РОВНО ОДИН раз за процесс.
+	orchmetrics.Register(svc.Metrics().Registry())
+
 	// Общий сигнал-чувствительный ctx — как в agent/main.go: создаётся ЗДЕСЬ,
 	// ДО запуска svc.Run, и передаётся всем горутинам (HTTP-сервер, мост
 	// Redpanda) через errgroup. Service.Run сам оборачивает переданный ctx в
@@ -277,7 +296,7 @@ func run() error {
 		// at-rest (FR I1, тикет 11.1), а Server расшифровывает его на чтении, оба
 		// под общим подключом (task.EventPayloadKeyPurpose). Ключи обязаны
 		// совпадать, иначе GCM-тег не сойдётся.
-		server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)))
+		server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())))
 		// Обмен кода привязки Telegram-аккаунта (тикет 10.2, FR D3): не зависит
 		// от Redpanda, только от БД — регистрируется здесь же безусловно, тем
 		// же принципом, что и SetTransitioner/SetNotifier ниже.
@@ -320,7 +339,7 @@ func run() error {
 		// (тикет 7.3) добавится сюда же отдельным каналом, когда будет
 		// реализован.
 		answerTimeoutWorker, err := task.NewAnswerTimeoutWorker(
-			task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)), db.New(pool), server.ClientConnHub(),
+			task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())), db.New(pool), server.ClientConnHub(),
 			task.WithAnswerTimeoutThreshold(cfg.AnswerTimeoutThreshold),
 			task.WithAnswerTimeoutBehavior(task.AnswerTimeoutBehavior(cfg.AnswerTimeoutBehavior)),
 		)
@@ -437,7 +456,7 @@ func run() error {
 			// integrations.status — гейтится тем же условием ORCH_REDPANDA_SEEDS,
 			// потому что last_seen_at в принципе обновляется только через
 			// heartbeat-consumer, который сам гейтится этим условием.
-			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey)), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
+			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
 			if err != nil {
 				return fmt.Errorf("orchestrator: сборка task.StaleWorker: %w", err)
 			}
