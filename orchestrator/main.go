@@ -45,6 +45,7 @@ import (
 	"github.com/yarabey/agentify/orchestrator/internal/channel"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
+	"github.com/yarabey/agentify/orchestrator/internal/notify/telegram"
 	"github.com/yarabey/agentify/orchestrator/internal/presence"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 	"github.com/yarabey/agentify/orchestrator/migrations"
@@ -302,7 +303,11 @@ func run() error {
 		// после создания сервера, до начала обслуживания HTTP/WS-трафика (тот
 		// же принцип, что и у SetTransitioner). НЕ гейтится ORCH_REDPANDA_SEEDS
 		// — web-доставка не зависит от Redpanda/моста, только от БД (тот же
-		// довод, что и у answerTimeoutWorker ниже).
+		// довод, что и у answerTimeoutWorker ниже). Если ORCH_REDPANDA_SEEDS
+		// ЗАДАН, этот вызов ниже (в блоке Redpanda-подсистемы) ПЕРЕрегистрируется
+		// на multiNotifier{web, Telegram} (тикет 7.3, см. notify_fanout.go) —
+		// без Redpanda web остаётся единственным каналом, тот же принцип
+		// «опциональная фича».
 		server.SetNotifier(server.ClientConnHub())
 		svc.SetHandler(api.NewRouter(server))
 
@@ -376,6 +381,23 @@ func run() error {
 			// потокобезопасен (godoc internal/bus/producer.go), отдельный
 			// экземпляр не нужен.
 			server.SetCommandPublisher(producer)
+
+			// Telegram-канал доставки уведомлений (тикет 7.3, FR G1, Gherkin §6
+			// «Уведомление в Telegram»): тот же producer instance (Redpanda-seeds
+			// заданы — единственное дополнительное условие сверх БД, которая уже
+			// проверена выше). telegram.NewNotifier сам резолвит channel_links
+			// пользователя ПЕРЕД публикацией (см. годок пакета) — бот (тикет
+			// 10.4) получает уже готовый chat_id/текст. Регистрируется ЗАМЕНОЙ
+			// notifier'а, установленного выше (server.SetNotifier(server.
+			// ClientConnHub())): multiNotifier рассылает КАЖДОМУ активному
+			// каналу безусловно (наивный fan-out до появления тикета 7.4
+			// «Маршрутизация каналов» — см. notify_fanout.go), поэтому web
+			// продолжает получать уведомления ровно как раньше.
+			telegramNotifier, err := telegram.NewNotifier(producer, db.New(pool))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка telegram.Notifier: %w", err)
+			}
+			server.SetNotifier(newMultiNotifier(svc.Logger(), server.ClientConnHub(), telegramNotifier))
 
 			sink, err := presence.NewSink(producer)
 			if err != nil {

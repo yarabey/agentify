@@ -109,6 +109,34 @@ Caddy/публичный интернет. При валидном секрет�
 Если `ORCH_DATABASE_URL` не задан (каркасные прогоны без БД), API не
 поднимается — остаётся только `/healthz` из `platform`.
 
+### Уведомления: web (тикет 7.2) и Telegram (тикет 7.3)
+
+Доменное событие уведомления (`orchestrator/internal/notify.Notification`,
+тикет 7.1) формируется при вопросе агента и важных сменах статуса задачи
+(`agent_question`/`command_approval_request`/`agent_completed`,
+`handleAgentQuestion` и соседние обработчики в
+[`internal/api/machine_ws.go`](internal/api/machine_ws.go)) и рассылается по
+всем активным каналам (FR G1, Gherkin §6 «Уведомления»):
+
+- **web** — `ClientConnHub` (тикет 7.2, [`internal/api/client_ws.go`](internal/api/client_ws.go)):
+  рассылает уведомление всем открытым `/ws`-соединениям браузера того же
+  пользователя; всегда доступен, от Redpanda не зависит.
+- **Telegram** — `telegram.Notifier` (тикет 7.3,
+  [`internal/notify/telegram`](internal/notify/telegram)): резолвит активную
+  привязку канала пользователя (`channel_links`, тикет 10.2) и, если она есть,
+  публикует в топик `notifications.telegram` (ADR 0001) УЖЕ готовый текст и
+  `telegram_chat_id` — бот (`bot/notify.go`, тикет 10.4) лишь пересылает его в
+  Bot API, не имея доступа к БД оркестратора (принцип «единый API»). Требует
+  `ORCH_REDPANDA_SEEDS`; без него регистрируется только web-канал.
+
+`orchestrator/main.go` регистрирует один и тот же `Notifier` дважды: сразу
+после `NewServer` — только `ClientConnHub` (баз., без Redpanda), и, если
+`ORCH_REDPANDA_SEEDS` задан, — `multiNotifier{ClientConnHub, telegram.Notifier}`
+(`orchestrator/notify_fanout.go`) поверх обоих. `multiNotifier` — наивный
+безусловный fan-out по всем настроенным каналам (ошибка одного канала не
+блокирует остальные); осмысленная маршрутизация между каналами — отдельный
+тикет 7.4 (вне объёма 7.3/10.4).
+
 ## Конфигурация (env)
 
 Все переменные — с префиксом `ORCH_`. Дефолты рассчитаны на запуск в dev без
@@ -126,6 +154,7 @@ Caddy/публичный интернет. При валидном секрет�
 | `ORCH_APP_ENCRYPTION_KEY` | — (пусто) | Мастер-ключ шифрования at-rest, base64 → ровно 32 байта (`openssl rand -base64 32`). При поднятом API обязателен и валидируется по длине. См. раздел «Шифрование at-rest» ниже. |
 | `ORCH_TELEGRAM_LINK_CODE_TTL` | `15m` | Срок действия кода привязки Telegram (`POST /channels/telegram/link-code`, тикет 9.6, FR A2/D3). Продуктовое значение не зафиксировано, см. `docs/MANUAL_STEPS.md` §4. |
 | `ORCH_BOT_SERVICE_SECRET` | — (пусто) | **Секрет.** Общий сервисный секрет между ботом и оркестратором (тикет 10.3, FR D1) для `POST /channels/telegram/token` (заголовок `X-Bot-Service-Secret`). Совпадает со значением `BOT_SERVICE_SECRET` у бота. Пусто (дефолт) → эндпоинт ВСЕГДА отвечает `401` (действия из Telegram отключены) — не фатально для старта, в отличие от `ORCH_JWT_SIGNING_KEY`/`ORCH_APP_ENCRYPTION_KEY`. НЕ коммитится. |
+| `ORCH_REDPANDA_SEEDS` | — (пусто) | Адреса брокеров Redpanda через запятую (тикет 3.2+). Гейтит мост `machine.commands` → WS (3.4), presence/heartbeat (3.6) и Telegram-канал доставки уведомлений (тикет 7.3, см. «Уведомления» выше). Пусто → эти подсистемы не поднимаются, оркестратор продолжает обслуживать REST+WS-handshake и web-уведомления. |
 
 Специфичные для оркестратора поля (Redpanda и др.) добавляются под тем же
 префиксом `ORCH_` в соответствующих тикетах.

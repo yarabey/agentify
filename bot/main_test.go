@@ -35,6 +35,29 @@ func TestLoadConfig_BotFields(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RedpandaSeeds проверяет, что BOT_REDPANDA_SEEDS (тикет 10.4,
+// доставка уведомлений, см. bot/notify.go) читается как срез через запятую —
+// тот же формат/тег envSeparator, что и ORCH_REDPANDA_SEEDS в
+// orchestrator/main.go.
+func TestLoadConfig_RedpandaSeeds(t *testing.T) {
+	t.Setenv("BOT_REDPANDA_SEEDS", "redpanda-1:9092,redpanda-2:9092")
+
+	var cfg config
+	if err := platform.LoadConfig(&cfg, envPrefix); err != nil {
+		t.Fatalf("LoadConfig вернул ошибку: %v", err)
+	}
+
+	want := []string{"redpanda-1:9092", "redpanda-2:9092"}
+	if len(cfg.RedpandaSeeds) != len(want) {
+		t.Fatalf("RedpandaSeeds = %v, ожидался %v", cfg.RedpandaSeeds, want)
+	}
+	for i := range want {
+		if cfg.RedpandaSeeds[i] != want[i] {
+			t.Errorf("RedpandaSeeds[%d] = %q, ожидался %q", i, cfg.RedpandaSeeds[i], want[i])
+		}
+	}
+}
+
 // TestLoadConfig_Defaults проверяет, что без BOT_-переменных конфиг остаётся
 // валидным каркасом 0.6 (dev, без токена/webhook) — то есть бот запускается в
 // dev без единой переменной и не падает (см. run).
@@ -55,5 +78,8 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	}
 	if cfg.PublicURL != "" {
 		t.Errorf("PublicURL по умолчанию = %q, ожидалась пустая строка", cfg.PublicURL)
+	}
+	if len(cfg.RedpandaSeeds) != 0 {
+		t.Errorf("RedpandaSeeds по умолчанию = %v, ожидался пустой срез (доставка уведомлений отключена)", cfg.RedpandaSeeds)
 	}
 }

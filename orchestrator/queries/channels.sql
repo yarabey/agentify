@@ -61,3 +61,19 @@ RETURNING *;
 -- найдено (внешний аккаунт не привязан ни к одному пользователю) →
 -- pgx.ErrNoRows.
 SELECT * FROM channel_links WHERE channel = $1 AND external_id = $2;
+
+-- name: GetChannelLinkByUserAndChannel :one
+-- Резолвит external_id (напр. telegram_user_id) по (user_id, channel) —
+-- ПРЯМОЕ направление по отношению к GetChannelLinkByChannelAndExternalID выше
+-- (user_id → external_id, а не наоборот). Нужен тикету 7.3 (публикация
+-- уведомления в notifications.telegram, orchestrator/internal/notify/telegram):
+-- при формировании уведомления для user_id оркестратор проверяет, есть ли у
+-- него активная привязка Telegram, и если да — публикует уведомление сразу с
+-- telegram_chat_id внутри payload (простой путь без резолва на стороне бота,
+-- принцип «единый API» — оркестратор единственный владелец channel_links).
+-- Схема НЕ гарантирует UNIQUE(user_id, channel) (только UNIQUE(channel,
+-- external_id), см. миграцию 00004) — теоретически один пользователь мог бы
+-- привязать несколько разных Telegram-аккаунтов последовательными кодами;
+-- берём САМУЮ СВЕЖУЮ привязку (ORDER BY created_at DESC). Нет привязки →
+-- pgx.ErrNoRows (штатно — Telegram-канал для этого user_id просто не активен).
+SELECT * FROM channel_links WHERE user_id = $1 AND channel = $2 ORDER BY created_at DESC LIMIT 1;
