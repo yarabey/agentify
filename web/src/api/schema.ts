@@ -950,6 +950,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channels/telegram/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Обменять telegram_user_id на короткоживущий acting-токен (внутренний, только для бота)
+         * @description Действия из Telegram — постановка/отмена задачи, ответ на вопрос агента
+         *     (тикет 10.3, FR D1, §4 «Постановка задачи из канала») — должны выполняться
+         *     через ТОТ ЖЕ REST API, что и web (принцип «единый API»,
+         *     docs/01_tech_stack_and_architecture.md). У бота нет пользовательского
+         *     access-JWT (только telegram_user_id отправителя апдейта), поэтому вместо
+         *     Bearer этот эндпоинт аутентифицируется общим сервисным секретом в
+         *     заголовке X-Bot-Service-Secret (ORCH_BOT_SERVICE_SECRET у оркестратора,
+         *     BOT_SERVICE_SECRET у бота — одно и то же значение, известное только двум
+         *     сервисам; см. docs/MANUAL_STEPS.md). Это доверенный внутренний канал:
+         *     оркестратор доступен боту напрямую внутри docker compose-сети
+         *     (BOT_ORCHESTRATOR_URL, тикет 10.2), минуя Caddy и публичный интернет.
+         *     При валидном секрете telegram_user_id резолвится в user_id через
+         *     channel_links (FR D3, тикет 10.2) и выпускается ОБЫЧНЫЙ access-JWT (тот
+         *     же формат/TTL, что и POST /auth/login, FR A3). Дальше бот выполняет
+         *     постановку/отмену задачи и ответ на вопрос ЧЕРЕЗ ОБЫЧНЫЕ защищённые
+         *     операции контракта (POST /tasks, /tasks/{id}/cancel, /tasks/{id}/answer,
+         *     GET /integrations) с этим токеном как Bearer — у оркестратора нет и не
+         *     появляется отдельного пути постановки задачи «для Telegram».
+         *     telegram_user_id, не привязанный ни к одному аккаунту (пользователь ещё
+         *     не выполнил `/start <code>`), → 404: бот отвечает пользователю подсказкой
+         *     привязать аккаунт (см. bot/README.md).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header: {
+                    "X-Bot-Service-Secret": string;
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["TelegramActingTokenRequest"];
+                };
+            };
+            responses: {
+                /** @description Acting-токен выдан */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TelegramActingToken"];
+                    };
+                };
+                /** @description Некорректное тело запроса */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Неверный/отсутствующий X-Bot-Service-Secret */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description telegram_user_id не привязан ни к одному аккаунту */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/machine/ws": {
         parameters: {
             query?: never;
@@ -1142,6 +1228,17 @@ export interface components {
             external_id?: string;
             /** Format: date-time */
             created_at?: string;
+        };
+        /** @description Тело POST /channels/telegram/token (FR D1, тикет 10.3). */
+        TelegramActingTokenRequest: {
+            /** @description Telegram user id отправителя апдейта (та же строка, что и в ChannelLinkRequest). */
+            telegram_user_id: string;
+        };
+        /** @description Короткоживущий access-JWT, действующий от имени пользователя, к которому привязан telegram_user_id (FR D1, тикет 10.3). Тот же формат и TTL, что и access-токен POST /auth/login (FR A3) — используется боту как Bearer в дальнейших вызовах единого API. */
+        TelegramActingToken: {
+            access_token?: string;
+            /** Format: date-time */
+            expires_at?: string;
         };
     };
     responses: {

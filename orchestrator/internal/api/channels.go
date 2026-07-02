@@ -3,7 +3,9 @@ package api
 // channels.go — привязка Telegram-аккаунта: генерация одноразового кода
 // (тикет 9.6, FR A2, D3) и его обмен на запись channel_links (тикет 10.2, FR
 // D3), Gherkin §6 «Уведомления» — привязка Telegram-аккаунта, предусловие
-// сценария «Уведомление в Telegram».
+// сценария «Уведомление в Telegram»; и выдача боту короткоживущего
+// acting-токена для действий из Telegram от имени привязанного пользователя
+// (тикет 10.3, FR D1, §4 «Постановка задачи из канала»).
 //
 // Назначение (бизнес): пользователь ставит задачи и получает уведомления не
 // только через web, но и через Telegram. Прежде чем это заработает, нужно
@@ -17,7 +19,12 @@ package api
 // (`security: []` в api/openapi.yaml): в ЭТОЙ точке нет web-сессии
 // пользователя, единственное доказательство права на привязку — сам
 // одноразовый код (та же модель доверия, что у registration_token в
-// POST /auth/register, тикет 1.2).
+// POST /auth/register, тикет 1.2). Дальше, когда пользователь пишет боту
+// текст/команду (постановка задачи, отмена, ответ на вопрос — тикет 10.3),
+// бот вызывает PostChannelsTelegramToken, чтобы получить право действовать
+// от его имени через ОБЫЧНЫЕ защищённые операции контракта (принцип «единый
+// API», docs/01_tech_stack_and_architecture.md) — см. её отдельный godoc
+// ниже про архитектурное решение и выбор способа аутентификации бота.
 //
 // Как устроено (тех): вся бизнес-логика (генерация кода — CodeIssuer;
 // проверка кода и атомарная транзакция обмена — Linker.Exchange) — в
@@ -25,15 +32,20 @@ package api
 // запроса и маппинг результатов/сентинел-ошибок на коды ответа контракта (см.
 // ChannelLinker/ChannelLinkCodeIssuer в server.go).
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/yarabey/agentify/internal/auth"
 	"github.com/yarabey/agentify/orchestrator/internal/channel"
+	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
 
 // channelTelegram — значение channel в БД/контракте для Telegram (тикет
@@ -185,4 +197,123 @@ func (s *Server) PostChannelsTelegramLinkCode(w http.ResponseWriter, r *http.Req
 type channelLinkCodeResponse struct {
 	Code      string    `json:"code"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// PostChannelsTelegramToken реализует POST /channels/telegram/token —
+// служебный (не пользовательский) эндпоинт, обменивающий telegram_user_id
+// входящего Telegram-апдейта на короткоживущий пользовательский access-JWT
+// (тикет 10.3, FR D1, §4 «Постановка задачи из канала»).
+//
+// АРХИТЕКТУРНОЕ РЕШЕНИЕ (аутентификация бота для действий от имени
+// пользователя): постановка/отмена задачи и ответ на вопрос агента из
+// Telegram (тикет 10.3) обязаны идти через ТОТ ЖЕ REST API, что и web
+// (принцип «единый API», docs/01_tech_stack_and_architecture.md §1) — у
+// оркестратора не должно появляться отдельного, Telegram-специфичного пути
+// постановки задачи. Проблема: защищённые операции контракта
+// (POST /tasks, /tasks/{id}/cancel, /tasks/{id}/answer, GET /integrations)
+// аутентифицируют по пользовательскому access-JWT (Authorization: Bearer,
+// authMiddleware, тикет 1.4), а у бота такого JWT нет — Telegram присылает
+// боту только telegram_user_id отправителя апдейта, у пользователя никакой
+// web-сессии в этот момент не существует.
+//
+// Рассмотренные варианты:
+//  1. Выпускать сервисный JWT боту с произвольным claim'ом acting_user_id,
+//     проверяемым отдельной веткой authMiddleware. Отклонено: потребовало бы
+//     разветвления auth-middleware на «два вида токенов» (пользовательский
+//     access-JWT vs сервисный JWT-от-имени), что усложняет ЕДИНСТВЕННУЮ
+//     проверочную точку auth.ParseAccessToken/authMiddleware (тикет 1.4) —
+//     она перестаёт быть про «кто предъявитель токена» и становится про
+//     «кто предъявитель и была ли это подмена от чужого имени», два разных
+//     вопроса в одном месте.
+//  2. (ВЫБРАНО) Отдельный внутренний service-to-service эндпоинт
+//     (этот, PostChannelsTelegramToken), защищённый общим сервисным
+//     секретом (X-Bot-Service-Secret, ORCH_BOT_SERVICE_SECRET/
+//     BOT_SERVICE_SECRET) — бот передаёт telegram_user_id, оркестратор сам
+//     резолвит user_id через channel_links (FR D3, тикет 10.2) и выпускает
+//     ОБЫЧНЫЙ access-JWT (auth.IssueAccessToken — та же функция, что и у
+//     POST /auth/login, тикет 1.3, тот же формат/TTL). Дальше бот —
+//     ОБЫЧНЫЙ клиент контракта: шлёт этот JWT как Bearer в POST /tasks и
+//     т.д., проходя ТОТ ЖЕ authMiddleware, что и web, без единой строчки
+//     Telegram-специфичной логики авторизации в бизнес-обработчиках задач
+//     (tasks.go этим тикетом НЕ меняется вообще). Единственное новое
+//     доверенное отношение — между двумя СЕРВИСАМИ (бот↔оркестратор), не
+//     между ботом и произвольным пользователем, и оно уже используется в
+//     проекте: BOT_ORCHESTRATOR_URL (тикет 10.2) — доверенный внутренний
+//     канал compose-сети, доступный боту напрямую по внутреннему DNS,
+//     минуя Caddy/публичный интернет (deploy/docker-compose.yml). Секрет
+//     передаётся тем же путём, что и остальные секреты проекта (GitHub
+//     Secrets/окружение хоста, НЕ коммитится, см. docs/MANUAL_STEPS.md).
+//
+// Явно НЕ рассмотрено и не нужно: постоянный/непросроченный токен бота на
+// пользователя — acting-токен живёт ровно AccessTokenTTL (15 минут, как и
+// обычный access-JWT), бот запрашивает новый при каждом действии
+// пользователя (см. bot/internal/orchestrator.Client.GetActingToken) — не
+// требует отдельного хранилища/ротации токенов на стороне бота.
+//
+// Алгоритм: сверить X-Bot-Service-Secret с s.botServiceSecret (constant-time
+// сравнение, subtle.ConstantTimeCompare — секрет предъявляется по HTTP, та же
+// крипто-гигиена, что и у сравнения хэшей паролей/refresh-токенов) → пустой
+// настроенный секрет ИЛИ несовпадение → 401 (фича мягко выключена без
+// настроенного секрета — деталь НЕ раскрывается вызывающему тем же кодом
+// unauthorized, что и обычный 401 auth-middleware, чтобы не давать сигнал,
+// сконфигурирован ли сервис) → декодировать/провалидировать тело
+// (telegram_user_id обязателен) → резолвить user_id через
+// GetChannelLinkByChannelAndExternalID(channel="telegram", external_id) →
+// не найдено (пользователь ещё не выполнил /start <code>, тикет 10.2) → 404
+// not_linked (бот транслирует это в понятную пользователю подсказку, см.
+// bot/internal/orchestrator.ErrNotLinked) → выпустить access-JWT
+// (auth.IssueAccessToken, TTL = auth.AccessTokenTTL, тот же ключ подписи
+// s.jwtSigningKey, что и у /auth/login) → 200 с access_token/expires_at.
+func (s *Server) PostChannelsTelegramToken(w http.ResponseWriter, r *http.Request, params PostChannelsTelegramTokenParams) {
+	ctx := r.Context()
+
+	secret := s.getBotServiceSecret()
+	// Пустой настроенный секрет — фича мягко выключена (см. godoc поля
+	// botServiceSecret, server.go): ConstantTimeCompare с пустым срезом при
+	// пустом presented-значении дал бы true, поэтому пустой secret
+	// проверяется явно и ВСЕГДА отклоняется, вне зависимости от заголовка.
+	presented := []byte(params.XBotServiceSecret)
+	if len(secret) == 0 || len(presented) != len(secret) || subtle.ConstantTimeCompare(presented, secret) != 1 {
+		writeUnauthorized(w)
+		return
+	}
+
+	var req TelegramActingTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "тело запроса не является валидным JSON")
+		return
+	}
+	if strings.TrimSpace(req.TelegramUserId) == "" {
+		writeError(w, http.StatusBadRequest, "validation_error", "telegram_user_id обязателен")
+		return
+	}
+
+	link, err := s.queries.GetChannelLinkByChannelAndExternalID(ctx, db.GetChannelLinkByChannelAndExternalIDParams{
+		Channel:    channelTelegram,
+		ExternalID: req.TelegramUserId,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_linked", "telegram-аккаунт не привязан к аккаунту agentify")
+			return
+		}
+		s.logError("GetChannelLinkByChannelAndExternalID", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	userID := uuid.UUID(link.UserID.Bytes)
+	now := time.Now().UTC()
+	accessToken, err := auth.IssueAccessToken(userID.String(), s.jwtSigningKey, now)
+	if err != nil {
+		s.logError("auth.IssueAccessToken (telegram acting token)", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	expiresAt := now.Add(auth.AccessTokenTTL)
+	writeJSON(w, http.StatusOK, TelegramActingToken{
+		AccessToken: &accessToken,
+		ExpiresAt:   &expiresAt,
+	})
 }

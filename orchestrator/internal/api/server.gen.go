@@ -35,6 +35,9 @@ type ServerInterface interface {
 	// Сгенерировать код привязки Telegram
 	// (POST /channels/telegram/link-code)
 	PostChannelsTelegramLinkCode(w http.ResponseWriter, r *http.Request)
+	// Обменять telegram_user_id на короткоживущий acting-токен (внутренний, только для бота)
+	// (POST /channels/telegram/token)
+	PostChannelsTelegramToken(w http.ResponseWriter, r *http.Request, params PostChannelsTelegramTokenParams)
 	// Health-check
 	// (GET /healthz)
 	GetHealthz(w http.ResponseWriter, r *http.Request)
@@ -131,6 +134,12 @@ func (_ Unimplemented) PostChannelsTelegramLink(w http.ResponseWriter, r *http.R
 // Сгенерировать код привязки Telegram
 // (POST /channels/telegram/link-code)
 func (_ Unimplemented) PostChannelsTelegramLinkCode(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Обменять telegram_user_id на короткоживущий acting-токен (внутренний, только для бота)
+// (POST /channels/telegram/token)
+func (_ Unimplemented) PostChannelsTelegramToken(w http.ResponseWriter, r *http.Request, params PostChannelsTelegramTokenParams) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -352,6 +361,50 @@ func (siw *ServerInterfaceWrapper) PostChannelsTelegramLinkCode(w http.ResponseW
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PostChannelsTelegramLinkCode(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostChannelsTelegramToken operation middleware
+func (siw *ServerInterfaceWrapper) PostChannelsTelegramToken(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params PostChannelsTelegramTokenParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "X-Bot-Service-Secret" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("X-Bot-Service-Secret")]; found {
+		var XBotServiceSecret string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "X-Bot-Service-Secret", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "X-Bot-Service-Secret", valueList[0], &XBotServiceSecret, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "X-Bot-Service-Secret", Err: err})
+			return
+		}
+
+		params.XBotServiceSecret = XBotServiceSecret
+
+	} else {
+		err := fmt.Errorf("Header parameter X-Bot-Service-Secret is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "X-Bot-Service-Secret", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostChannelsTelegramToken(w, r, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -988,6 +1041,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/channels/telegram/link-code", wrapper.PostChannelsTelegramLinkCode)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/channels/telegram/token", wrapper.PostChannelsTelegramToken)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/healthz", wrapper.GetHealthz)

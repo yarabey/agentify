@@ -18,7 +18,7 @@ Telegram-агностиком (FR D1, D4, G2).
 
 Бот деплоится на наш VPS в составе `docker compose` за Caddy (`bot.<домен>`).
 
-## Что реализовано сейчас (тикеты 0.6, 10.1, 10.2)
+## Что реализовано сейчас (тикеты 0.6, 10.1, 10.2, 10.3)
 
 **Общий операционный каркас** из пакета
 [`internal/platform`](../internal/platform): загрузка конфига из env, slog,
@@ -55,8 +55,48 @@ telegram-аккаунт уже привязан к другому пользов
 (`orchestrator/internal/channel.Linker`, см. `orchestrator/README.md`), бот
 только адаптирует HTTP↔Telegram (принцип «единый API»).
 
-Постановка/отмена задачи и ответ на вопрос агента из Telegram — тикет 10.3;
-consumer уведомлений — тикет 10.4. Хендлеры для них пока не зарегистрированы.
+**Действия из Telegram — постановка/отмена задачи, ответ на вопрос** (тикет
+10.3, FR D1, §4 «Постановка задачи из канала», Примеры: канал=telegram) — см.
+[`bot/task.go`](task.go). Пользователь, уже привязавший аккаунт (`/start
+<code>`), может:
+  - написать боту **обычный текст** (не команду) — бот ставит задачу
+    подключённой машине пользователя (`GET /integrations` → если ровно одна —
+    сразу `POST /tasks`; если ни одной — подсказка подключить машину в web;
+    если несколько — бот НЕ угадывает и просит уточнить машину явно через
+    `/task`, см. ниже — выбор из нескольких машин кнопками/списком — вне
+    объёма этого тикета);
+  - `/task <id машины> <текст задачи>` — та же постановка с ЯВНЫМ выбором
+    машины (нужно, когда подключено больше одной);
+  - `/cancel <id задачи>` — отменяет задачу (FR E6, тикет 8.4);
+  - `/answer <id задачи> <id вопроса> <текст ответа>` — отвечает на вопрос
+    агента (FR F1/F2, тикет 6.1). Доставка САМОГО вопроса пользователю в
+    Telegram — отдельный тикет 7.3/10.4 (consumer уведомлений), ещё НЕ
+    реализован; эта команда рассчитана на пользователя, который уже знает id
+    задачи/вопроса (например, из истории задачи в web).
+
+**Архитектурное решение — как бот действует от имени пользователя без
+пользовательского JWT.** Все три действия идут через ТОТ ЖЕ REST API
+оркестратора, что и web (принцип «единый API»), но REST API аутентифицирует
+защищённые операции по access-JWT пользователя (`Authorization: Bearer`), а у
+бота такого токена нет — Telegram передаёт боту только `telegram_user_id`
+отправителя апдейта. Решение: перед каждым действием бот вызывает
+[`bot/internal/orchestrator`](internal/orchestrator).`Client.GetActingToken` →
+`POST /channels/telegram/token` — служебный (НЕ пользовательский) эндпоинт,
+аутентифицированный ОБЩИМ СЕРВИСНЫМ СЕКРЕТОМ между ботом и оркестратором
+(`BOT_SERVICE_SECRET`/`ORCH_BOT_SERVICE_SECRET`, заголовок
+`X-Bot-Service-Secret`) — доверенным ровно тем же способом, что и
+`BOT_ORCHESTRATOR_URL` (тикет 10.2): прямой вызов внутри `docker compose`-сети,
+минуя Caddy/публичный интернет. Оркестратор резолвит `telegram_user_id` в
+`user_id` через `channel_links` (та же привязка, что и `/start <code>`) и
+выпускает ОБЫЧНЫЙ access-JWT (тот же формат/TTL, что и `POST /auth/login`).
+Дальше `Client.ListIntegrations`/`CreateTask`/`AnswerTask`/`CancelTask`
+вызывают `GET /integrations`/`POST /tasks`/`POST /tasks/{id}/answer`/
+`POST /tasks/{id}/cancel` с этим токеном как Bearer — РОВНО как это делал бы
+web-клиент; в оркестраторе НЕТ отдельной, Telegram-специфичной логики
+постановки/отмены задачи (`tasks.go` этим тикетом не меняется вовсе). Полное
+обоснование выбора — годок `PostChannelsTelegramToken` в
+[`orchestrator/internal/api/channels.go`](../orchestrator/internal/api/channels.go)
+и [`orchestrator/README.md`](../orchestrator/README.md).
 
 `GET /healthz` отвечает `200` и телом `{"status":"ok","service":"bot"}` — нужно
 `docker compose` и Caddy для проверки живости (приёмка тикета 0.3).
@@ -77,12 +117,14 @@ consumer уведомлений — тикет 10.4. Хендлеры для н�
 | `BOT_TOKEN` | *(пусто)* | **Секрет.** Токен бота от @BotFather (FR D1). Пусто → Telegram-часть отключена, только `/healthz`. НЕ коммитить. |
 | `BOT_WEBHOOK_SECRET` | *(пусто)* | **Секрет.** Секрет в пути `/webhook/<secret>` и как `secret_token` Telegram. Обязателен при заданном `BOT_PUBLIC_URL` (иначе фатальная ошибка старта). НЕ коммитить. |
 | `BOT_PUBLIC_URL` | *(пусто)* | Внешний базовый URL бота за Caddy (например `https://bot.<домен>`). Задан → webhook регистрируется в Telegram (`SetWebhook`). Пусто → webhook не регистрируется (dev). |
-| `BOT_ORCHESTRATOR_URL` | *(пусто)* | Базовый URL API оркестратора (тикет 10.2, FR D3), нужен `/start <code>` для обмена кода привязки. Внутри `docker compose` — `http://orchestrator:8080` (внутренний DNS, напрямую, минуя Caddy). Пусто → `/start <code>` отвечает «функция недоступна» вместо обращения к оркестратору (dev/CI без БД). |
+| `BOT_ORCHESTRATOR_URL` | *(пусто)* | Базовый URL API оркестратора (тикеты 10.2/10.3, FR D3/D1), нужен `/start <code>` (обмен кода привязки) и действиям из Telegram (постановка/отмена задачи, ответ на вопрос). Внутри `docker compose` — `http://orchestrator:8080` (внутренний DNS, напрямую, минуя Caddy). Пусто → эти хендлеры отвечают «функция недоступна» вместо обращения к оркестратору (dev/CI без БД). |
+| `BOT_SERVICE_SECRET` | *(пусто)* | **Секрет.** Общий сервисный секрет между ботом и оркестратором (тикет 10.3, FR D1) — отправляется как `X-Bot-Service-Secret` в `POST /channels/telegram/token` (`Client.GetActingToken`). ОБЯЗАН совпадать со значением `ORCH_BOT_SERVICE_SECRET` на стороне оркестратора. Пусто → действия из Telegram отключены (оркестратор всегда отвечает `401`, см. `orchestrator/README.md`). НЕ коммитить. |
 
-> **Секреты** (`BOT_TOKEN`, `BOT_WEBHOOK_SECRET`) в репозиторий не коммитятся:
-> задаются через окружение хоста / GitHub Secrets. `BOT_TOKEN` — это
-> `TELEGRAM_BOT_TOKEN` из [`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) §3;
-> `BOT_WEBHOOK_SECRET` генерируется разово (см. MANUAL_STEPS §2). Полный
+> **Секреты** (`BOT_TOKEN`, `BOT_WEBHOOK_SECRET`, `BOT_SERVICE_SECRET`) в
+> репозиторий не коммитятся: задаются через окружение хоста / GitHub Secrets.
+> `BOT_TOKEN` — это `TELEGRAM_BOT_TOKEN` из
+> [`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) §3; `BOT_WEBHOOK_SECRET` и
+> `BOT_SERVICE_SECRET` генерируются разово (см. MANUAL_STEPS §2). Полный
 > публичный адрес webhook, который выставляется в Telegram, —
 > `https://bot.<домен>/webhook/<BOT_WEBHOOK_SECRET>`.
 
@@ -110,6 +152,16 @@ BOT_TOKEN=123:ABC BOT_WEBHOOK_SECRET=devsecret BOT_ORCHESTRATOR_URL=http://local
 curl -s -XPOST localhost:8080/webhook/devsecret \
   -H 'X-Telegram-Bot-Api-Secret-Token: devsecret' \
   -d '{"update_id":2,"message":{"message_id":2,"from":{"id":999,"first_name":"U"},"chat":{"id":999,"type":"private"},"text":"/start devcode"}}'
+
+# Действия из Telegram (тикет 10.3) — нужен ещё BOT_SERVICE_SECRET,
+# совпадающий с ORCH_BOT_SERVICE_SECRET оркестратора:
+BOT_TOKEN=123:ABC BOT_WEBHOOK_SECRET=devsecret \
+  BOT_ORCHESTRATOR_URL=http://localhost:8081 BOT_SERVICE_SECRET=devbotsecret go run ./bot
+# Постановка задачи обычным текстом (пользователь 999 уже привязан, см. выше):
+curl -s -XPOST localhost:8080/webhook/devsecret \
+  -H 'X-Telegram-Bot-Api-Secret-Token: devsecret' \
+  -d '{"update_id":3,"message":{"message_id":3,"from":{"id":999,"first_name":"U"},"chat":{"id":999,"type":"private"},"text":"Собери проект и прогони тесты"}}'
+# Отмена: /cancel <id задачи>; ответ на вопрос: /answer <id задачи> <id вопроса> <текст>.
 ```
 
 Остановка — `Ctrl+C` (SIGINT) или `kill -TERM <pid>`: сервис гасится gracefully.

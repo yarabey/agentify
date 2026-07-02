@@ -88,6 +88,9 @@ type fakeQuerier struct {
 
 	softDeleteIntegrationResult pgtype.UUID
 	softDeleteIntegrationErr    error
+
+	getChannelLinkByChannelAndExternalIDResult db.ChannelLink
+	getChannelLinkByChannelAndExternalIDErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -252,6 +255,15 @@ func (f fakeQuerier) SoftDeleteIntegration(context.Context, db.SoftDeleteIntegra
 		return pgtype.UUID{}, f.softDeleteIntegrationErr
 	}
 	return f.softDeleteIntegrationResult, nil
+}
+
+// GetChannelLinkByChannelAndExternalID — фейк для юнит-тестов
+// PostChannelsTelegramToken (тикет 10.3, см. channels_token_test.go).
+func (f fakeQuerier) GetChannelLinkByChannelAndExternalID(context.Context, db.GetChannelLinkByChannelAndExternalIDParams) (db.ChannelLink, error) {
+	if f.getChannelLinkByChannelAndExternalIDErr != nil {
+		return db.ChannelLink{}, f.getChannelLinkByChannelAndExternalIDErr
+	}
+	return f.getChannelLinkByChannelAndExternalIDResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api

@@ -160,6 +160,20 @@ type config struct {
 	// дефолт 15m совпадает с channel.DefaultLinkCodeTTL (используется, если
 	// эта переменная почему-то придёт пустой/некорректной длительностью).
 	TelegramLinkCodeTTL time.Duration `env:"TELEGRAM_LINK_CODE_TTL" envDefault:"15m"`
+
+	// BotServiceSecret — общий сервисный секрет между ботом и оркестратором
+	// (тикет 10.3, FR D1), проверяемый PostChannelsTelegramToken (заголовок
+	// X-Bot-Service-Secret). Переменная ORCH_BOT_SERVICE_SECRET, генерируется
+	// ОДНОКРАТНО вручную (`openssl rand -base64 32`, см.
+	// docs/MANUAL_STEPS.md) и совпадает со значением BOT_SERVICE_SECRET на
+	// стороне бота. Секрет: НЕ коммитится. Пустое значение (дефолт) означает
+	// «действия из Telegram отключены» — PostChannelsTelegramToken отвечает
+	// 401 на ЛЮБОЙ запрос (см. godoc SetBotServiceSecret,
+	// orchestrator/internal/api/server.go), а не тихо принимает пустой
+	// заголовок; удобно для dev/CI без настроенного бота, тот же принцип, что
+	// у JWTSigningKey/AppEncryptionKey, но без фатального падения старта —
+	// эндпоинт не единственная точка входа системы, как auth-эндпоинты.
+	BotServiceSecret string `env:"BOT_SERVICE_SECRET"`
 }
 
 func main() {
@@ -272,6 +286,15 @@ func run() error {
 		// код, эта его выпускает. Тоже не зависит от Redpanda, только от БД —
 		// регистрируется здесь же безусловно, тем же принципом.
 		server.SetChannelLinkCodeIssuer(channel.NewCodeIssuer(pool, cfg.TelegramLinkCodeTTL))
+		// Действия из Telegram (тикет 10.3, FR D1): сервисный секрет между
+		// ботом и оркестратором для PostChannelsTelegramToken (см. её
+		// архитектурный godoc в orchestrator/internal/api/channels.go). Не
+		// зависит от Redpanda, только от БД (channel_links) — регистрируется
+		// здесь же безусловно, тем же принципом, что и SetChannelLinker/
+		// SetChannelLinkCodeIssuer выше. Пустой cfg.BotServiceSecret — тот же
+		// принцип «мягкое выключение фичи» (см. godoc SetBotServiceSecret):
+		// эндпоинт остаётся смонтирован, но всегда отвечает 401.
+		server.SetBotServiceSecret([]byte(cfg.BotServiceSecret))
 		// Web-канал доставки уведомлений (тикет 7.2, FR G1): ClientConnHub —
 		// реестр активных WS-соединений браузера (server.ClientConnHub(),
 		// заведён в NewServer безусловно, в отличие от опциональных

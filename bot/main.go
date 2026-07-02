@@ -10,15 +10,19 @@
 // регистрация webhook при старте (SetWebhook) и базовое логирование апдейта;
 // тикет 10.2 добавляет первый реальный хендлер — `/start <code>` (обмен
 // одноразового кода на привязку telegram_user_id ↔ user_id, FR D3, см.
-// bot/start.go и bot/internal/orchestrator). Действия из Telegram
-// (постановка/отмена задачи, ответ на вопрос) — тикет 10.3, consumer
-// уведомлений — тикет 10.4.
+// bot/start.go и bot/internal/orchestrator). Тикет 10.3 добавляет действия из
+// Telegram от имени привязанного пользователя — постановка задачи обычным
+// текстом, явный выбор машины (`/task`), отмена (`/cancel`), ответ на вопрос
+// агента (`/answer`), см. bot/task.go. Consumer уведомлений
+// (notifications.telegram → Bot API) — тикет 10.4, здесь ещё не реализован.
 //
 // Как устроено (тех): main — тонкий: грузит конфиг под префиксом BOT_ через
 // общий пакет platform, поднимает каркас сервиса (slog + chi /healthz). Если
-// задан BOT_TOKEN, создаётся *tele.Bot, регистрируется хендлер `/start`
-// (newStartHandler, bot/start.go — работает и без BOT_ORCHESTRATOR_URL,
-// см. его godoc про мягкую деградацию) и на общий chi-роутер монтируется
+// задан BOT_TOKEN, создаётся *tele.Bot, регистрируются хендлеры `/start`
+// (newStartHandler, bot/start.go), `/task`/`/cancel`/`/answer`/обычный текст
+// (newTaskCommandHandler/newCancelHandler/newAnswerHandler/newTaskTextHandler,
+// bot/task.go — все работают и без BOT_ORCHESTRATOR_URL/BOT_SERVICE_SECRET,
+// см. их godoc про мягкую деградацию) и на общий chi-роутер монтируется
 // webhook.Handler по секретному пути (bot/internal/webhook). Если дополнительно
 // задан BOT_PUBLIC_URL, webhook регистрируется в Telegram (SetWebhook) при
 // старте; без него (dev) сервис поднимается, но webhook не регистрируется — так
@@ -87,6 +91,22 @@ type config struct {
 	// обращения к оркестратору; удобно для dev/CI без поднятого оркестратора,
 	// тот же принцип, что у Token/PublicURL выше.
 	OrchestratorURL string `env:"ORCHESTRATOR_URL"`
+
+	// ServiceSecret — общий сервисный секрет между ботом и оркестратором
+	// (тикет 10.3, FR D1), нужен действиям из Telegram (постановка/отмена
+	// задачи, ответ на вопрос, см. bot/task.go) — Client.GetActingToken
+	// шлёт его как заголовок X-Bot-Service-Secret в POST
+	// /channels/telegram/token. Переменная BOT_SERVICE_SECRET, генерируется
+	// ОДНОКРАТНО вручную (`openssl rand -base64 32`, см.
+	// docs/MANUAL_STEPS.md) и ОБЯЗАНА совпадать со значением
+	// ORCH_BOT_SERVICE_SECRET на стороне оркестратора. Секрет: НЕ
+	// коммитится. Пустое значение (дефолт) означает «действия из Telegram
+	// отключены» — GetActingToken тогда всегда получит 401 от оркестратора
+	// (см. годок SetBotServiceSecret, orchestrator/internal/api/server.go),
+	// а newTaskHandler (bot/task.go) отвечает пользователю "функция
+	// недоступна" вместо обращения к оркестратору — тот же принцип, что у
+	// OrchestratorURL выше.
+	ServiceSecret string `env:"SERVICE_SECRET"`
 }
 
 func main() {
@@ -155,23 +175,44 @@ func setupWebhook(svc *platform.Service, cfg config) error {
 	}
 
 	// /start <code> — обмен кода привязки Telegram-аккаунта (тикет 10.2, FR
-	// D3, см. bot/start.go). Клиент к оркестратору nil, если
-	// BOT_ORCHESTRATOR_URL не задан — обработчик регистрируется всё равно
-	// (см. godoc newStartHandler про мягкую деградацию). Действия из Telegram
-	// (постановка/отмена задачи, ответ на вопрос) — тикет 10.3, здесь не
-	// регистрируются.
-	// ВАЖНО: orchClient объявлена именно типом telegramLinker (интерфейс,
-	// bot/start.go), а не *orchestrator.Client — иначе неприсвоенный
-	// typed-nil-указатель внутри интерфейсного параметра newStartHandler не
-	// был бы равен nil (классическая ловушка Go), и проверка client == nil в
-	// startReplyText молча перестала бы работать.
+	// D3, см. bot/start.go); постановка/отмена задачи и ответ на вопрос из
+	// Telegram — тикет 10.3, FR D1, см. bot/task.go. Оба набора хендлеров
+	// используют ОДИН и тот же *orchestrator.Client (единый HTTP-клиент к
+	// оркестратору) — nil, если BOT_ORCHESTRATOR_URL не задан, тогда все
+	// хендлеры регистрируются всё равно, но отвечают "функция недоступна"
+	// вместо обращения к оркестратору (см. godoc newStartHandler/
+	// actingTokenOrReplyText про мягкую деградацию).
+	// ВАЖНО: orchClient/orchActor объявлены именно интерфейсными типами
+	// (telegramLinker, bot/start.go; telegramActor, bot/task.go), а не
+	// *orchestrator.Client — иначе неприсвоенный typed-nil-указатель внутри
+	// интерфейсного параметра хендлеров не был бы равен nil (классическая
+	// ловушка Go), и проверки на nil внутри chistых функций молча перестали
+	// бы работать.
 	var orchClient telegramLinker
+	var orchActor telegramActor
 	if cfg.OrchestratorURL != "" {
-		orchClient = orchestrator.NewClient(cfg.OrchestratorURL)
+		client := orchestrator.NewClient(cfg.OrchestratorURL, cfg.ServiceSecret)
+		orchClient = client
+		orchActor = client
+		if cfg.ServiceSecret == "" {
+			// Привязка (/start) не требует сервисного секрета (код привязки
+			// сам по себе — доказательство права, тикет 10.2), а действия из
+			// Telegram (тикет 10.3) требуют — предупреждаем отдельно, не
+			// отключая привязку.
+			svc.Logger().Warn("действия из Telegram (постановка/отмена задачи, ответ на вопрос) недоступны: BOT_SERVICE_SECRET не задан")
+		}
 	} else {
-		svc.Logger().Warn("привязка аккаунта (/start) отключена: BOT_ORCHESTRATOR_URL не задан")
+		svc.Logger().Warn("привязка аккаунта (/start) и действия из Telegram отключены: BOT_ORCHESTRATOR_URL не задан")
 	}
 	bot.Handle("/start", newStartHandler(orchClient, svc.Logger()))
+
+	// Действия из Telegram (тикет 10.3, FR D1): постановка задачи обычным
+	// текстом (tele.OnText), явный выбор машины (/task), отмена (/cancel),
+	// ответ на вопрос агента (/answer) — см. bot/task.go.
+	bot.Handle("/task", newTaskCommandHandler(orchActor, svc.Logger()))
+	bot.Handle("/cancel", newCancelHandler(orchActor, svc.Logger()))
+	bot.Handle("/answer", newAnswerHandler(orchActor, svc.Logger()))
+	bot.Handle(tele.OnText, newTaskTextHandler(orchActor, svc.Logger()))
 
 	path := webhook.Path(cfg.WebhookSecret)
 	svc.Router().Post(path, webhook.NewHandler(bot, cfg.WebhookSecret, svc.Logger()).ServeHTTP)
