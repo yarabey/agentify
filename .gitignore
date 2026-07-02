@@ -22,3 +22,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code: изолированные worktree'ы субагентов и локальная конфигурация
+.claude/
