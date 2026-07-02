@@ -28,6 +28,8 @@ tags:
     description: Привязка каналов, напр. Telegram (FR D3)
   - name: machine
     description: Точка подключения агента (WebSocket, auth по UUID)
+  - name: web
+    description: Точка подключения браузера (WebSocket, auth по access-токену)
 
 paths:
   /healthz:
@@ -247,6 +249,9 @@ paths:
               schema: { $ref: "#/components/schemas/Task" }
         "200":
           description: Идемпотентный повтор — возвращена уже созданная задача
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
 
   /tasks/{id}:
     parameters: [ { $ref: "#/components/parameters/IdPath" } ]
@@ -390,6 +395,23 @@ paths:
         "101": { description: Switching Protocols (WebSocket) }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  # ---------- WEB (WebSocket, auth по access-токену) ----------
+  /ws:
+    get:
+      tags: [web]
+      security: []
+      summary: Точка подключения браузера (WebSocket Upgrade)
+      description: |
+        Открытая вкладка web держит исходящее WS-соединение к оркестратору и
+        аутентифицируется по access-токену (FR G1). Уведомления (например, "агент
+        задал вопрос") доставляются в открытую вкладку без перезагрузки страницы
+        (§6 «Уведомление в web по WebSocket»). Формат сообщений — простой JSON,
+        НЕ конверт машинного протокола docs/protocol.md; это не обычный
+        REST-эндпоинт.
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -501,14 +523,23 @@ components:
       required: [integration_id, text]
       properties:
         integration_id: { type: string, format: uuid }
-        text: { type: string }
+        text:
+          type: string
+          description: >-
+            Текст запроса. Неизменяем после создания задачи (FR H3) — API для
+            редактирования текста существующей задачи нет. Чтобы «исправить»
+            уже отправленный запрос, нужно создать новую задачу отдельным
+            POST /tasks (свой Idempotency-Key) — это отдельное действие
+            («повтор»), не затрагивающее статус/журнал уже существующей задачи.
 
     Task:
       type: object
       properties:
         id: { type: string, format: uuid }
         integration_id: { type: string, format: uuid }
-        text: { type: string }
+        text:
+          type: string
+          description: Текст запроса на момент создания задачи; неизменяем (FR H3).
         status: { $ref: "#/components/schemas/TaskStatus" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }

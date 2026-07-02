@@ -1,0 +1,66 @@
+# release-agent.yml — тикет 4.1 (deps: 0.4, 3.3). Источник правды по решению —
+# docs/01_tech_stack_and_architecture.md §3 «Агент (Go-демон)»: «Сборка/релиз:
+# GoReleaser → бинарь в GitHub Releases; install.sh его выкачивает» (FR C1).
+#
+# Назначение (бизнес): единственный путь, которым бинарь агента попадает к
+# пользователю (кроме сборки из исходников). В отличие от остальных трёх
+# сервисов монорепо (orchestrator/bot/web), которые деплоятся по commit SHA
+# через .github/workflows/deploy.yml (Docker-образы в GHCR, БЕЗ git-тегов),
+# агент — единственный компонент, для которого в этом репозитории вообще
+# используются git-теги: релиз агента запускается публикацией тега `v*`
+# (например `v0.1.0`), и только им. Не путать с деплоем остальных сервисов.
+#
+# Как устроено (тех):
+#   * Триггер — push тега `v*`; полная история (fetch-depth: 0) нужна
+#     GoReleaser для генерации changelog между тегами.
+#   * permissions: contents: write — минимально необходимое для публикации
+#     GitHub Release (GoReleaser создаёт релиз и заливает архивы/checksums
+#     через GITHUB_TOKEN этого запуска); явно объявляем на верхнем уровне
+#     workflow, по аналогии с ci.yml.
+#   * GoReleaser ставим тем же способом и той же версией (v2.5.1), что и в
+#     Makefile (GORELEASER_VERSION) и в CI-гейте agent-release-build
+#     (ci.yml) — go install, а не goreleaser-action, чтобы не держать в
+#     репозитории два разных источника правды о версии инструмента.
+#   * `goreleaser release --clean` — полная публикация (НЕ --snapshot):
+#     собирает 4 таргета из .goreleaser.yaml (macOS/Ubuntu × amd64/arm64),
+#     архивирует, считает checksums.txt и создаёт GitHub Release с тегом,
+#     на который сработал триггер.
+#   * Сборка Docker-образов и деплой сюда не входят — это отдельные workflow
+#     (deploy.yml) для orchestrator/bot/web/caddy, вне объёма тикета 4.1.
+name: Release agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.24"
+  # Совпадает с Makefile GORELEASER_VERSION и CI-гейтом agent-release-build
+  # (ci.yml) — один источник правды о зафиксированной версии инструмента.
+  GORELEASER_VERSION: "v2.5.1"
+
+jobs:
+  release:
+    name: goreleaser release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install goreleaser ${{ env.GORELEASER_VERSION }}
+        run: go install github.com/goreleaser/goreleaser/v2@${{ env.GORELEASER_VERSION }}
+
+      - name: goreleaser release --clean
+        run: goreleaser release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

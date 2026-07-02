@@ -1,0 +1,70 @@
+# deploy/docker-compose.prod.yml — прод-оверрай поверх docker-compose.yml (тикет 0.5).
+#
+# Назначение (бизнес): прод-релиз катит уже собранные в CI образы из GHCR (см.
+# .github/workflows/deploy.yml), а не пересобирает их на VPS — деплой должен
+# быть быстрым, детерминированным и не зависеть от состояния build-тулчейна на
+# хосте (01_tech_stack §2 [РЕШЕНИЕ 5]: «CI собирает образы, пушит в GHCR, по SSH
+# делает docker compose pull && up»).
+#
+# Как устроено (тех): запускается ВМЕСТЕ с базовым файлом, не вместо него:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml ...
+# Переопределяем ТОЛЬКО build → image для 4 наших сервисов (orchestrator, bot,
+# web, caddy); env/healthcheck/volumes/depends_on/restart наследуются из
+# базового файла без дублирования. `build: !reset null` — compose-spec reset-тег,
+# явно убирает секцию build из мёрженого сервиса, чтобы `docker compose pull`/`up`
+# на VPS гарантированно брали готовый образ из GHCR (без этого compose молча
+# держал бы build-секцию рядом с image и при отсутствующем образе попытался бы
+# собрать локально). Тег образа — `IMAGE_TAG` (workflow подставляет SHA коммита,
+# который только что собрал и запушил); без неё, для ручных операций — `:latest`.
+#
+# Для caddy дополнительно:
+#   - вместо запечённого в образ deploy/Caddyfile (auto_https off, path-роутинг
+#     для localhost, тикет 0.3) монтируем deploy/Caddyfile.prod — домен-based
+#     роутинг с автоматическим Let's Encrypt TLS;
+#   - домены приходят из окружения (APP_DOMAIN/API_DOMAIN/BOT_DOMAIN) — значения
+#     задаёт человек в deploy/.env на VPS по DNS-записям из MANUAL_STEPS.md §1;
+#     без них compose падает явной ошибкой (`${VAR:?...}`), а не молча стартует
+#     с пустым доменом;
+#   - порты переопределены на 80/443 (`!override`, иначе compose СЛОЖИЛ бы их со
+#     списком из базового файла — `${HTTP_PORT:-8080}:8080` остался бы рядом,
+#     т.к. списочные свойства типа `ports` в compose-спеке при мёрже нескольких
+#     файлов конкатенируются, а не заменяются молча). Домену
+#     без явного порта в Caddyfile.prod соответствует автоматический TLS на
+#     :443 + редирект/ACME HTTP-01 challenge на :80 — то же самое, что слушает
+#     Caddy внутри контейнера, поэтому паблишим именно эту пару;
+#   - именованные тома caddy_data/caddy_config — Caddy хранит в /data выданные
+#     Let's Encrypt сертификаты; без персистентного тома `docker compose up`
+#     после каждого передеплоя заново запрашивал бы сертификат и рисковал
+#     упереться в rate limit Let's Encrypt.
+
+services:
+  orchestrator:
+    build: !reset null
+    image: ghcr.io/yarabey/agentify-orchestrator:${IMAGE_TAG:-latest}
+
+  bot:
+    build: !reset null
+    image: ghcr.io/yarabey/agentify-bot:${IMAGE_TAG:-latest}
+
+  web:
+    build: !reset null
+    image: ghcr.io/yarabey/agentify-web:${IMAGE_TAG:-latest}
+
+  caddy:
+    build: !reset null
+    image: ghcr.io/yarabey/agentify-caddy:${IMAGE_TAG:-latest}
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN обязателен на проде — DNS A-запись app.<домен>, см. MANUAL_STEPS.md §1}
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN обязателен на проде — DNS A-запись api.<домен>, см. MANUAL_STEPS.md §1}
+      BOT_DOMAIN: ${BOT_DOMAIN:?BOT_DOMAIN обязателен на проде — DNS A-запись bot.<домен>, см. MANUAL_STEPS.md §1}
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports: !override
+      - "80:80"
+      - "443:443"
+
+volumes:
+  caddy_data:
+  caddy_config:
