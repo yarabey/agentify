@@ -44,7 +44,11 @@ func TestIntegration_AnswerTimeoutWorker_AutoCancel_MarksTaskCancelled(t *testin
 	q := db.New(pool)
 	taskID := seedTask(ctx, t, pool, q, "answer-timeout-owner")
 
-	tr := task.NewTransitioner(pool)
+	// lastStatusChangePayload (см. stale_worker_integration_test.go) ниже
+	// расшифровывает payload_enc фиксированным staleWorkerTestMasterKey —
+	// Transitioner здесь должен шифровать тем же ключом, иначе GCM-тег не
+	// сойдётся (FR I1, тикет 11.1).
+	tr := task.NewTransitioner(pool, task.WithMasterKey(staleWorkerTestMasterKey))
 
 	// Довести задачу до waiting_user с agent_question (реалистичный payload,
 	// тот же приём, что handleAgentQuestion в machine_ws.go).

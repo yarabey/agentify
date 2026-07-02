@@ -79,8 +79,8 @@ SELECT * FROM tasks WHERE id = $1 AND integration_id = $2;
 -- конкретной записью task_events (её id становится ref_event_id ответа, тикет
 -- 6.1, FR F2). Сопоставление по question_id внутри payload_enc выполняется НА
 -- СТОРОНЕ GO (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
--- payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
--- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+-- payload_enc зашифрован at-rest (тикет 11.1, как text_enc), поэтому
+-- SQL-side JSON-экстракция по нему в принципе невозможна.
 SELECT * FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER BY seq DESC;
 
 -- name: ListCommandApprovalRequestEventsByTask :many
@@ -90,8 +90,8 @@ SELECT * FROM task_events WHERE task_id = $1 AND type = 'agent_question' ORDER B
 -- Тот же приём, что и у ListAgentQuestionEventsByTask выше (тикет 6.1):
 -- сопоставление по request_id внутри payload_enc выполняется НА СТОРОНЕ GO
 -- (после json.Unmarshal), а не SQL-выражением вроде payload_enc::jsonb —
--- payload_enc помимо джейсона со временем станет зашифрованным (TODO(11.1),
--- как text_enc), и SQL-side JSON-экстракция тогда молча сломается.
+-- payload_enc зашифрован at-rest (тикет 11.1, как text_enc), поэтому
+-- SQL-side JSON-экстракция по нему в принципе невозможна.
 SELECT * FROM task_events WHERE task_id = $1 AND type = 'command_approval_request' ORDER BY seq DESC;
 
 -- name: ListActiveTaskIDsByIntegration :many

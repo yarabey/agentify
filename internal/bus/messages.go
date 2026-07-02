@@ -57,6 +57,42 @@ const (
 	MessageTypePing = "ping"
 )
 
+// MessageTypeTelegramNotification — единственный тип сообщения оркестратор →
+// бот (топик TopicNotificationsTelegram, ADR 0001, тикеты 7.3/10.4, FR G1):
+// уведомление пользователя, уже отформатированное оркестратором в готовый
+// текст и адресованное конкретному Telegram-чату (см. TelegramNotificationPayload).
+// В отличие от machine.commands/machine.events здесь один-единственный тип —
+// бот не должен разбирать бизнес-смысл Kind (agent_question/agent_completed/…,
+// см. orchestrator/internal/notify), только доставить готовый текст в чат
+// (принцип «единый API», вся бизнес-логика — в оркестраторе, см.
+// orchestrator/internal/notify/telegram).
+const MessageTypeTelegramNotification = "telegram_notification"
+
+// TelegramNotificationPayload — payload сообщения type ==
+// MessageTypeTelegramNotification (тикеты 7.3/10.4, FR G1, Gherkin §6
+// «Уведомление в Telegram»). Формируется orchestrator/internal/notify/telegram.Notifier
+// ПОСЛЕ резолва привязки канала (channel_links, тикет 10.2) — бот получает уже
+// готовый chat_id и текст, ему не нужен доступ к БД оркестратора (принцип
+// «единый API»: только оркестратор владеет связью user_id ↔ telegram_user_id).
+type TelegramNotificationPayload struct {
+	// TelegramChatID — telegram_user_id получателя (channel_links.external_id,
+	// тикет 10.2), он же chat_id личного чата с ботом (Telegram API: chat_id
+	// приватного чата с пользователем численно равен его user_id).
+	TelegramChatID int64 `json:"telegram_chat_id"`
+	// Kind — вид доменного уведомления (notify.KindAgentQuestion и т.п., см.
+	// orchestrator/internal/notify) — переносится для наблюдаемости/логов
+	// бота; сама доставка (§4, выше) не различает Kind, шлёт готовый Text.
+	Kind string `json:"kind"`
+	// TaskID — задача, к которой относится уведомление (для контекста в
+	// логах бота и потенциальных будущих команд вида /answer, тикет 10.3).
+	TaskID string `json:"task_id"`
+	// Text — готовый человекочитаемый текст уведомления на русском,
+	// сформированный оркестратором (Kind + сырой Payload доменного события,
+	// см. orchestrator/internal/notify/telegram.formatText) — бот отправляет
+	// его как есть, без дополнительного форматирования.
+	Text string `json:"text"`
+}
+
 // AckPayload — payload сообщения type == MessageTypeAck (protocol.md §4, §5):
 // подтверждение агентом обработки команды из machine.commands, отправленное
 // в ответ на конкретный конверт-команду. AckMessageID — это MessageID ИМЕННО

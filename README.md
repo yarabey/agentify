@@ -53,7 +53,7 @@ Makefile             # tools, generate, lint, test, bdd, docs-check, run-local
 | `make generate` | кодогенерация из openapi.yaml и sqlc | заглушка → тикет 0.2 |
 | `make run-local` | поднять стек в docker compose | заглушка → тикет 0.3 |
 | `make docs-check` | проверка документации | заглушка → тикет 0.7 |
-| `make bdd` | прогон Gherkin-сценариев (godog) | заглушка → тикет 11.2 |
+| `make bdd` | прогон Gherkin-сценариев (godog), см. [`orchestrator/features/README.md`](orchestrator/features/README.md) | работает (тикет 11.2) |
 
 ### Быстрый старт для разработчика
 
@@ -77,7 +77,7 @@ CI описан в [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (ти�
 | `test` | `make test` | unit-тесты Go |
 | `generate-check` | `make generate-check` | контракт-генерёнка (oapi-codegen/sqlc/openapi-typescript) синхронна |
 | `docs-check` | `make docs-check` | godoc на экспортируемых символах, TODO с номером, согласованность openapi |
-| `bdd` | `make bdd` | Gherkin-сценарии (godog) — сейчас заглушка, та же команда заработает в 11.2 |
+| `bdd` | `make bdd` | Gherkin-сценарии §1–§10 (godog, orchestrator/features) на testcontainers-Postgres — тикет 11.2, см. [`orchestrator/features/README.md`](orchestrator/features/README.md) |
 | `integration` | `go test -tags=integration ./...` | testcontainers Postgres+Redpanda — каркас для 1.1/3.2/11.3 (тестов с тегом пока нет ⇒ no-op) |
 | `agent-release-build` | `goreleaser check` + `goreleaser build --snapshot --clean` | тикет 4.1: CI собирает все 4 кросс-таргета агента (darwin/linux × amd64/arm64) — без публикации; публикует релизы отдельный [`release-agent.yml`](.github/workflows/release-agent.yml) по git-тегу `v*` |
 | `agent-install-test` | `goreleaser release --snapshot ...` + `install/test-install.sh` в `docker run ubuntu:24.04` | тикет 4.2: `install/install.sh` (скачивание бинаря + sha256 + установка + Node.js) прогоняется целиком в чистом Ubuntu без предустановленного Node |

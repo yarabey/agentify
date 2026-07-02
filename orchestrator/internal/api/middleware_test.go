@@ -195,18 +195,27 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 
 // TestRouter_ProtectedRouteRequiresToken — сквозной тест через NewRouter:
 // защищённый контрактом маршрут (нет `security: []` в openapi.yaml) отдаёт
-// 401 без токена и доходит до обработчика (тут — заглушка Unimplemented,
-// 501) с валидным.
+// 401 без токена и НЕ отдаёт 401 с валидным — доходит до реального
+// обработчика.
 //
 // Маршрут под тестом — POST /channels/telegram/link-code (привязка
-// Telegram, FR D3; ещё не реализован — PostChannelsTelegramLinkCode не
-// переопределён ни в одном обработчике пакета, падает в заглушку
-// Unimplemented). Раньше здесь использовался DELETE /integrations/{id}
-// (реализован с тикета 2.6), затем GET /tasks (реализован тикетом 8.6,
-// GetTasks в tasks.go, отвечает 200) — оба стали негодны для этой проверки
-// по мере реализации; этот тест проверяет общий механизм
-// middleware+Unimplemented на ЛЮБОМ ещё не готовом защищённом маршруте, а не
-// конкретно на каком-то одном пути.
+// Telegram, FR A2/D3, тикет 9.6, PostChannelsTelegramLinkCode в channels.go).
+// С валидным токеном, но БЕЗ сконфигурированного ChannelLinkCodeIssuer
+// (newTestServer его не регистрирует) обработчик отвечает 500 — тот же
+// инвариант-сбой инициализации, что и у остальных Setter-зависимых
+// обработчиков (channelLinker/transitioner/commandPublisher); этот тест
+// проверяет ТОЛЬКО то, что middleware пропустило запрос до обработчика
+// (статус — не 401), а не конкретное значение ответа обработчика.
+//
+// Раньше здесь ожидался 501 от заглушки Unimplemented: маршрут был защищён,
+// но ещё не реализован (сначала DELETE /integrations/{id}, затем GET /tasks,
+// затем /channels/telegram/link-code — каждый становился негодным для этой
+// проверки по мере реализации своим тикетом). С тикета 9.6
+// PostChannelsTelegramLinkCode стал последней операцией контракта, у которой
+// появился реальный обработчик (см. package-godoc server.go) — заглушка
+// Unimplemented больше не задействована ни одним реальным маршрутом; сама
+// она по-прежнему проверяется отдельно (TestUnimplementedStubReturns501,
+// register_test.go).
 func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	router := NewRouter(newTestServer(fakeQuerier{}))
 
@@ -221,8 +230,8 @@ func TestRouter_ProtectedRouteRequiresToken(t *testing.T) {
 	withToken.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
 	withTokenRec := httptest.NewRecorder()
 	router.ServeHTTP(withTokenRec, withToken)
-	if withTokenRec.Code != http.StatusNotImplemented {
-		t.Fatalf("с валидным токеном: статус = %d (%s), ожидался 501 (обработчик ещё не реализован, но middleware пропустило)", withTokenRec.Code, withTokenRec.Body.String())
+	if withTokenRec.Code == http.StatusUnauthorized {
+		t.Fatalf("с валидным токеном: статус = 401 (%s), middleware должно было пропустить запрос до обработчика", withTokenRec.Body.String())
 	}
 }
 

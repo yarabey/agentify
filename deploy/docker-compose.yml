@@ -77,6 +77,15 @@ services:
       ORCH_DATABASE_URL: postgres://${POSTGRES_USER:-agentify}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentify}?sslmode=disable
       # Seed-брокер Redpanda для моста machine.commands → WS (тикет 3.4, ADR 0001).
       ORCH_REDPANDA_SEEDS: redpanda:9092
+      # Сервисный секрет бот↔оркестратор (тикет 10.3, FR D1) для
+      # POST /channels/telegram/token (действия из Telegram от имени
+      # привязанного пользователя, см. orchestrator/README.md). НАМЕРЕННО тот
+      # же host-переменная BOT_SERVICE_SECRET, что и у сервиса bot ниже —
+      # значения гарантированно совпадают по построению (одна переменная в
+      # deploy/.env), а не две независимые копии одного секрета, которые
+      # могли бы разъехаться. Пусто в dev → эндпоинт всегда отвечает 401
+      # (действия из Telegram отключены), это не фатально для старта.
+      ORCH_BOT_SERVICE_SECRET: ${BOT_SERVICE_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,7 +102,34 @@ services:
       BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-info}
       BOT_LOG_FORMAT: ${BOT_LOG_FORMAT:-json}
       BOT_HEALTH_ADDR: ":8080"
+      # Telegram-webhook (тикет 10.1, FR D1). Все три — из deploy/.env; пустые в
+      # dev (тогда бот поднимает только /healthz и не падает без токена).
+      # Секреты (BOT_TOKEN, BOT_WEBHOOK_SECRET) НЕ коммитятся — в проде их пишет
+      # deploy-workflow в deploy/.env из GitHub Secrets (см. MANUAL_STEPS.md §3).
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET:-}
+      # Публичный адрес бота за Caddy (https://bot.<домен>); задан → на старте
+      # регистрируется webhook в Telegram. Пусто в dev.
+      BOT_PUBLIC_URL: ${BOT_PUBLIC_URL:-}
+      # Адрес API оркестратора внутри compose-сети (тикеты 10.2/10.3, FR D3/D1)
+      # — нужен /start <code> (обмен кода привязки) и действиям из Telegram
+      # (см. bot/internal/orchestrator). Внутренний DNS compose (сервис
+      # orchestrator слушает :8080), не публичный https://api.<домен> — бот
+      # ходит к оркестратору напрямую, минуя Caddy.
+      BOT_ORCHESTRATOR_URL: http://orchestrator:8080
+      # Сервисный секрет бот↔оркестратор (тикет 10.3, FR D1) — та же
+      # host-переменная BOT_SERVICE_SECRET, что и у ORCH_BOT_SERVICE_SECRET
+      # сервиса orchestrator выше (см. комментарий там про гарантированное
+      # совпадение значений).
+      BOT_SERVICE_SECRET: ${BOT_SERVICE_SECRET:-}
+      # Seed-брокер Redpanda для consumer'а notifications.telegram (тикет
+      # 10.4, FR G1, ADR 0001, consumer group "telegram-bot") — та же
+      # переменная compose-сети, что и ORCH_REDPANDA_SEEDS у orchestrator
+      # выше (публикует оркестратор, тикет 7.3, см. orchestrator/README.md).
+      BOT_REDPANDA_SEEDS: redpanda:9092
     depends_on:
+      orchestrator:
+        condition: service_started
       redpanda:
         condition: service_healthy
 

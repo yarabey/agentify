@@ -381,6 +381,88 @@ paths:
                   code: { type: string }
                   expires_at: { type: string, format: date-time }
 
+  /channels/telegram/link:
+    post:
+      tags: [channels]
+      security: []
+      summary: Обменять код привязки на привязку Telegram-аккаунта
+      description: |
+        Вызывается ботом (тикет 10.2) при обработке `/start <code>`: обменивает
+        одноразовый код (выданный `POST /channels/telegram/link-code`, тикет 9.6) на
+        привязку telegram_user_id ↔ user_id (FR D3, Gherkin §6). Без Bearer — в этой
+        точке пользователь ещё не аутентифицирован в системе как web-клиент; вместо
+        этого доказательством права на привязку служит сам одноразовый код —
+        высокоэнтропийный, одноразовый, с ограниченным сроком жизни (та же модель
+        доверия, что у registration_token в POST /auth/register). Код атомарно
+        помечается использованным ТОЛЬКО при успешной привязке (одна транзакция) —
+        на любой ошибке код остаётся в прежнем состоянии (кроме случаев, когда сама
+        ошибка — «код уже использован» или «код истёк»), т.е. неудачная попытка
+        (например конфликт already-linked) не сжигает код впустую.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChannelLinkRequest" }
+      responses:
+        "200":
+          description: Аккаунт привязан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChannelLink" }
+        "400": { description: Некорректное тело запроса }
+        "404": { description: Код привязки не найден }
+        "409":
+          description: >
+            Код уже использован, истёк, либо этот telegram_user_id уже привязан к
+            другому аккаунту — см. поле code в теле ошибки.
+
+  /channels/telegram/token:
+    post:
+      tags: [channels]
+      security: []
+      summary: Обменять telegram_user_id на короткоживущий acting-токен (внутренний, только для бота)
+      description: |
+        Действия из Telegram — постановка/отмена задачи, ответ на вопрос агента
+        (тикет 10.3, FR D1, §4 «Постановка задачи из канала») — должны выполняться
+        через ТОТ ЖЕ REST API, что и web (принцип «единый API»,
+        docs/01_tech_stack_and_architecture.md). У бота нет пользовательского
+        access-JWT (только telegram_user_id отправителя апдейта), поэтому вместо
+        Bearer этот эндпоинт аутентифицируется общим сервисным секретом в
+        заголовке X-Bot-Service-Secret (ORCH_BOT_SERVICE_SECRET у оркестратора,
+        BOT_SERVICE_SECRET у бота — одно и то же значение, известное только двум
+        сервисам; см. docs/MANUAL_STEPS.md). Это доверенный внутренний канал:
+        оркестратор доступен боту напрямую внутри docker compose-сети
+        (BOT_ORCHESTRATOR_URL, тикет 10.2), минуя Caddy и публичный интернет.
+        При валидном секрете telegram_user_id резолвится в user_id через
+        channel_links (FR D3, тикет 10.2) и выпускается ОБЫЧНЫЙ access-JWT (тот
+        же формат/TTL, что и POST /auth/login, FR A3). Дальше бот выполняет
+        постановку/отмену задачи и ответ на вопрос ЧЕРЕЗ ОБЫЧНЫЕ защищённые
+        операции контракта (POST /tasks, /tasks/{id}/cancel, /tasks/{id}/answer,
+        GET /integrations) с этим токеном как Bearer — у оркестратора нет и не
+        появляется отдельного пути постановки задачи «для Telegram».
+        telegram_user_id, не привязанный ни к одному аккаунту (пользователь ещё
+        не выполнил `/start <code>`), → 404: бот отвечает пользователю подсказкой
+        привязать аккаунт (см. bot/README.md).
+      parameters:
+        - name: X-Bot-Service-Secret
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TelegramActingTokenRequest" }
+      responses:
+        "200":
+          description: Acting-токен выдан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TelegramActingToken" }
+        "400": { description: Некорректное тело запроса }
+        "401": { description: Неверный/отсутствующий X-Bot-Service-Secret }
+        "404": { description: telegram_user_id не привязан ни к одному аккаунту }
+
   # ---------- MACHINE (WebSocket, auth по UUID) ----------
   /machine/ws:
     get:
@@ -555,3 +637,45 @@ components:
           enum: [status_change, agent_question, user_answer, command_approval_request, user_decision, agent_progress, agent_completed, error]
         payload: { type: object, additionalProperties: true }
         created_at: { type: string, format: date-time }
+
+    ChannelLinkRequest:
+      type: object
+      description: Тело POST /channels/telegram/link (FR D3, тикет 10.2).
+      required: [code, telegram_user_id]
+      properties:
+        code:
+          type: string
+          description: Одноразовый код привязки из POST /channels/telegram/link-code (тикет 9.6).
+        telegram_user_id:
+          type: string
+          description: >
+            Telegram user id отправителя /start <code> (числовой id Telegram, передаётся
+            строкой — channel_links.external_id хранит идентификатор как TEXT, канало-агностично).
+
+    ChannelLink:
+      type: object
+      description: Привязка внешнего канала к аккаунту (FR D3).
+      properties:
+        channel: { type: string, enum: [telegram] }
+        external_id: { type: string, description: telegram_user_id привязанного Telegram-аккаунта }
+        created_at: { type: string, format: date-time }
+
+    TelegramActingTokenRequest:
+      type: object
+      description: Тело POST /channels/telegram/token (FR D1, тикет 10.3).
+      required: [telegram_user_id]
+      properties:
+        telegram_user_id:
+          type: string
+          description: Telegram user id отправителя апдейта (та же строка, что и в ChannelLinkRequest).
+
+    TelegramActingToken:
+      type: object
+      description: >-
+        Короткоживущий access-JWT, действующий от имени пользователя, к
+        которому привязан telegram_user_id (FR D1, тикет 10.3). Тот же формат
+        и TTL, что и access-токен POST /auth/login (FR A3) — используется
+        боту как Bearer в дальнейших вызовах единого API.
+      properties:
+        access_token: { type: string }
+        expires_at: { type: string, format: date-time }

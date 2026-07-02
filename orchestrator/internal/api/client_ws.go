@@ -75,6 +75,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/yarabey/agentify/internal/auth"
+	"github.com/yarabey/agentify/orchestrator/internal/metrics"
 	"github.com/yarabey/agentify/orchestrator/internal/notify"
 )
 
@@ -163,6 +164,11 @@ func (h *ClientConnHub) register(userID uuid.UUID, conn *websocket.Conn) {
 		h.conns[userID] = set
 	}
 	set[conn] = struct{}{}
+	// gauge активных web-соединений (тикет 11.4) — каждый register это ВСЕГДА
+	// новая вкладка/соединение (conn — уникальный указатель на новое
+	// websocket.Conn, в отличие от registerMachineConn здесь нет вытеснения,
+	// см. годок типа), поэтому инкремент безусловный, симметричный unregister.
+	metrics.ClientWSConnectionsActive.Inc()
 }
 
 // unregister снимает conn с регистрации userID при дисконнекте (вызывается
@@ -178,10 +184,16 @@ func (h *ClientConnHub) unregister(userID uuid.UUID, conn *websocket.Conn) {
 	if !ok {
 		return
 	}
+	if _, present := set[conn]; !present {
+		// Не в наборе (например, повторный вызов unregister) — не в счёте
+		// gauge, декрементировать нечего (симметрия с register).
+		return
+	}
 	delete(set, conn)
 	if len(set) == 0 {
 		delete(h.conns, userID)
 	}
+	metrics.ClientWSConnectionsActive.Dec()
 }
 
 // Notify реализует api.Notifier (и структурно — task.answerNotifier, тикет

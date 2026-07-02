@@ -77,7 +77,7 @@ describe("App shell", () => {
     expect(screen.queryByText("Agentify")).not.toBeInTheDocument();
   });
 
-  it("рендерит экран /integrations (тикет 9.3) и заглушку /settings (авторизован)", () => {
+  it("рендерит экран /integrations (тикет 9.3) и /settings (тикет 9.6, авторизован)", () => {
     const { unmount } = renderApp("/integrations", { authenticated: true });
     expect(
       screen.getByRole("heading", { name: "Интеграции" }),

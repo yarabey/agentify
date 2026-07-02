@@ -34,6 +34,35 @@ func TestEncryptDecrypt_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncryptDecrypt_EmptyAndNilPlaintext(t *testing.T) {
+	// Край приёмки FR I1 (тикет 11.1): пустой/nil plaintext шифруется без
+	// ошибки (результат — непустой nonce+tag, не сам plaintext) и
+	// расшифровывается обратно в пустой срез.
+	key := testKey32()
+	cases := map[string][]byte{
+		"пустой срез": {},
+		"nil":         nil,
+	}
+	for name, plaintext := range cases {
+		t.Run(name, func(t *testing.T) {
+			ciphertext, err := crypto.Encrypt(key, plaintext)
+			if err != nil {
+				t.Fatalf("Encrypt: %v", err)
+			}
+			if len(ciphertext) == 0 {
+				t.Fatal("ciphertext пуст — ожидался хотя бы nonce+tag")
+			}
+			got, err := crypto.Decrypt(key, ciphertext)
+			if err != nil {
+				t.Fatalf("Decrypt: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("расшифрованный пустой plaintext = %q, ожидался пустой", got)
+			}
+		})
+	}
+}
+
 func TestEncrypt_DifferentNoncePerCall(t *testing.T) {
 	key := testKey32()
 	plaintext := []byte("same plaintext")

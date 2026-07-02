@@ -12,12 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-
-	"github.com/google/uuid"
 
 	"github.com/yarabey/agentify/orchestrator/internal/db"
 )
@@ -91,6 +88,9 @@ type fakeQuerier struct {
 
 	softDeleteIntegrationResult pgtype.UUID
 	softDeleteIntegrationErr    error
+
+	getChannelLinkByChannelAndExternalIDResult db.ChannelLink
+	getChannelLinkByChannelAndExternalIDErr    error
 }
 
 func (f fakeQuerier) GetActiveRegistrationToken(context.Context) (db.RegistrationToken, error) {
@@ -181,11 +181,17 @@ func (f fakeQuerier) GetIntegrationByUUIDHMAC(context.Context, string) (db.Integ
 	return f.getIntegrationByUUIDHMACResult, nil
 }
 
-func (f fakeQuerier) CreateTask(context.Context, db.CreateTaskParams) (db.Task, error) {
+func (f fakeQuerier) CreateTask(_ context.Context, arg db.CreateTaskParams) (db.Task, error) {
 	if f.createTaskErr != nil {
 		return db.Task{}, f.createTaskErr
 	}
-	return f.createTaskResult, nil
+	// Эхо-семантика RETURNING: реальный INSERT возвращает вставленный
+	// (уже зашифрованный, FR I1, тикет 11.1) text_enc, а не пресет фикстуры —
+	// так toTask на выходе PostTasks расшифровывает ровно то, что зашифровал
+	// обработчик, и тест получает исходный текст обратно.
+	res := f.createTaskResult
+	res.TextEnc = arg.TextEnc
+	return res, nil
 }
 
 func (f fakeQuerier) GetTaskByUserAndIdempotencyKey(context.Context, db.GetTaskByUserAndIdempotencyKeyParams) (db.Task, error) {
@@ -249,6 +255,15 @@ func (f fakeQuerier) SoftDeleteIntegration(context.Context, db.SoftDeleteIntegra
 		return pgtype.UUID{}, f.softDeleteIntegrationErr
 	}
 	return f.softDeleteIntegrationResult, nil
+}
+
+// GetChannelLinkByChannelAndExternalID — фейк для юнит-тестов
+// PostChannelsTelegramToken (тикет 10.3, см. channels_token_test.go).
+func (f fakeQuerier) GetChannelLinkByChannelAndExternalID(context.Context, db.GetChannelLinkByChannelAndExternalIDParams) (db.ChannelLink, error) {
+	if f.getChannelLinkByChannelAndExternalIDErr != nil {
+		return db.ChannelLink{}, f.getChannelLinkByChannelAndExternalIDErr
+	}
+	return f.getChannelLinkByChannelAndExternalIDResult, nil
 }
 
 // testJWTSigningKey — ключ подписи access-JWT для unit-тестов пакета api
@@ -342,37 +357,25 @@ func TestHealthzServedByRouter(t *testing.T) {
 	}
 }
 
-// TestUnimplementedReturns501 — нереализованная операция (привязка Telegram,
-// будущий тикет) отвечает 501 через встроенную заглушку Unimplemented.
-// /auth/login, /auth/refresh, /auth/logout реализованы тикетом 1.3 — их
-// сценарии теперь покрыты login_test.go/refresh_test.go/logout_test.go.
+// TestUnimplementedStubReturns501 — сама встроенная заглушка api.Unimplemented
+// (server.gen.go, отвечает 501 на любую операцию ServerInterface) работает,
+// даже когда её никто в проде не вызывает.
 //
-// /channels/telegram/link-code защищён auth-middleware (тикет 1.4, нет
-// `security: []` в openapi.yaml) — даже нереализованные операции проходят
-// через него, поэтому запрос несёт валидный Bearer-токен: тест проверяет
-// именно заглушку Unimplemented (501), а не auth-middleware (его 401-поведение
-// для этого же маршрута — TestUnimplementedRequiresBearerToken ниже).
-func TestUnimplementedReturns501(t *testing.T) {
-	router := NewRouter(newTestServer(fakeQuerier{}))
-	req := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
-	req.Header.Set("Authorization", "Bearer "+issueTestAccessToken(t, uuid.New(), time.Now()))
+// До тикета 9.6 это проверялось на реальном маршруте
+// /channels/telegram/link-code — последней операции контракта, у которой не
+// было своего обработчика (см. TestUnimplementedRequiresBearerToken до этого
+// коммита). С 9.6 Server переопределяет ВСЕ операции ServerInterface (см.
+// package-godoc server.go) — Unimplemented больше не задействован ни одним
+// реальным маршрутом, поэтому тест бьёт по самой заглушке напрямую, а не
+// через собранный роутер: она остаётся смонтированной как страховка на
+// случай будущего расширения контракта операцией без обработчика, и эта
+// страховка не должна незаметно сломаться.
+func TestUnimplementedStubReturns501(t *testing.T) {
+	var u Unimplemented
+	req := httptest.NewRequest(http.MethodPost, "/any-not-yet-implemented-operation", nil)
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
+	u.PostChannelsTelegramLinkCode(rec, req)
 	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("статус /channels/telegram/link-code = %d, ожидался 501", rec.Code)
-	}
-}
-
-// TestUnimplementedRequiresBearerToken — та же нереализованная операция без
-// Authorization-заголовка отдаёт 401 от auth-middleware, не доходя до
-// заглушки Unimplemented (FR A3, D2, тикет 1.4): «защищённый, но ещё не
-// реализованный» — всё равно защищённый.
-func TestUnimplementedRequiresBearerToken(t *testing.T) {
-	router := NewRouter(newTestServer(fakeQuerier{}))
-	req := httptest.NewRequest(http.MethodPost, "/channels/telegram/link-code", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("статус /channels/telegram/link-code без токена = %d, ожидался 401", rec.Code)
+		t.Fatalf("статус = %d, ожидался 501", rec.Code)
 	}
 }

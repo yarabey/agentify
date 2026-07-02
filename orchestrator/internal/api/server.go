@@ -16,18 +16,23 @@
 // вкл. вытеснение повторного соединения той же интеграции (FR B3, B6,
 // Gherkin §2, ADR 0002, см. machine_ws.go). Доступ в систему закрытый:
 // аккаунт создаётся лишь при предъявлении активного секретного токена
-// регистрации; без него — отказ (FR A1). Остальные операции контракта (задачи)
-// пока отвечают 501 Not Implemented и будут реализованы в своих тикетах, но
-// уже сейчас проходят через auth-middleware наравне с готовыми защищёнными
-// операциями.
+// регистрации; без него — отказ (FR A1). С тикета 9.6 (генерация кода
+// привязки Telegram, PostChannelsTelegramLinkCode, см. channels.go) все
+// операции контракта реализованы — ни одна больше не падает во встроенную
+// заглушку api.Unimplemented; она остаётся смонтированной как страховка на
+// случай будущего расширения контракта операцией без обработчика.
 //
 // Как устроено (тех): Server реализует сгенерированный из openapi.yaml
 // api.ServerInterface. Чтобы не писать все операции сразу, Server встраивает
 // сгенерированный api.Unimplemented (каждый его метод отдаёт 501) и переопределяет
-// только готовые операции — GetHealthz, PostAuthRegister,
+// все операции контракта — GetHealthz, PostAuthRegister,
 // PostAuthLogin/PostAuthRefresh/PostAuthLogout (см. auth.go),
 // GetIntegrations/PostIntegrations/GetIntegrationsId/PatchIntegrationsId/
-// DeleteIntegrationsId (см. integrations.go) и GetMachineWs (см.
+// DeleteIntegrationsId (см. integrations.go), задачи (см. tasks.go),
+// привязку Telegram-канала — PostChannelsTelegramLink/
+// PostChannelsTelegramLinkCode (см. channels.go), выдачу acting-токена боту —
+// PostChannelsTelegramToken (тикет 10.3, FR D1, см. channels.go) — и
+// GetMachineWs (см.
 // machine_ws.go), которая после
 // успешного hello разбирает входящие кадры машины и пересылает ack-кадры
 // зарегистрированному AckSink — мосту оркестратора (machine.commands →
@@ -112,6 +117,12 @@ type Querier interface {
 	// user_id: владелец на этом шаге ещё не известен (FR B3, B6, тикет 2.3,
 	// см. machine_ws.go).
 	GetIntegrationByUUIDHMAC(ctx context.Context, uuidHmac string) (db.Integration, error)
+	// GetChannelLinkByChannelAndExternalID резолвит user_id по (channel,
+	// external_id) — обратный поиск к CreateChannelLink, нужен
+	// PostChannelsTelegramToken (тикет 10.3, FR D1, см. channels.go):
+	// telegram_user_id входящего апдейта → user_id, от имени которого бот
+	// действует через единый API. Не найдено → pgx.ErrNoRows.
+	GetChannelLinkByChannelAndExternalID(ctx context.Context, arg db.GetChannelLinkByChannelAndExternalIDParams) (db.ChannelLink, error)
 	// ListActiveTaskIDsByIntegration возвращает id активных (не терминальных)
 	// задач интеграции — используется DeleteIntegrationsId (тикет 2.6, FR B5)
 	// для решения о 409 (без confirm=true) и для отмены через FSM при
@@ -186,6 +197,19 @@ type Server struct {
 	integrationUUIDAEADKey []byte
 	integrationUUIDHMACKey []byte
 
+	// taskTextAEADKey/taskEventPayloadAEADKey — подключи at-rest шифрования
+	// tasks.text_enc и task_events.payload_enc (FR I1, тикет 11.1), выведенные
+	// из того же мастер-ключа (encryptionKey параметр NewServer) через
+	// crypto.DeriveKey под разными purpose. text_enc сервер и шифрует (на
+	// записи, PostTasks), и расшифровывает (на чтении, GetTasks/GetTasksId);
+	// payload_enc сервер только РАСШИФРОВЫВАЕТ на чтении (история/сопоставление
+	// вопросов) — пишет его единственный писатель task.Transitioner, поэтому
+	// подключ payload_enc выводится под ОБЩИМ с ним purpose
+	// (task.EventPayloadKeyPurpose), чтобы GCM-тег сошёлся. Как и подключи
+	// UUID-секрета, выводятся из мастер-ключа, а не используют его напрямую.
+	taskTextAEADKey         []byte
+	taskEventPayloadAEADKey []byte
+
 	// machineConns — реестр активных WS-соединений машины по integration_id
 	// (тикет 2.4, FR B6, ADR 0002 "защита от повторного UUID"). Один процесс
 	// оркестратора в MVP (docs/01_tech_stack_and_architecture.md [РЕШЕНИЕ 5]) —
@@ -258,6 +282,44 @@ type Server struct {
 	// SetCommandPublisher.
 	commandPublisher   CommandPublisher
 	commandPublisherMu sync.RWMutex
+
+	// channelLinker — обмен одноразового кода привязки канала на запись
+	// channel_links (тикет 10.2, FR D3, см. ChannelLinker). nil по умолчанию
+	// — штатно, если БД не настроена (каркасные прогоны/тесты без
+	// ORCH_DATABASE_URL, как у ackSink/eventSink/notifier); тогда
+	// PostChannelsTelegramLink отвечает 500, а не паникует. Регистрируется
+	// один раз при старте через SetChannelLinker.
+	channelLinker   ChannelLinker
+	channelLinkerMu sync.RWMutex
+
+	// channelLinkCodeIssuer — генерация одноразового кода привязки канала
+	// (тикет 9.6, FR A2, D3, см. ChannelLinkCodeIssuer) — обратная операция
+	// по отношению к channelLinker: тот ТРАТИТ уже выпущенный код, этот его
+	// ВЫПУСКАЕТ. nil по умолчанию — тот же принцип, что и у channelLinker:
+	// штатно без БД, тогда PostChannelsTelegramLinkCode отвечает 500, а не
+	// паникует. Регистрируется один раз при старте через
+	// SetChannelLinkCodeIssuer.
+	channelLinkCodeIssuer   ChannelLinkCodeIssuer
+	channelLinkCodeIssuerMu sync.RWMutex
+
+	// botServiceSecret — общий сервисный секрет между ботом и оркестратором
+	// (тикет 10.3, FR D1), проверяемый PostChannelsTelegramToken в заголовке
+	// X-Bot-Service-Secret (ORCH_BOT_SERVICE_SECRET у оркестратора,
+	// BOT_SERVICE_SECRET у бота — одно и то же значение). Это НЕ
+	// пользовательский Bearer (bearerAuth): у бота нет access-JWT
+	// пользователя, только telegram_user_id входящего апдейта, поэтому нужен
+	// отдельный канал доверия именно между двумя сервисами — тот же
+	// доверенный внутренний канал compose-сети, что и у BOT_ORCHESTRATOR_URL
+	// (тикет 10.2, см. godoc PostChannelsTelegramToken в channels.go). nil/
+	// пустое значение по умолчанию — тот же принцип «пустой опциональный
+	// секрет → фича мягко выключена», что и у channelLinker/transitioner:
+	// PostChannelsTelegramToken тогда ВСЕГДА отвечает 401, а не тихо
+	// принимает любой (в т.ч. пустой) заголовок — иначе пустой конфиг на
+	// проде дал бы любому вызывающему возможность получить acting-токен
+	// произвольного привязанного пользователя. Регистрируется один раз при
+	// старте через SetBotServiceSecret.
+	botServiceSecret   []byte
+	botServiceSecretMu sync.RWMutex
 }
 
 // AckSink — получатель ack-кадров от машины (protocol.md §5): тикет 3.4
@@ -347,6 +409,28 @@ type taskTransitioner interface {
 	RecordEvent(ctx context.Context, taskID pgtype.UUID, eventType string, refEventID pgtype.UUID, eventPayload []byte) (seq int64, err error)
 }
 
+// ChannelLinker — узкий интерфейс на *channel.Linker.Exchange (тикет 10.2, FR
+// D3), нужный PostChannelsTelegramLink (channels.go) для обмена одноразового
+// кода привязки на запись channel_links. Та же граница между
+// транспортным/API-слоем и бизнес-подсистемой, что и у taskTransitioner —
+// сужение до одного метода упрощает юнит-тесты обработчика (фейк вместо
+// реального *pgxpool.Pool, который требует channel.Linker). *channel.Linker
+// удовлетворяет этому интерфейсу структурно.
+type ChannelLinker interface {
+	Exchange(ctx context.Context, channelName, code, externalID string) (link db.ChannelLink, err error)
+}
+
+// ChannelLinkCodeIssuer — узкий интерфейс на *channel.CodeIssuer.IssueLinkCode
+// (тикет 9.6, FR A2, D3), нужный PostChannelsTelegramLinkCode (channels.go)
+// для генерации одноразового кода привязки канала. Та же граница между
+// транспортным/API-слоем и бизнес-подсистемой, что и у ChannelLinker выше —
+// сужение до одного метода упрощает юнит-тесты обработчика (фейк вместо
+// реального *pgxpool.Pool, который требует channel.CodeIssuer).
+// *channel.CodeIssuer удовлетворяет этому интерфейсу структурно.
+type ChannelLinkCodeIssuer interface {
+	IssueLinkCode(ctx context.Context, userID pgtype.UUID, channelName string) (db.ChannelLinkCode, error)
+}
+
 // integrationUUIDAEADKeyPurpose/integrationUUIDHMACKeyPurpose — строки purpose
 // для crypto.DeriveKey, под которые выводятся подключи тикета 2.2. Значения
 // произвольны, но должны быть СТАБИЛЬНЫ между рестартами процесса (иначе ранее
@@ -356,6 +440,12 @@ type taskTransitioner interface {
 const (
 	integrationUUIDAEADKeyPurpose = "integration-uuid-aead"
 	integrationUUIDHMACKeyPurpose = "integration-uuid-hmac"
+	// taskTextAEADKeyPurpose — purpose подключа AEAD для tasks.text_enc (FR I1,
+	// тикет 11.1). Отдельный от purpose payload_enc и UUID-секрета: разные
+	// колонки — разные независимые подключи из одного мастер-ключа (та же
+	// крипто-гигиена, что и у UUID-подключей). Подключ payload_enc выводится
+	// под task.EventPayloadKeyPurpose (общий с писателем task.Transitioner).
+	taskTextAEADKeyPurpose = "task-text-aead"
 )
 
 // NewServer собирает обработчик API оркестратора поверх слоя данных, логгера,
@@ -367,19 +457,23 @@ const (
 // docs/MANUAL_STEPS.md); encryptionKey — мастер-ключ шифрования, РОВНО 32
 // декодированных байта (APP_ENCRYPTION_KEY из окружения, тикет 2.2,
 // internal/crypto) — из него здесь же выводятся независимые подключи под
-// UUID-секрет интеграции (см. поля Server). Как и jwtSigningKey, НЕ
+// UUID-секрет интеграции и под at-rest шифрование tasks.text_enc /
+// task_events.payload_enc (FR I1, тикет 11.1, см. поля Server). Как и
+// jwtSigningKey, НЕ
 // генерируется и не подставляется по умолчанию здесь: вызывающая сторона
 // (orchestrator/main.go) отвечает за то, что оба ключа непусты и корректной
 // длины в проде. Возвращает *Server, готовый к монтированию через NewRouter.
 func NewServer(queries Querier, logger *slog.Logger, jwtSigningKey []byte, encryptionKey []byte) *Server {
 	return &Server{
-		queries:                queries,
-		logger:                 logger,
-		jwtSigningKey:          jwtSigningKey,
-		integrationUUIDAEADKey: crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
-		integrationUUIDHMACKey: crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
-		machineConns:           make(map[uuid.UUID]*websocket.Conn),
-		clientHub:              NewClientConnHub(logger),
+		queries:                 queries,
+		logger:                  logger,
+		jwtSigningKey:           jwtSigningKey,
+		integrationUUIDAEADKey:  crypto.DeriveKey(encryptionKey, integrationUUIDAEADKeyPurpose),
+		integrationUUIDHMACKey:  crypto.DeriveKey(encryptionKey, integrationUUIDHMACKeyPurpose),
+		taskTextAEADKey:         crypto.DeriveKey(encryptionKey, taskTextAEADKeyPurpose),
+		taskEventPayloadAEADKey: crypto.DeriveKey(encryptionKey, task.EventPayloadKeyPurpose),
+		machineConns:            make(map[uuid.UUID]*websocket.Conn),
+		clientHub:               NewClientConnHub(logger),
 	}
 }
 
@@ -533,6 +627,67 @@ func (s *Server) getCommandPublisher() CommandPublisher {
 	s.commandPublisherMu.RLock()
 	defer s.commandPublisherMu.RUnlock()
 	return s.commandPublisher
+}
+
+// SetChannelLinker регистрирует обменник кода привязки канала (тикет 10.2,
+// см. ChannelLinker). Вызывается ОДИН раз при старте (orchestrator/main.go),
+// сразу после NewServer, до начала обслуживания HTTP-трафика; nil —
+// допустимое значение (в т.ч. явный сброс) — тогда PostChannelsTelegramLink
+// отвечает 500 (см. godoc поля channelLinker).
+func (s *Server) SetChannelLinker(l ChannelLinker) {
+	s.channelLinkerMu.Lock()
+	defer s.channelLinkerMu.Unlock()
+	s.channelLinker = l
+}
+
+// getChannelLinker читает текущий ChannelLinker под channelLinkerMu (см.
+// godoc полей Server).
+func (s *Server) getChannelLinker() ChannelLinker {
+	s.channelLinkerMu.RLock()
+	defer s.channelLinkerMu.RUnlock()
+	return s.channelLinker
+}
+
+// SetChannelLinkCodeIssuer регистрирует генератор кода привязки канала
+// (тикет 9.6, см. ChannelLinkCodeIssuer). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), сразу после NewServer, до начала обслуживания
+// HTTP-трафика; nil — допустимое значение (в т.ч. явный сброс) — тогда
+// PostChannelsTelegramLinkCode отвечает 500 (см. godoc поля
+// channelLinkCodeIssuer).
+func (s *Server) SetChannelLinkCodeIssuer(i ChannelLinkCodeIssuer) {
+	s.channelLinkCodeIssuerMu.Lock()
+	defer s.channelLinkCodeIssuerMu.Unlock()
+	s.channelLinkCodeIssuer = i
+}
+
+// getChannelLinkCodeIssuer читает текущий ChannelLinkCodeIssuer под
+// channelLinkCodeIssuerMu (см. godoc полей Server).
+func (s *Server) getChannelLinkCodeIssuer() ChannelLinkCodeIssuer {
+	s.channelLinkCodeIssuerMu.RLock()
+	defer s.channelLinkCodeIssuerMu.RUnlock()
+	return s.channelLinkCodeIssuer
+}
+
+// SetBotServiceSecret регистрирует сервисный секрет бота (тикет 10.3, см.
+// godoc поля botServiceSecret). Вызывается ОДИН раз при старте
+// (orchestrator/main.go), сразу после NewServer, до начала обслуживания
+// HTTP-трафика; nil/пустой срез — допустимое значение (дефолт) — тогда
+// PostChannelsTelegramToken ВСЕГДА отвечает 401 (фича мягко выключена, тот
+// же принцип, что у остальных опциональных зависимостей Server, но с
+// безопасным по умолчанию поведением «отказ», а не «ошибка сервера»,
+// поскольку эндпоинт — точка входа в систему аутентификации, а не бизнес-CRUD).
+func (s *Server) SetBotServiceSecret(secret []byte) {
+	s.botServiceSecretMu.Lock()
+	defer s.botServiceSecretMu.Unlock()
+	s.botServiceSecret = secret
+}
+
+// getBotServiceSecret читает текущий сервисный секрет бота под
+// botServiceSecretMu (см. godoc поля botServiceSecret).
+func (s *Server) getBotServiceSecret() []byte {
+	s.botServiceSecretMu.RLock()
+	defer s.botServiceSecretMu.RUnlock()
+	return s.botServiceSecret
 }
 
 // GetHealthz отвечает 200 на liveness-проверку.

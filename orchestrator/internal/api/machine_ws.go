@@ -122,6 +122,7 @@ import (
 	"github.com/yarabey/agentify/internal/bus"
 	"github.com/yarabey/agentify/internal/crypto"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	"github.com/yarabey/agentify/orchestrator/internal/metrics"
 	"github.com/yarabey/agentify/orchestrator/internal/notify"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 )
@@ -1023,6 +1024,14 @@ func (s *Server) registerMachineConn(integrationID uuid.UUID, conn *websocket.Co
 	s.machineConnsMu.Unlock()
 
 	if !existed {
+		// Действительно новое активное соединение (не вытеснение) — ровно
+		// здесь gauge растёт (тикет 11.4). Симметрично unregisterMachineConn
+		// ниже: при вытеснении (existed==true) старое соединение закрывается,
+		// но НЕ уменьшает gauge само по себе (его собственный defer
+		// unregisterMachineConn не пройдёт compare-and-delete — карта уже
+		// указывает на новый conn), поэтому здесь для этого пути gauge
+		// намеренно НЕ увеличивается: соединение было и остаётся одно.
+		metrics.MachineWSConnectionsActive.Inc()
 		return
 	}
 
@@ -1051,6 +1060,11 @@ func (s *Server) unregisterMachineConn(integrationID uuid.UUID, conn *websocket.
 	defer s.machineConnsMu.Unlock()
 	if s.machineConns[integrationID] == conn {
 		delete(s.machineConns, integrationID)
+		// Симметрично инкременту в registerMachineConn (тикет 11.4): только
+		// РЕАЛЬНОЕ снятие с регистрации (compare-and-delete совпал — conn всё
+		// ещё актуален) уменьшает gauge. Отменённое из-за session-takeover
+		// снятие (см. годок функции выше) до этой строки не доходит.
+		metrics.MachineWSConnectionsActive.Dec()
 	}
 }
 

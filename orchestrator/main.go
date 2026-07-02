@@ -22,7 +22,15 @@
 // `orchestrator bootstrap` (тикет 1.7, см. cmd_bootstrap.go): без аргументов
 // запускается обычный сервис (как раньше), с аргументом "bootstrap" —
 // идемпотентно создаёт первого администратора и стартовый токен регистрации и
-// завершается, не поднимая HTTP.
+// завершается, не поднимая HTTP. Тикет 11.4 (ТЗ «эксплуатация») добавляет
+// наблюдаемость: GET /metrics (platform.Metrics, смонтирован безусловно
+// каркасом) плюс бизнес-метрики оркестратора (orchestrator/internal/metrics
+// — переходы FSM задачи, активные WS-соединения машин/web-клиентов),
+// зарегистрированные здесь в run() ДО старта HTTP-сервера, и структурные
+// логи с task_id по ключевым точкам пути задачи (task.Transitioner —
+// единственная точка смены статуса, поэтому и единственная точка,
+// логирующая переход; orchestrator/internal/bridge — факт доставки команды
+// машине).
 package main
 
 import (
@@ -42,8 +50,11 @@ import (
 	"github.com/yarabey/agentify/internal/platform"
 	"github.com/yarabey/agentify/orchestrator/internal/api"
 	"github.com/yarabey/agentify/orchestrator/internal/bridge"
+	"github.com/yarabey/agentify/orchestrator/internal/channel"
 	"github.com/yarabey/agentify/orchestrator/internal/db"
+	orchmetrics "github.com/yarabey/agentify/orchestrator/internal/metrics"
 	"github.com/yarabey/agentify/orchestrator/internal/migrate"
+	"github.com/yarabey/agentify/orchestrator/internal/notify/telegram"
 	"github.com/yarabey/agentify/orchestrator/internal/presence"
 	"github.com/yarabey/agentify/orchestrator/internal/task"
 	"github.com/yarabey/agentify/orchestrator/migrations"
@@ -149,6 +160,30 @@ type config struct {
 	// команды отмены на машину, см. task.AnswerTimeoutBehaviorAutoCancel и
 	// тикет 8.4). Переменная ORCH_ANSWER_TIMEOUT_BEHAVIOR.
 	AnswerTimeoutBehavior string `env:"ANSWER_TIMEOUT_BEHAVIOR" envDefault:"wait"`
+
+	// TelegramLinkCodeTTL — срок действия одноразового кода привязки
+	// Telegram-аккаунта, выпускаемого POST /channels/telegram/link-code (FR
+	// A2, D3, тикет 9.6, см. channel.CodeIssuer). Переменная
+	// ORCH_TELEGRAM_LINK_CODE_TTL. Продуктовое решение об окончательном
+	// значении не зафиксировано (docs/MANUAL_STEPS.md §4 — тот же принцип
+	// "дефолт + открытый вопрос", что у AnswerTimeoutThreshold выше) —
+	// дефолт 15m совпадает с channel.DefaultLinkCodeTTL (используется, если
+	// эта переменная почему-то придёт пустой/некорректной длительностью).
+	TelegramLinkCodeTTL time.Duration `env:"TELEGRAM_LINK_CODE_TTL" envDefault:"15m"`
+
+	// BotServiceSecret — общий сервисный секрет между ботом и оркестратором
+	// (тикет 10.3, FR D1), проверяемый PostChannelsTelegramToken (заголовок
+	// X-Bot-Service-Secret). Переменная ORCH_BOT_SERVICE_SECRET, генерируется
+	// ОДНОКРАТНО вручную (`openssl rand -base64 32`, см.
+	// docs/MANUAL_STEPS.md) и совпадает со значением BOT_SERVICE_SECRET на
+	// стороне бота. Секрет: НЕ коммитится. Пустое значение (дефолт) означает
+	// «действия из Telegram отключены» — PostChannelsTelegramToken отвечает
+	// 401 на ЛЮБОЙ запрос (см. godoc SetBotServiceSecret,
+	// orchestrator/internal/api/server.go), а не тихо принимает пустой
+	// заголовок; удобно для dev/CI без настроенного бота, тот же принцип, что
+	// у JWTSigningKey/AppEncryptionKey, но без фатального падения старта —
+	// эндпоинт не единственная точка входа системы, как auth-эндпоинты.
+	BotServiceSecret string `env:"BOT_SERVICE_SECRET"`
 }
 
 func main() {
@@ -181,6 +216,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// Метрики оркестратора (тикет 11.4, ТЗ «эксплуатация»): регистрируем
+	// ДО запуска svc.Run (то есть ДО того, как GET /metrics и вообще
+	// HTTP-сервер начинают обслуживать трафик, см. platform.Metrics.
+	// wrapRouter) — иначе окно между стартом сервера и регистрацией дало бы
+	// GET /metrics шанс ответить БЕЗ бизнес-метрик оркестратора (только
+	// базовые HTTP-метрики платформы). Метрики этого пакета — package-level
+	// переменные (см. её годок про обоснование), Register нужно вызвать
+	// РОВНО ОДИН раз за процесс.
+	orchmetrics.Register(svc.Metrics().Registry())
 
 	// Общий сигнал-чувствительный ctx — как в agent/main.go: создаётся ЗДЕСЬ,
 	// ДО запуска svc.Run, и передаётся всем горутинам (HTTP-сервер, мост
@@ -246,7 +291,30 @@ func run() error {
 		defer pool.Close()
 
 		server := api.NewServer(db.New(pool), svc.Logger(), []byte(cfg.JWTSigningKey), encryptionKey)
-		server.SetTransitioner(task.NewTransitioner(pool))
+		// Тот же мастер-ключ, что и у api.Server, передаётся Transitioner —
+		// единственному писателю task_events.payload_enc: он шифрует payload
+		// at-rest (FR I1, тикет 11.1), а Server расшифровывает его на чтении, оба
+		// под общим подключом (task.EventPayloadKeyPurpose). Ключи обязаны
+		// совпадать, иначе GCM-тег не сойдётся.
+		server.SetTransitioner(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())))
+		// Обмен кода привязки Telegram-аккаунта (тикет 10.2, FR D3): не зависит
+		// от Redpanda, только от БД — регистрируется здесь же безусловно, тем
+		// же принципом, что и SetTransitioner/SetNotifier ниже.
+		server.SetChannelLinker(channel.NewLinker(pool))
+		// Генерация кода привязки Telegram-аккаунта (тикет 9.6, FR A2, D3):
+		// обратная операция по отношению к SetChannelLinker выше — та тратит
+		// код, эта его выпускает. Тоже не зависит от Redpanda, только от БД —
+		// регистрируется здесь же безусловно, тем же принципом.
+		server.SetChannelLinkCodeIssuer(channel.NewCodeIssuer(pool, cfg.TelegramLinkCodeTTL))
+		// Действия из Telegram (тикет 10.3, FR D1): сервисный секрет между
+		// ботом и оркестратором для PostChannelsTelegramToken (см. её
+		// архитектурный godoc в orchestrator/internal/api/channels.go). Не
+		// зависит от Redpanda, только от БД (channel_links) — регистрируется
+		// здесь же безусловно, тем же принципом, что и SetChannelLinker/
+		// SetChannelLinkCodeIssuer выше. Пустой cfg.BotServiceSecret — тот же
+		// принцип «мягкое выключение фичи» (см. godoc SetBotServiceSecret):
+		// эндпоинт остаётся смонтирован, но всегда отвечает 401.
+		server.SetBotServiceSecret([]byte(cfg.BotServiceSecret))
 		// Web-канал доставки уведомлений (тикет 7.2, FR G1): ClientConnHub —
 		// реестр активных WS-соединений браузера (server.ClientConnHub(),
 		// заведён в NewServer безусловно, в отличие от опциональных
@@ -254,7 +322,11 @@ func run() error {
 		// после создания сервера, до начала обслуживания HTTP/WS-трафика (тот
 		// же принцип, что и у SetTransitioner). НЕ гейтится ORCH_REDPANDA_SEEDS
 		// — web-доставка не зависит от Redpanda/моста, только от БД (тот же
-		// довод, что и у answerTimeoutWorker ниже).
+		// довод, что и у answerTimeoutWorker ниже). Если ORCH_REDPANDA_SEEDS
+		// ЗАДАН, этот вызов ниже (в блоке Redpanda-подсистемы) ПЕРЕрегистрируется
+		// на multiNotifier{web, Telegram} (тикет 7.3, см. notify_fanout.go) —
+		// без Redpanda web остаётся единственным каналом, тот же принцип
+		// «опциональная фича».
 		server.SetNotifier(server.ClientConnHub())
 		svc.SetHandler(api.NewRouter(server))
 
@@ -267,7 +339,7 @@ func run() error {
 		// (тикет 7.3) добавится сюда же отдельным каналом, когда будет
 		// реализован.
 		answerTimeoutWorker, err := task.NewAnswerTimeoutWorker(
-			task.NewTransitioner(pool), db.New(pool), server.ClientConnHub(),
+			task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())), db.New(pool), server.ClientConnHub(),
 			task.WithAnswerTimeoutThreshold(cfg.AnswerTimeoutThreshold),
 			task.WithAnswerTimeoutBehavior(task.AnswerTimeoutBehavior(cfg.AnswerTimeoutBehavior)),
 		)
@@ -329,6 +401,23 @@ func run() error {
 			// экземпляр не нужен.
 			server.SetCommandPublisher(producer)
 
+			// Telegram-канал доставки уведомлений (тикет 7.3, FR G1, Gherkin §6
+			// «Уведомление в Telegram»): тот же producer instance (Redpanda-seeds
+			// заданы — единственное дополнительное условие сверх БД, которая уже
+			// проверена выше). telegram.NewNotifier сам резолвит channel_links
+			// пользователя ПЕРЕД публикацией (см. годок пакета) — бот (тикет
+			// 10.4) получает уже готовый chat_id/текст. Регистрируется ЗАМЕНОЙ
+			// notifier'а, установленного выше (server.SetNotifier(server.
+			// ClientConnHub())): multiNotifier применяет политику маршрутизации
+			// тикета 7.4 (FR G2, см. годок notify_fanout.go) — ДУБЛИРОВАТЬ в
+			// КАЖДЫЙ активный канал безусловно, поэтому web продолжает получать
+			// уведомления ровно как раньше.
+			telegramNotifier, err := telegram.NewNotifier(producer, db.New(pool))
+			if err != nil {
+				return fmt.Errorf("orchestrator: сборка telegram.Notifier: %w", err)
+			}
+			server.SetNotifier(newMultiNotifier(svc.Logger(), server.ClientConnHub(), telegramNotifier))
+
 			sink, err := presence.NewSink(producer)
 			if err != nil {
 				return fmt.Errorf("orchestrator: сборка presence.Sink: %w", err)
@@ -367,7 +456,7 @@ func run() error {
 			// integrations.status — гейтится тем же условием ORCH_REDPANDA_SEEDS,
 			// потому что last_seen_at в принципе обновляется только через
 			// heartbeat-consumer, который сам гейтится этим условием.
-			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
+			staleWorker, err := task.NewStaleWorker(task.NewTransitioner(pool, task.WithMasterKey(encryptionKey), task.WithLogger(svc.Logger())), db.New(pool), task.WithStaleThreshold(cfg.StaleThreshold))
 			if err != nil {
 				return fmt.Errorf("orchestrator: сборка task.StaleWorker: %w", err)
 			}

@@ -312,6 +312,20 @@ func (b *Bridge) deliver(ctx context.Context, rec *kgo.Record) {
 		case <-ackCh:
 			timer.Stop()
 			b.commit(ctx, rec)
+			// Структурный лог успешной доставки с task_id (тикет 11.4, ТЗ
+			// «эксплуатация», FSM-переход уже залогирован отдельно
+			// task.Transitioner — здесь именно ФАКТ доставки КОНКРЕТНОЙ команды
+			// до машины, что отдельная от смены статуса точка пути задачи).
+			// env.TaskID — machine-level команды (маловероятны в этом потоке,
+			// см. годок пакета bridge про источник machine.commands) не имеют
+			// task_id — тогда пропускаем поле, а не логируем пустую строку.
+			if env.TaskID != nil {
+				b.logger.Info("bridge: команда доставлена на машину",
+					slog.String("task_id", *env.TaskID),
+					slog.String("integration_id", env.IntegrationID),
+					slog.String("type", env.Type),
+				)
+			}
 			return
 		case <-timer.C:
 			b.unregisterPending(env.MessageID)
