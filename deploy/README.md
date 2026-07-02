@@ -16,6 +16,8 @@ bot, web за фронтовым Caddy). Прод-деплой через GHCR/S
 | `caddy.Dockerfile` | образ фронтового Caddy с запечённым `Caddyfile` (локальный конфиг; на проде подменяется bind-mount'ом `Caddyfile.prod`) |
 | `.env.example` | шаблон секретов/настроек (скопировать в `.env`) |
 | `scripts/smoke.sh` | smoke-проверка: `/healthz` всех сервисов отвечает 200 |
+| `docker-compose.backup.yml` | опциональный оверрай: сервис регулярного бэкапа Postgres по cron (тикет 11.5) |
+| `backup/` | образ бэкап-сервиса (`Dockerfile`+`entrypoint.sh`), скрипт `backup.sh` (pg_dump), `restore-check.sh` (проверка восстановления) и Go-тест `pgbackup/` |
 
 Статика web и её внутренний `/healthz` собираются из `web/Dockerfile` +
 `web/Caddyfile` (в 0.3 — заглушка `index.html`; полноценный Vite — тикет 9.1).
@@ -121,6 +123,63 @@ make run-local-down     # docker compose down -v — гасит и удаляе�
 `internal/platform.Config` (префиксы `ORCH_`/`BOT_`): `ENV`, `LOG_LEVEL`,
 `LOG_FORMAT`; `HEALTH_ADDR` фиксируется в compose как `:8080`. Секреты — только
 через `.env`, никогда в репозитории.
+
+## Бэкап и восстановление Postgres (тикет 11.5, FR I2)
+
+**Зачем.** История задач/событий в agentify хранится **бессрочно** (FR I2,
+[`01_tech_stack`](../docs/01_tech_stack_and_architecture.md) §"Бэкап БД"):
+авто-удаления нет. Регулярный `pg_dump` — страховка от потери этой истории при
+гибели диска/инстанса. Бэкап — инфраструктурная забота деплоя, поэтому вынесен
+в отдельный лёгкий сервис рядом с Postgres, а не в сервисный Go-код.
+
+**Состав** (каталог `deploy/backup/`):
+
+| Файл | Назначение |
+|---|---|
+| `Dockerfile` | образ бэкап-сервиса: `postgres:16-alpine` (совместимые `pg_dump`/`pg_restore` мажора 16) + busybox `crond` |
+| `entrypoint.sh` | настраивает crontab из `BACKUP_SCHEDULE`, делает стартовый бэкап, держит `crond` в foreground |
+| `backup.sh` | один прогон `pg_dump -Fc` → `<db>_<UTC>.dump` в `BACKUP_DIR` + ретенция по возрасту |
+| `restore-check.sh` | host-скрипт: поднять **чистый** инстанс и восстановить последний дамп (приёмка FR I2) |
+| `pgbackup/` | Go integration-тест того же сценария на testcontainers (CI-джоба `integration`) |
+
+**Как включить бэкап** (опциональный оверрай поверх базового compose):
+
+```bash
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.backup.yml up -d
+```
+
+Сервис `backup` по расписанию (`BACKUP_SCHEDULE`, по умолчанию `0 3 * * *` —
+ежедневно 03:00 UTC) снимает `pg_dump` в custom-формате (`-Fc`) в именованный
+том `pg_backups` (в проекте — `agentify_pg_backups`). Файлы старше
+`BACKUP_RETENTION_DAYS` (по умолчанию 7) удаляются. Секретов бэкап **не
+добавляет** — использует те же `POSTGRES_*` из `deploy/.env`, что и Postgres.
+
+Разовый бэкап вручную (Postgres должен быть запущен):
+
+```bash
+make backup
+```
+
+**Проверка восстановления (FR I2).** Бэкап ценен только если из него
+восстанавливаются данные. Воспроизводимая проверка:
+
+```bash
+make restore-check          # или: deploy/backup/restore-check.sh
+```
+
+Скрипт поднимает **отдельный, заведомо чистый** `postgres:16-alpine`, монтирует
+том дампов только для чтения, `pg_restore` последнего `*.dump` и проверяет, что
+в схеме `public` появились таблицы и из них читаются строки. Throwaway-контейнер
+удаляется всегда (`trap`), состояние хоста не меняется. Источник дампов
+настраивается: `BACKUP_VOLUME` (docker-том, по умолчанию `agentify_pg_backups`)
+или `BACKUP_HOST_DIR` (каталог на хосте); конкретный файл — аргументом или
+`DUMP_FILE`.
+
+Автоматический аналог для CI — `deploy/backup/pgbackup` (Go-тест с тегом
+`integration`): поднимает Postgres на testcontainers, наполняет данными, снимает
+`pg_dump`, поднимает **второй чистый** Postgres, `pg_restore` и сверяет строки.
+Гоняется джобой `integration` (`go test -tags=integration ./...`); обычный
+`make test` его не запускает (docker не требуется).
 
 ## Прод-релиз (CD, тикет 0.5)
 

@@ -1,0 +1,48 @@
+# deploy/docker-compose.backup.yml — оверрай сервиса бэкапа Postgres (тикет 11.5).
+#
+# Назначение (бизнес): добавить к стеку регулярный pg_dump — страховку бессрочной
+# истории задач/событий (FR I2, docs/01_tech_stack §"Бэкап БД"). Опциональный
+# оверрай: базовый стек (0.3) поднимается без него, бэкап включается явным
+# добавлением этого файла — и локально, и на проде.
+#
+# Как устроено (тех): запускается ВМЕСТЕ с базовым docker-compose.yml (сервис
+# backup зависит от сервиса postgres из базового файла), не вместо него:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.backup.yml up -d
+# Сервис backup — образ deploy/backup (postgres:16-alpine + crond, см.
+# deploy/backup/Dockerfile), пишет дампы в именованный том pg_backups. Секреты
+# (POSTGRES_PASSWORD) — те же, что у postgres, из deploy/.env (не коммитятся).
+# Расписание/ретенция — из env с дефолтами (см. deploy/.env.example).
+#
+# Проверка восстановления (FR I2) — вне compose: host-скрипт
+# deploy/backup/restore-check.sh поднимает отдельный чистый инстанс и
+# восстанавливает в него последний дамп (см. deploy/README.md).
+
+services:
+  backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Хост/порт БД — сервис postgres из базового compose-файла.
+      PGHOST: postgres
+      PGPORT: "5432"
+      # Совпадают с сервисом postgres (docker-compose.yml): дамп снимается тем же
+      # пользователем/базой, пароль — тот же секрет из deploy/.env.
+      POSTGRES_USER: ${POSTGRES_USER:-agentify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен — задайте в deploy/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-agentify}
+      # Параметры бэкапа (дефолты — ежедневно 03:00 UTC, хранить 7 дней).
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 3 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      BACKUP_DIR: /backups
+    volumes:
+      - pg_backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  # Именованный том с дампами (в проекте agentify — agentify_pg_backups).
+  # restore-check.sh по умолчанию читает дампы именно из него.
+  pg_backups:

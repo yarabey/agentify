@@ -26,11 +26,14 @@ SQLC         ?= $(GOBIN)/sqlc
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools tools-generate tools-generate-go generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke
+.PHONY: help tools tools-generate tools-generate-go generate generate-go generate-ts generate-sql generate-check lint test bdd docs-check run-local run-local-down smoke backup restore-check
 
 # Compose-файл локального стека (тикет 0.3).
 COMPOSE_FILE ?= deploy/docker-compose.yml
 DOCKER_COMPOSE ?= docker compose -f $(COMPOSE_FILE)
+
+# Оверрай сервиса бэкапа Postgres (тикет 11.5); добавляется к базовому файлу.
+BACKUP_COMPOSE_FILE ?= deploy/docker-compose.backup.yml
 
 help: ## Показать список целей.
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -92,3 +95,9 @@ run-local-down: ## Погасить локальный стек и удалит�
 
 smoke: ## Smoke-проверка локального стека: /healthz всех сервисов отвечает 200.
 	deploy/scripts/smoke.sh
+
+backup: ## Снять разовый бэкап Postgres в том pg_backups (тикет 11.5; postgres должен быть запущен).
+	$(DOCKER_COMPOSE) -f $(BACKUP_COMPOSE_FILE) run --rm backup /usr/local/bin/backup.sh
+
+restore-check: ## Проверка восстановления последнего дампа на чистый инстанс (FR I2, тикет 11.5).
+	deploy/backup/restore-check.sh
