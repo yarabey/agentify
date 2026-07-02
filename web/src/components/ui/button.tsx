@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
  * shadcn/ui Button (тикет 9.1: подтверждает, что связка
  * Tailwind+shadcn реально работает, не только сконфигурирована).
  * Назначение: базовый интерактивный элемент, переиспользуемый экранами из
- * тикетов 9.2-9.6 (сейчас используется в Layout и на заглушке /tasks).
+ * тикетов 9.2-9.6 (Layout, /tasks, /integrations, /settings и др.).
  */
 const buttonVariants = cva(
   "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",

@@ -38,10 +38,11 @@ chi-роутер, что и `/healthz`, по **секретному пути** �
 «привязка канала к аккаунту описана явно», Gherkin §6 «Уведомления»,
 предусловие сценария «Уведомление в Telegram») — первый реальный хендлер, зарегистрированный
 через `bot.Handle("/start", ...)` (см. [`bot/start.go`](start.go)). Пользователь
-генерирует одноразовый код привязки в web (тикет 9.6, `POST
-/channels/telegram/link-code` — **пока не реализован**, код для локальной
-проверки нужно вставить в БД напрямую, см. «Запуск локально» ниже) и
-пересылает его боту как deep-link (`t.me/<bot>?start=<code>`) либо вручную
+генерирует одноразовый код привязки на экране «Настройки» в web (тикет 9.6,
+`POST /channels/telegram/link-code`, реализован в оркестраторе — см.
+[`orchestrator/README.md`](../orchestrator/README.md); для локальной проверки
+БЕЗ поднятого web можно вставить код напрямую в БД, см. «Запуск локально»
+ниже) и пересылает его боту как deep-link (`t.me/<bot>?start=<code>`) либо вручную
 (`/start <code>`) — Telegram доставляет оба варианта одинаково текстом команды
 с payload после пробела. Обработчик вызывает единый API оркестратора —
 [`bot/internal/orchestrator`](internal/orchestrator).`Client.LinkTelegram` →
@@ -101,7 +102,9 @@ curl -s -XPOST localhost:8080/webhook/devsecret \
 
 # С привязкой аккаунта (тикет 10.2) — нужен ещё и запущенный оркестратор:
 BOT_TOKEN=123:ABC BOT_WEBHOOK_SECRET=devsecret BOT_ORCHESTRATOR_URL=http://localhost:8081 go run ./bot
-# Код привязки в MVP пока создаётся напрямую в БД (POST /channels/telegram/link-code — тикет 9.6):
+# Код привязки в обычном флоу получают на экране «Настройки» в web
+# (POST /channels/telegram/link-code — тикет 9.6). Без запущенного web для
+# локальной проверки можно вставить код напрямую в БД:
 #   INSERT INTO channel_link_codes (code, user_id, channel, expires_at)
 #   VALUES ('devcode', '<user_id>', 'telegram', now() + interval '1 hour');
 curl -s -XPOST localhost:8080/webhook/devsecret \

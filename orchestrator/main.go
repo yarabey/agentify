@@ -150,6 +150,16 @@ type config struct {
 	// команды отмены на машину, см. task.AnswerTimeoutBehaviorAutoCancel и
 	// тикет 8.4). Переменная ORCH_ANSWER_TIMEOUT_BEHAVIOR.
 	AnswerTimeoutBehavior string `env:"ANSWER_TIMEOUT_BEHAVIOR" envDefault:"wait"`
+
+	// TelegramLinkCodeTTL — срок действия одноразового кода привязки
+	// Telegram-аккаунта, выпускаемого POST /channels/telegram/link-code (FR
+	// A2, D3, тикет 9.6, см. channel.CodeIssuer). Переменная
+	// ORCH_TELEGRAM_LINK_CODE_TTL. Продуктовое решение об окончательном
+	// значении не зафиксировано (docs/MANUAL_STEPS.md §4 — тот же принцип
+	// "дефолт + открытый вопрос", что у AnswerTimeoutThreshold выше) —
+	// дефолт 15m совпадает с channel.DefaultLinkCodeTTL (используется, если
+	// эта переменная почему-то придёт пустой/некорректной длительностью).
+	TelegramLinkCodeTTL time.Duration `env:"TELEGRAM_LINK_CODE_TTL" envDefault:"15m"`
 }
 
 func main() {
@@ -257,6 +267,11 @@ func run() error {
 		// от Redpanda, только от БД — регистрируется здесь же безусловно, тем
 		// же принципом, что и SetTransitioner/SetNotifier ниже.
 		server.SetChannelLinker(channel.NewLinker(pool))
+		// Генерация кода привязки Telegram-аккаунта (тикет 9.6, FR A2, D3):
+		// обратная операция по отношению к SetChannelLinker выше — та тратит
+		// код, эта его выпускает. Тоже не зависит от Redpanda, только от БД —
+		// регистрируется здесь же безусловно, тем же принципом.
+		server.SetChannelLinkCodeIssuer(channel.NewCodeIssuer(pool, cfg.TelegramLinkCodeTTL))
 		// Web-канал доставки уведомлений (тикет 7.2, FR G1): ClientConnHub —
 		// реестр активных WS-соединений браузера (server.ClientConnHub(),
 		// заведён в NewServer безусловно, в отличие от опциональных
