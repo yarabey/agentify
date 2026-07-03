@@ -82,6 +82,15 @@ const defaultOfflineRetryInterval = 5 * time.Second
 // повторяется (тот же исход, что для офлайн-машины).
 const writeTimeout = 10 * time.Second
 
+// ackCommitTimeout — крайний срок коммита offset ПОДТВЕРЖДЁННОЙ (ack получен)
+// записи. Такой коммит намеренно не отменяется вместе с ctx моста (см.
+// commitAcked): агент уже обработал команду, и оборванный shutdown-ом коммит
+// означал бы гарантированную повторную доставку после рестарта (дубль,
+// допустимый at-least-once, но бессмысленный). Таймаут ограничивает время,
+// на которое такой коммит может задержать graceful shutdown (Run ждёт
+// воркеров через wg.Wait), если брокер недоступен.
+const ackCommitTimeout = 10 * time.Second
+
 // machineQueueCapacity — глубина буферизованного канала записей одной
 // машины (см. godoc пакета про воркер на integration_id). Ограничивает
 // память на сильно отставшую машину; при заполнении канала диспетчер Run
@@ -256,10 +265,14 @@ func (b *Bridge) machineWorker(ctx context.Context, ch <-chan *kgo.Record) {
 // (commit-after-ack, protocol.md §5, см. godoc пакета): пока машина офлайн —
 // ждёт и повторяет поиск соединения; как только соединение нашлось — пишет
 // конверт в WS и ждёт ack с совпадающим message_id не дольше ackTimeout;
-// получен ack — коммитит offset записи и завершает; таймаут — повторяет
-// доставку (тот же конверт, тот же message_id — допустимый дубль,
-// гасится дедупом агента по message_id, §5); отмена ctx — завершает без
-// коммита (запись будет вычитана заново при следующем запуске моста).
+// получен ack — коммитит offset записи (через commitAcked — коммит
+// подтверждённой записи переживает отмену ctx) и завершает; таймаут —
+// повторяет доставку (тот же конверт, тот же message_id — допустимый дубль,
+// гасится дедупом агента по message_id, §5); отмена ctx ДО ack — завершает
+// без коммита (запись будет вычитана заново при следующем запуске моста);
+// если же ack успел прийти к моменту отмены ctx (оба канала select готовы —
+// Go выбирает ветку случайно), запись всё равно коммитится: полученный ack
+// не теряется из-за исхода этой гонки.
 func (b *Bridge) deliver(ctx context.Context, rec *kgo.Record) {
 	env, err := bus.Unmarshal(rec.Value)
 	if err != nil {
@@ -311,7 +324,7 @@ func (b *Bridge) deliver(ctx context.Context, rec *kgo.Record) {
 		select {
 		case <-ackCh:
 			timer.Stop()
-			b.commit(ctx, rec)
+			b.commitAcked(ctx, rec)
 			// Структурный лог успешной доставки с task_id (тикет 11.4, ТЗ
 			// «эксплуатация», FSM-переход уже залогирован отдельно
 			// task.Transitioner — здесь именно ФАКТ доставки КОНКРЕТНОЙ команды
@@ -333,7 +346,16 @@ func (b *Bridge) deliver(ctx context.Context, rec *kgo.Record) {
 			continue
 		case <-ctx.Done():
 			timer.Stop()
-			b.unregisterPending(env.MessageID)
+			// При одновременно готовых ackCh и ctx.Done() select выше выбирает
+			// ветку случайно (спецификация Go) — уже полученный ack не должен
+			// пропадать из-за исхода этой гонки: неблокирующе проверяем ackCh
+			// и, если ack пришёл, коммитим как при обычном подтверждении.
+			select {
+			case <-ackCh:
+				b.commitAcked(ctx, rec)
+			default:
+				b.unregisterPending(env.MessageID)
+			}
 			return
 		}
 	}
@@ -347,6 +369,22 @@ func (b *Bridge) commit(ctx context.Context, rec *kgo.Record) {
 	if err := b.consumer.CommitRecords(ctx, rec); err != nil && ctx.Err() == nil {
 		b.logWarn("bridge: commit offset не удался", "error", err)
 	}
+}
+
+// commitAcked коммитит offset ПОДТВЕРЖДЁННОЙ (ack получен) записи. В отличие
+// от прямого commit(ctx, ...) не отменяется вместе с ctx моста: между
+// HandleAck (закрывает канал ожидания) и коммитом в воркере есть окно, и
+// shutdown, попавший в это окно, обрывал бы сетевой CommitRecords — offset
+// уже обработанной агентом команды оставался бы незакоммиченным, и после
+// рестарта моста она доставлялась бы повторно (дубль допустим at-least-once,
+// но бессмысленен, когда ack уже получен). Поэтому коммит выполняется в
+// контексте, переживающем отмену родителя (context.WithoutCancel), но
+// ограниченном ackCommitTimeout — чтобы shutdown не завис на недоступном
+// брокере (Run ждёт воркеров через wg.Wait).
+func (b *Bridge) commitAcked(ctx context.Context, rec *kgo.Record) {
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackCommitTimeout)
+	defer cancel()
+	b.commit(commitCtx, rec)
 }
 
 // sleep ждёт d, прерываясь немедленно при отмене ctx. Возвращает false, если
