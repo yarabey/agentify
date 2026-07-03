@@ -19,6 +19,7 @@ bot, web за фронтовым Caddy). Прод-деплой через GHCR/S
 | `scripts/e2e-bootstrap.sh` | тикет 9.8: идемпотентный `orchestrator bootstrap` (админ + токен регистрации) перед сквозным E2E (`make e2e`, см. `web/e2e/README.md`) |
 | `docker-compose.backup.yml` | опциональный оверрай: сервис регулярного бэкапа Postgres по cron (тикет 11.5) |
 | `backup/` | образ бэкап-сервиса (`Dockerfile`+`entrypoint.sh`), скрипт `backup.sh` (pg_dump), `restore-check.sh` (проверка восстановления) и Go-тест `pgbackup/` |
+| `setup/` | скрипты первичной установки прода: автоматизируют ручные шаги MANUAL_STEPS.md §2–§3 и подготовку VPS до первого деплоя — см. [`setup/README.md`](setup/README.md) |
 
 Статика web и её внутренний `/healthz` собираются из `web/Dockerfile` +
 `web/Caddyfile` (в 0.3 — заглушка `index.html`; полноценный Vite — тикет 9.1).
@@ -32,6 +33,12 @@ bot, web за фронтовым Caddy). Прод-деплой через GHCR/S
   # отредактировать POSTGRES_PASSWORD (без него compose не стартует)
   ```
   Реальный `deploy/.env` **не коммитится** (см. `.gitignore`).
+- Кроме `POSTGRES_PASSWORD` compose требует `JWT_SIGNING_KEY` и
+  `APP_ENCRYPTION_KEY` (маппятся в `ORCH_JWT_SIGNING_KEY`/
+  `ORCH_APP_ENCRYPTION_KEY` — при поднятой БД оркестратор без них фатально
+  падает на старте, см. `orchestrator/main.go`). В `.env.example` уже заданы
+  локальные не-секретные dev-значения; для прода — сгенерированные
+  (MANUAL_STEPS.md §2).
 
 ## Запуск
 
@@ -194,8 +201,12 @@ make restore-check          # или: deploy/backup/restore-check.sh
 ### Что должно быть настроено заранее (один раз, руками)
 
 Это делает человек, не агент — полный чеклист и точные имена секретов в
-[`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) §1–§3. Здесь не дублируем
-значения, только перечисляем, что именно требуется для этого workflow:
+[`docs/MANUAL_STEPS.md`](../docs/MANUAL_STEPS.md) §1–§3. Всё из этого списка,
+кроме покупки домена/VPS/создания бота, автоматизировано скриптами
+[`deploy/setup/`](setup/README.md) — четыре команды на macOS выполняют
+генерацию секретов, настройку GitHub, подготовку VPS и первый деплой. Здесь не
+дублируем значения, только перечисляем, что именно требуется для этого
+workflow:
 
 - VPS поднят, на нём Docker + Docker Compose, есть деплой-пользователь по SSH.
 - На VPS **один раз вручную склонирован этот репозиторий в `~/agentify`** под
