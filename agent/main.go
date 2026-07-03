@@ -319,3 +319,5 @@ func sendHeartbeat(ctx context.Context, sender eventSender, integrationUUID stri
 		logger.Warn("agent: не удалось поставить heartbeat в outbox", "error", err)
 	}
 }
+
+// CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).

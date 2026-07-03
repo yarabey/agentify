@@ -479,3 +479,5 @@ func run() error {
 	}
 	return nil
 }
+
+// CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).

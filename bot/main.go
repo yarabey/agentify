@@ -325,3 +325,5 @@ func setupWebhook(svc *platform.Service, cfg config) (*tele.Bot, error) {
 	svc.Logger().Info("webhook зарегистрирован в Telegram", "public_url", publicURL)
 	return bot, nil
 }
+
+// CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).

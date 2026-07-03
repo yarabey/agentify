@@ -29,3 +29,5 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     </QueryClientProvider>
   </React.StrictMode>,
 );
+
+// CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).

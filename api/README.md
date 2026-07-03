@@ -42,3 +42,5 @@ make generate-check # generate + git diff --exit-code: проверка синх
   golangci-lint v2.5.0 (собран под go 1.24). Спека и так лежит в `openapi.yaml`.
 - **OpenAPI 3.1.** oapi-codegen v2.4.1 печатает WARNING про 3.1.x, но генерит
   корректный код для используемых здесь конструкций; контракт не понижался до 3.0.
+
+<!-- CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется). -->

@@ -201,3 +201,5 @@ echo "agentify-agent ${installed_version} установлен в ${AGENTIFY_INS
 echo "Node.js: $(node --version 2>/dev/null || echo "версия не определена")."
 echo
 echo "Дальше нужно настроить агента: адрес оркестратора, UUID машины и провайдера ИИ."
+
+# CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).

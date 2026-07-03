@@ -163,3 +163,5 @@ func parseLogLevel(level string) (slog.Level, error) {
 		return slog.LevelInfo, fmt.Errorf("недопустимый LOG_LEVEL %q: ожидается debug|info|warn|error", level)
 	}
 }
+
+// CI: no-op строка для прогона всех проверок в throwaway-PR (мёржить не планируется).
