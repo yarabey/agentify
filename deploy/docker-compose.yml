@@ -77,6 +77,15 @@ services:
       ORCH_DATABASE_URL: postgres://${POSTGRES_USER:-agentify}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentify}?sslmode=disable
       # Seed-брокер Redpanda для моста machine.commands → WS (тикет 3.4, ADR 0001).
       ORCH_REDPANDA_SEEDS: redpanda:9092
+      # Подпись access-JWT (FR A3, тикет 1.3) и мастер-ключ шифрования at-rest
+      # (тикет 2.2). Имена host-переменных совпадают с именами GitHub Secrets из
+      # MANUAL_STEPS.md §3 (JWT_SIGNING_KEY/APP_ENCRYPTION_KEY); значения — из
+      # deploy/.env (локально — НЕ-секретные dev-дефолты из .env.example, на
+      # VPS — сгенерированные, MANUAL_STEPS.md §2). При поднятой БД пустые
+      # значения фатальны на старте оркестратора (orchestrator/main.go), поэтому
+      # требуем их на уровне compose, а не уходим в crash-loop контейнера.
+      ORCH_JWT_SIGNING_KEY: "${JWT_SIGNING_KEY:?JWT_SIGNING_KEY обязателен — задайте в deploy/.env (шаблон deploy/.env.example)}"
+      ORCH_APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY обязателен — задайте в deploy/.env (шаблон deploy/.env.example)}"
       # Сервисный секрет бот↔оркестратор (тикет 10.3, FR D1) для
       # POST /channels/telegram/token (действия из Telegram от имени
       # привязанного пользователя, см. orchestrator/README.md). НАМЕРЕННО тот
